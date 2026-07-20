@@ -1,0 +1,25 @@
+# Normalize text to LF in the repo; leave binaries untouched.
+* text=auto eol=lf
+
+# Windows-only scripts keep CRLF
+*.ps1 text eol=crlf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Binary assets — never touch line endings, never diff as text
+*.png  binary
+*.bin  binary
+*.a    binary
+*.suprx binary
+*.skprx binary
+*.self binary
+*.velf binary
+*.vpk  binary
+*.obb  binary
+*.gxp  binary
+
+# Keep GitHub language stats sane
+third_party/**    linguist-vendored
+lib/falso_jni/**  linguist-vendored
+lib/so_util/**    linguist-vendored
+docs/**           linguist-documentation

@@ -1,0 +1,67 @@
+# ============================================================================
+#  Minecraft: Story Mode — PS Vita loader (soloader). SOURCE ONLY.
+#  This repo ships the LOADER. It contains NO game content. Running it
+#  requires the user's own legally-owned copy of the Android game
+#  (APK + OBB), which is extracted locally into prepared_data/ and never
+#  committed. Everything below is build output, editor cruft, or
+#  copyrighted game material that MUST NOT be published.
+# ============================================================================
+
+# --- Build artifacts / output ---
+build/
+build_local/
+build_archive/
+cmake-build-*/
+vpk/
+logs/
+*.velf
+*.self
+*.vpk
+eboot.bin
+eboot.bin.out
+
+# --- COPYRIGHTED GAME CONTENT — NEVER COMMIT ------------------------------
+#     (Telltale / Mojang. Requires the user's own game copy.)
+prepared_data/
+apk/
+apk_assets/
+*.obb
+# game native libs extracted from the APK
+libGameEngine.so
+libfmod*.so
+libmain.so
+libSDL2.so
+# reference art copied from the Android build
+*_android.png
+# proprietary PowerVR driver (Imagination Technologies — "Strictly Confidential",
+# NOT redistributable). The shipping build is vitaGL; these are never used or published.
+lib/pvr/
+third_party/pvr_psp2/
+# dead PVR-only loader sources (our own code, but vitaGL is the only backend now)
+source/utils/pvr_init.*
+source/reimpl/pvr_gles_stubs.c
+source/reimpl/egl_pvr_shim.*
+source/psp2_pvr_hint.h
+
+# --- Runtime captures / accumulated caches (device state, not source) ---
+extras/_progcache_accum/
+extras/choice_stats/
+extras/progcache_seed.bin*
+*.STALE*
+
+# --- Backups / editor / OS ---
+*.p5bak
+*.prebubble_bak
+*.bak
+.DS_Store
+.idea/
+__pycache__/
+lib/libc_bridge/out/
+
+# --- Session scratch / internal notes (personal paths + LAN IPs; not published) ---
+scratchpad_*.md
+tools/vita-parse-core/
+docs/AI_PORTING_GUIDE.md
+CODEX_HANDOFF.md
+ai_build_vpk.ps1
+tools/maintenance_legacy/

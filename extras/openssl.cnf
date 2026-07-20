@@ -1,0 +1,6 @@
+# Minimal OpenSSL config for runtime probes in loader-based ports.
+# Keeping this file present avoids NULL config path failures in older Android libs.
+
+openssl_conf = openssl_init
+
+[openssl_init]
