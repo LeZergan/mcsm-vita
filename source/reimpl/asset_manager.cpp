@@ -140,6 +140,10 @@ AAsset* AAssetManager_open(AAssetManager* mgr, const char* filename, int mode) {
         a->fileSize = sceLibcBridge_ftell(a->f);
         sceLibcBridge_fseek(a->f, 0, SEEK_SET);
 #else
+        /* PERF: 32 KB fully-buffered stream (newlib default BUFSIZ is 1 KB) so
+         * AAsset_read/fread refills in big chunks instead of 1 KB sceIo reads.
+         * Freed on fclose. (The hot .ttarch2 reads use the vfd/pread path, not this.) */
+        setvbuf(a->f, NULL, _IOFBF, 32 * 1024);
         fseek(a->f, 0, SEEK_END);
         a->fileSize = ftell(a->f);
         fseek(a->f, 0, SEEK_SET);

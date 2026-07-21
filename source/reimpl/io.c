@@ -694,27 +694,24 @@ off_t asset_vfd_lseek(int fd, off_t offset, int whence) {
 }
 
 int asset_vfd_fstat(int fd, stat64_bionic *buf) {
-    char path[PATH_MAX];
     off_t length = 0;
     if (!buf) {
         errno = EFAULT;
         return -1;
     }
-    if (asset_vfd_snapshot(fd, path, sizeof(path), NULL, &length) < 0) {
+    if (asset_vfd_snapshot(fd, NULL, 0, NULL, &length) < 0) {
         return -1;
     }
 
-    struct stat st;
-    if (stat(path, &st) == 0) {
-        stat_newlib_to_bionic(&st, buf);
-        buf->st_size = length;
-    } else {
-        memset(buf, 0, sizeof(*buf));
-        buf->st_mode = 0100000 | 0444;
-        buf->st_size = length;
-        buf->st_blksize = 4096;
-        buf->st_blocks = (length + 511) / 512;
-    }
+    /* Fabricate directly from the cached length — no per-fstat path-based stat()
+     * (a memory-card directory traversal). st_size is the only field the engine
+     * needs, and it was always overwritten with `length` anyway. */
+    memset(buf, 0, sizeof(*buf));
+    buf->st_mode = 0100000 | 0444;
+    buf->st_nlink = 1;   /* a valid file has >=1 link; 0 can read as "unlinked" */
+    buf->st_size = length;
+    buf->st_blksize = 4096;
+    buf->st_blocks = (length + 511) / 512;
 
     l_debug("[ASSETVFD] fstat fd=%d size=%lld", fd, (long long)buf->st_size);
     return 0;
@@ -815,6 +812,24 @@ static const char *remap_android_path(const char *path) {
         return path_buf;
     }
 
+    /* Collapse accidental "//" (the engine's <Temp> logical resolution emits e.g.
+     * "ux0:data/mcsm//Temp/choice.prop"; sceIo does NOT normalize "//", so opening
+     * OR stat/access'ing an existing file at that path returns -1. That broke the
+     * crowd-choice read — ResourceExists('choice.prop') saw the double-slash path
+     * as missing, so the "% of players chose" stats never loaded, even though the
+     * real 114KB choice.prop is present under Temp/. Only rewrites when "//" is
+     * actually present, so normal paths pay just one strstr. */
+    if (strstr(path, "//")) {
+        char *w = path_buf;
+        char *end = path_buf + sizeof(path_buf) - 1;
+        for (const char *r = path; *r && w < end; ++r) {
+            if (r[0] == '/' && r[1] == '/') continue;   /* drop the first of each "//" */
+            *w++ = *r;
+        }
+        *w = '\0';
+        return path_buf;
+    }
+
     return path;
 }
 
@@ -902,10 +917,17 @@ int open_soloader(const char * path, int oflag, ...) {
 
     oflag = oflags_bionic_to_newlib(oflag);
     int ret = open(path, oflag, mode);
+    if (ret < 0 && errno == EMFILE) {
+        /* fd table exhausted by the hot ttarch archive fd-cache. Free some cached
+         * archive fds and retry, so a non-archive open — e.g. the crowd choice.prop
+         * read that the "% of players chose" screen needs — doesn't just fail. */
+        asset_vfd_trim_cached_fds(ASSET_VFD_RAW_CACHE_RETRY_TARGET);
+        ret = open(path, oflag, mode);
+    }
     if (ret >= 0)
         l_debug("open(%s, %x): %i", path, oflag, ret);
     else
-        l_warn("open(%s, %x): %i", path, oflag, ret);
+        l_warn("open(%s, %x): %i errno=%d", path, oflag, ret, errno);
     obb_track_fd(path, ret);
     savedata_track_fd(path, ret, oflag);
     return ret;

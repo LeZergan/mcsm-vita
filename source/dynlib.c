@@ -69,6 +69,10 @@
 
 const unsigned int __page_size = PAGE_SIZE;
 
+/* strlen via the NEON-optimized sceClibStrnlen (there is no sceClibStrlen).
+ * strlen is the single highest-frequency libc string call in the C++ engine. */
+static size_t strlen_sce(const char *s) { return sceClibStrnlen(s, 0x7FFFFFFF); }
+
 extern void * _ZNSt9exceptionD2Ev;
 extern void * _ZSt17__throw_bad_allocv;
 extern void * _ZSt9terminatev;
@@ -1104,12 +1108,12 @@ so_default_dynlib default_dynlib[] = {
         { "strdup", (uintptr_t)&strdup },
         { "strlcat", (uintptr_t)&strlcat },
         { "strlcpy", (uintptr_t)&strlcpy },
-        { "strlen", (uintptr_t)&strlen },
+        { "strlen", (uintptr_t)&strlen_sce },
         { "strncasecmp", (uintptr_t)&sceClibStrncasecmp },
-        { "strncat", (uintptr_t)&strncat },
+        { "strncat", (uintptr_t)&sceClibStrncat },
         { "strncmp", (uintptr_t)&sceClibStrncmp },
         { "strncpy", (uintptr_t)&sceClibStrncpy },
-        { "strnlen", (uintptr_t)&strnlen },
+        { "strnlen", (uintptr_t)&sceClibStrnlen },
         { "strpbrk", (uintptr_t)&strpbrk },
         { "strrchr", (uintptr_t)&sceClibStrrchr },
         { "strspn", (uintptr_t)&strspn },

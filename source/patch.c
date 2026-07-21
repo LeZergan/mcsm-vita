@@ -16,7 +16,7 @@
 
 #include <psp2/kernel/threadmgr.h>
 #include <psp2/kernel/clib.h>
-#include <psp2/io/fcntl.h>   /* sceIoOpen/Write/Close for the reliable choice_diag */
+#include <psp2/io/fcntl.h>
 #include <psp2/power.h>      /* scePowerSetArmClockFrequency for the adaptive clock governor */
 
 #include <stdint.h>
@@ -543,23 +543,7 @@ static void mcsm_clock_governor_tick(uint32_t sim_us) {
 }
 
 static int mcsm_mega_diag_enabled(void) {
-    static int initialized = 0;
-    static int enabled = 0;
-    if (!initialized) {
-        initialized = 1;
-        FILE *fp = fopen(DATA_PATH "megadiag.txt", "r");
-        if (!fp) {
-            fp = fopen("ux0:data/mcsm/megadiag.txt", "r");
-        }
-        if (!fp) {
-            fp = fopen("ux0:/data/mcsm/megadiag.txt", "r");
-        }
-        if (fp) {
-            fclose(fp);
-            enabled = 1;
-        }
-    }
-    return enabled;
+    return 0; /* verbose diagnostics removed — off by default */
 }
 
 static int should_log_diag_count(uint32_t count) {
@@ -2788,8 +2772,6 @@ static void patch_engine_diag_hooks(void) {
 static so_hook g_hook_sdl_show_text_input;
 static void hook_sdl_show_text_input(void *inputRect) {
     extern void mcsm_ime_begin(const char *initial);
-    { SceUID f = sceIoOpen("ux0:data/mcsm/keyboard_diag.txt", SCE_O_WRONLY | SCE_O_CREAT | SCE_O_APPEND, 0777);
-      if (f >= 0) { const char *m = "Android_JNI_ShowTextInput -> Vita IME\n"; sceIoWrite(f, m, strlen(m)); sceIoClose(f); } }
     l_info("KEYBOARD: Android_JNI_ShowTextInput -> Vita IME");
     mcsm_ime_begin("");
     (void)inputRect;
@@ -3374,20 +3356,6 @@ static int hook_lua_resource_exists_redirect(void *L) {
     int ret = SO_CONTINUE(int, g_hook_lua_resource_exists_redirect, L);
     if (is_save_shaped) {
         l_info("SAVETRACE: ResourceExists('%s') RETURN #%u", nm ? nm : "?", count);
-        /* Reliable sceIo diag (2026-07-18) for the crowd-choice read: shows the
-         * RESOLVED (post-redirect) name + whether the engine found the seeded
-         * choice.prop. want ret=1 for a choice.prop query = crowd stats will read.
-         * Capped so it can't grow unbounded. */
-        if (nm && (strstr(nm, "choice") || strstr(nm, "Choice"))) {
-            static unsigned s_cdiag = 0;
-            if (s_cdiag++ < 40u) {
-                char b[224];
-                int n = snprintf(b, sizeof(b), "ResourceExists('%s') -> %d\n", nm, ret);
-                SceUID df = sceIoOpen("ux0:data/mcsm/choice_diag.txt",
-                                      SCE_O_WRONLY | SCE_O_CREAT | SCE_O_APPEND, 0777);
-                if (df >= 0) { if (n > 0) sceIoWrite(df, b, (SceSize)n); sceIoClose(df); }
-            }
-        }
     }
     return ret;
 }
@@ -5114,16 +5082,12 @@ static void hook_get_virtual_keyboard_result(void *self, void *out_string, unsig
 static so_hook g_hook_lua_input_supports_keyboard;
 static int hook_lua_input_supports_keyboard(void *L) {
     static uint32_t count = 0;
-    { SceUID f = sceIoOpen("ux0:data/mcsm/keyboard_diag.txt", SCE_O_WRONLY|SCE_O_CREAT|SCE_O_APPEND, 0777);
-      if (f>=0){ const char *m="InputSupportsKeyboard -> forced TRUE\n"; sceIoWrite(f,m,strlen(m)); sceIoClose(f);} }
     int ret = hook_forced_lua_bool(L, 1, "InputSupportsKeyboard", &count);
     return ret >= 0 ? ret : SO_CONTINUE(int, g_hook_lua_input_supports_keyboard, L);
 }
 static so_hook g_hook_lua_input_has_keyboard;
 static int hook_lua_input_has_keyboard(void *L) {
     static uint32_t count = 0;
-    { SceUID f = sceIoOpen("ux0:data/mcsm/keyboard_diag.txt", SCE_O_WRONLY|SCE_O_CREAT|SCE_O_APPEND, 0777);
-      if (f>=0){ const char *m="InputHasKeyboard -> forced TRUE\n"; sceIoWrite(f,m,strlen(m)); sceIoClose(f);} }
     int ret = hook_forced_lua_bool(L, 1, "InputHasKeyboard", &count);
     return ret >= 0 ? ret : SO_CONTINUE(int, g_hook_lua_input_has_keyboard, L);
 }
@@ -5133,8 +5097,6 @@ static int hook_lua_input_has_keyboard(void *L) {
  * somehow) — and I can hook whatever raised the text field. Log-only. */
 static so_hook g_hook_lua_saveload_set_display_name;
 static int hook_lua_saveload_set_display_name(void *L) {
-    SceUID f = sceIoOpen("ux0:data/mcsm/keyboard_diag.txt", SCE_O_WRONLY | SCE_O_CREAT | SCE_O_APPEND, 0777);
-    if (f >= 0) { const char *m = "luaSaveLoadSetSaveDisplayName CALLED (rename reached setter)\n"; sceIoWrite(f, m, strlen(m)); sceIoClose(f); }
     return SO_CONTINUE(int, g_hook_lua_saveload_set_display_name, L);
 }
 

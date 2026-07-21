@@ -259,10 +259,9 @@ struct passwd *getpwuid_soloader(uid_t uid) {
 
 ssize_t pread_soloader(int fd, void *buf, size_t count, off_t offset) {
     if (asset_vfd_is(fd)) { return asset_vfd_pread(fd, buf, count, offset); }
-    off_t old_offset = lseek(fd, 0, SEEK_CUR);
-    if (old_offset < 0 || lseek(fd, offset, SEEK_SET) < 0) return -1;
-    ssize_t read_bytes = read(fd, buf, count);
-    lseek(fd, old_offset, SEEK_SET);
+    /* newlib pread -> a single sceIoPread, instead of the old
+     * lseek(save)+lseek(set)+read+lseek(restore) 4-syscall emulation. */
+    ssize_t read_bytes = pread(fd, buf, count, offset);
     if (obb_is_fd(fd)) {
         static int n = 0;
         if (count > 64 || offset > 8192 || n++ < 100) {

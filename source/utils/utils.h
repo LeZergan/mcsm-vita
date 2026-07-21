@@ -72,7 +72,8 @@ FILE * mcsm_open_setting(const char * basename, const char * mode);
  * ux0:data/mcsm/settings/clock.txt (or the data root). Lines are order-free and
  * forgiving; recognised tokens:
  *   off            -> disable the adaptive governor (pin ARM to `arm_max`)
- *   min <MHz>      -> governor floor      (default 266, clamped 111..500)
+ *   min <MHz>      -> governor floor      (default 444 = pinned; lower it, e.g.
+ *                     "min 266", to enable adaptive battery scaling)
  *   max <MHz>      -> governor ceiling + boot ARM clock (default 444, 222..500)
  *   gpu <MHz>      -> GPU clock           (default 222, clamped 111..266)
  * An absent file (or absent line) yields the defaults below. This ONE doc is

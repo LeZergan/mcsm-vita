@@ -126,22 +126,28 @@ PTHR_INLINE int _mutex_t_static_init(pthread_mutex_t_bionic * mutex, const pthre
         else if (* (int *) mutex == BIONIC_PTHREAD_ERRORCHECK_MUTEX_INITIALIZER) kind = PTHREAD_MUTEX_ERRORCHECK;
     }
 
-    mutex->real_ptr = malloc(sizeof(pthread_mutex_t));
-    if (!mutex->real_ptr) {
+    pthread_mutex_t *real = malloc(sizeof(pthread_mutex_t));
+    if (!real) {
         PTHR_UNLOCK
         return ENOMEM;
     }
-    sceClibMemset(mutex->real_ptr, 0, sizeof(pthread_mutex_t));
+    sceClibMemset(real, 0, sizeof(pthread_mutex_t));
 
     pthread_mutexattr_t mutattr;
     pthread_mutexattr_init(&mutattr);
     pthread_mutexattr_settype(&mutattr, kind);
-    ret = pthread_mutex_init(mutex->real_ptr, &mutattr);
+    ret = pthread_mutex_init(real, &mutattr);
     pthread_mutexattr_destroy(&mutattr);
 
     if (ret == 0) {
+        /* Publish real_ptr only AFTER the mutex is fully constructed, with a
+         * release barrier, so the lock-free fast path (which reads real_ptr
+         * without PTHR_LOCK) can never observe a non-null pointer to a
+         * half-initialized mutex on a concurrent first-touch. */
+        __atomic_store_n(&mutex->real_ptr, real, __ATOMIC_RELEASE);
         rememberObject_nl(mutex);
     } else {
+        free(real);
         l_error("mutex initialization for %p has failed", mutex);
     }
 
@@ -162,18 +168,21 @@ PTHR_INLINE int _cond_t_static_init(pthread_cond_t_bionic * cond, const pthread_
         return ret;
     }
 
-    cond->real_ptr = malloc(sizeof(pthread_cond_t));
-    if (!cond->real_ptr) {
+    pthread_cond_t *real = malloc(sizeof(pthread_cond_t));
+    if (!real) {
         PTHR_UNLOCK
         return ENOMEM;
     }
-    sceClibMemset(cond->real_ptr, 0, sizeof(pthread_cond_t));
+    sceClibMemset(real, 0, sizeof(pthread_cond_t));
 
-    ret = pthread_cond_init(cond->real_ptr, attr);
+    ret = pthread_cond_init(real, attr);
 
     if (ret == 0) {
+        /* Publish only after full init, release-ordered (see _mutex_t_static_init). */
+        __atomic_store_n(&cond->real_ptr, real, __ATOMIC_RELEASE);
         rememberObject_nl(cond);
     } else {
+        free(real);
         l_error("cond initialization for %p has failed", cond);
     }
 
@@ -351,6 +360,14 @@ int pthread_mutex_destroy_soloader(pthread_mutex_t_bionic *mutex)
 int pthread_mutex_lock_soloader(pthread_mutex_t_bionic *mutex)
 {
     if (!mutex) return EINVAL;
+    /* Fast path: an initialized mutex holds a real heap pointer in real_ptr,
+     * published with a release barrier only AFTER pthread_mutex_init completes
+     * (see _mutex_t_static_init); a still-static bionic mutex holds a small
+     * sentinel (<=0x8000). The acquire load pairs with that release so we never
+     * fast-path onto a half-initialized mutex, and skips the global init lock +
+     * 1024-entry scan for the common inited case. */
+    pthread_mutex_t *rp = __atomic_load_n(&mutex->real_ptr, __ATOMIC_ACQUIRE);
+    if ((uintptr_t)rp > 0x10000u) return pthread_mutex_lock(rp);
     _mutex_t_static_init(mutex, NULL);
     return pthread_mutex_lock(mutex->real_ptr);
 }
@@ -358,6 +375,8 @@ int pthread_mutex_lock_soloader(pthread_mutex_t_bionic *mutex)
 int pthread_mutex_trylock_soloader(pthread_mutex_t_bionic *mutex)
 {
     if (!mutex) return EINVAL;
+    pthread_mutex_t *rp = __atomic_load_n(&mutex->real_ptr, __ATOMIC_ACQUIRE);
+    if ((uintptr_t)rp > 0x10000u) return pthread_mutex_trylock(rp);
     _mutex_t_static_init(mutex, NULL);
     return pthread_mutex_trylock(mutex->real_ptr);
 }
@@ -395,19 +414,20 @@ int pthread_cond_destroy_soloader(pthread_cond_t_bionic *cond)
 int pthread_cond_signal_soloader(pthread_cond_t_bionic *cond)
 {
     if (!cond) return EINVAL;
-
+    pthread_cond_t *rc = __atomic_load_n(&cond->real_ptr, __ATOMIC_ACQUIRE);
+    if ((uintptr_t)rc > 0x10000u) return pthread_cond_signal(rc);
     _cond_t_static_init(cond, NULL);
-
     return pthread_cond_signal(cond->real_ptr);
 }
 
 int pthread_cond_timedwait_soloader(pthread_cond_t_bionic *cond, pthread_mutex_t_bionic *mutex, struct timespec *abstime)
 {
     if (!cond || !mutex) return EINVAL;
-
-    _cond_t_static_init(cond, NULL);
-    _mutex_t_static_init(mutex, NULL);
-
+    if (!((uintptr_t)__atomic_load_n(&cond->real_ptr, __ATOMIC_ACQUIRE) > 0x10000u &&
+          (uintptr_t)__atomic_load_n(&mutex->real_ptr, __ATOMIC_ACQUIRE) > 0x10000u)) {
+        _cond_t_static_init(cond, NULL);
+        _mutex_t_static_init(mutex, NULL);
+    }
     return pthread_cond_timedwait(cond->real_ptr, mutex->real_ptr, abstime);
 }
 
@@ -415,19 +435,20 @@ int pthread_cond_timedwait_soloader(pthread_cond_t_bionic *cond, pthread_mutex_t
 int pthread_cond_wait_soloader(pthread_cond_t_bionic *cond, pthread_mutex_t_bionic *mutex)
 {
     if (!cond || !mutex) return EINVAL;
-
-    _cond_t_static_init(cond, NULL);
-    _mutex_t_static_init(mutex, NULL);
-
+    if (!((uintptr_t)__atomic_load_n(&cond->real_ptr, __ATOMIC_ACQUIRE) > 0x10000u &&
+          (uintptr_t)__atomic_load_n(&mutex->real_ptr, __ATOMIC_ACQUIRE) > 0x10000u)) {
+        _cond_t_static_init(cond, NULL);
+        _mutex_t_static_init(mutex, NULL);
+    }
     return pthread_cond_wait(cond->real_ptr, mutex->real_ptr);
 }
 
 int pthread_cond_broadcast_soloader(pthread_cond_t_bionic *cond)
 {
     if (!cond) return EINVAL;
-
+    pthread_cond_t *rc = __atomic_load_n(&cond->real_ptr, __ATOMIC_ACQUIRE);
+    if ((uintptr_t)rc > 0x10000u) return pthread_cond_broadcast(rc);
     _cond_t_static_init(cond, NULL);
-
     return pthread_cond_broadcast(cond->real_ptr);
 }
 
@@ -530,8 +551,6 @@ int pthread_setname_np_soloader(pthread_t thread, const char* thread_name) {
     if (thread_name_len >= MAX_TASK_COMM_LEN) {
         return ERANGE;
     }
-
-    sceClibPrintf("PTHREAD: pthread_setname_np with name %s for thread:0x%x\n", thread_name, pthread_self());
 
     return 0;
 }

@@ -115,9 +115,14 @@ FILE * mcsm_open_setting(const char * basename, const char * mode) {
 
 void mcsm_read_clock_cfg(McsmClockCfg * cfg) {
     if (!cfg) return;
-    /* defaults: governor ON, ARM 266..444, GPU 222 */
+    /* Defaults: ARM PINNED at 444 (arm_min == arm_max -> single level -> the
+     * governor stays idle). Post-optimization the CPU has real frame-time
+     * headroom, so adaptive downclocking became counter-productive: a light
+     * frame drops the clock to 266, then the next heavy frame runs slow at 266
+     * before it ramps back = visible fps fluctuation. Pinning 444 gives the
+     * steadiest frame rate. Battery scaling is opt-in via clock.txt "min <MHz>". */
     cfg->governor_off = 0;
-    cfg->arm_min = 266;
+    cfg->arm_min = 444;
     cfg->arm_max = 444;
     cfg->gpu     = 222;
 

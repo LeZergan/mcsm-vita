@@ -343,9 +343,7 @@ static int shader_file_diag_enabled(void) {
     static int enabled = 0;
     if (!initialized) {
         initialized = 1;
-        enabled = file_exists(DATA_PATH "shader_diag.txt") ||
-                  file_exists("ux0:data/mcsm/shader_diag.txt") ||
-                  file_exists("ux0:/data/mcsm/shader_diag.txt");
+        enabled = 0; /* shader-source diagnostics removed — off by default */
     }
     return enabled;
 }
@@ -355,12 +353,7 @@ static int gl_verbose_diag_enabled(void) {
     static int enabled = 0;
     if (!initialized) {
         initialized = 1;
-        enabled = file_exists(DATA_PATH "megadiag.txt") ||
-                  file_exists("ux0:data/mcsm/megadiag.txt") ||
-                  file_exists("ux0:/data/mcsm/megadiag.txt") ||
-                  file_exists(DATA_PATH "texdiag.txt") ||
-                  file_exists("ux0:data/mcsm/texdiag.txt") ||
-                  file_exists("ux0:/data/mcsm/texdiag.txt");
+        enabled = 0; /* verbose GL/texture diagnostics removed — off by default */
     }
     return enabled;
 }
@@ -852,13 +845,27 @@ static int gl_uniform4fv_split_telltale(GLint location, GLsizei count, const GLf
         unsigned used; GLint el[64];
     } s_memo[256];
     static unsigned s_memo_clock = 0;
+    /* Direct-mapped hash index over (prog,loc,cnt) -> slot+1 (0 = empty), turning
+     * the ~860-calls/heavy-frame lookup from an O(256) scan into ~O(1). The linear
+     * scan stays as the exact-correct fallback, and the FULL key is always
+     * re-checked before accepting a candidate, so a hash collision can never
+     * return a wrong entry — it just falls back to the scan. */
+    static unsigned s_index[1024];
+    unsigned hkey = (((unsigned)program * 2654435761u) ^
+                     ((unsigned)location * 40503u) ^ ((unsigned)count * 2246822519u)) & 1023u;
     int hit = -1, empty = -1;
-    for (int i = 0; i < 256; ++i) {
-        if (s_memo[i].state && s_memo[i].prog == program &&
-            s_memo[i].loc == location && s_memo[i].cnt == count) { hit = i; break; }
-        if (!s_memo[i].state && empty < 0) empty = i;
+    { int cand = (int)s_index[hkey] - 1;
+      if (cand >= 0 && s_memo[cand].state && s_memo[cand].prog == program &&
+          s_memo[cand].loc == location && s_memo[cand].cnt == count) hit = cand; }
+    if (hit < 0) {
+        for (int i = 0; i < 256; ++i) {
+            if (s_memo[i].state && s_memo[i].prog == program &&
+                s_memo[i].loc == location && s_memo[i].cnt == count) { hit = i; break; }
+            if (!s_memo[i].state && empty < 0) empty = i;
+        }
     }
     if (hit >= 0) {
+        s_index[hkey] = (unsigned)(hit + 1);
         s_memo[hit].used = ++s_memo_clock;
         if (s_memo[hit].state == 2) return 0;               /* cached NO_SPLIT */
         for (GLsizei i = 0; i < count; ++i)
@@ -887,6 +894,7 @@ static int gl_uniform4fv_split_telltale(GLint location, GLsizei count, const GLf
     }
     s_memo[slot].prog = program; s_memo[slot].loc = location; s_memo[slot].cnt = count;
     s_memo[slot].used = ++s_memo_clock;
+    s_index[hkey] = (unsigned)(slot + 1);
     if (splittable) {
         s_memo[slot].state = 1;
         for (GLsizei i = 0; i < count; ++i) s_memo[slot].el[i] = element_locations[i];
@@ -1144,24 +1152,13 @@ void gl_init() {
     /* Untapped vitaGL perf levers. vitaGL ALREADY defaults to: triple-buffering ON,
      * VRAM-first ON, and newlib mem as a final texture fallback (vglUseExtraMem) ON —
      * so those are not free wins. These two ARE untapped but carry risk, so they are
-     * OPT-IN (default off, no rebuild to toggle):
-     *   cached_mem.txt : vglUseCachedMem(TRUE) — vitaGL's internal pools use CACHED
-     *     memory. CPU writes to GL pools (texture/vertex uploads) become much faster;
-     *     vitaGL flushes caches before GPU reads. Risk: if the flush path misbehaves
-     *     on this GXM build it corrupts rendering — hence opt-in. Must precede vglInit.
-     *   gc_core3.txt : pin vitaGL's garbage-collector thread to core 3 (0x80000, freed
-     *     by capUnlocker) so freeing deleted GPU resources doesn't steal render cycles.
-     *     Risk: if core 3 isn't actually unlocked, thread create can fail -> opt-in. */
-    /* DEFAULT-ON (2026-07-17): the workload is CPU-bound + upload-heavy, so cached GL
-     * pools (faster CPU->GPU uploads) and moving vitaGL's GC off the engine's core are
-     * both real wins; capUnlocker (which frees core 3) is a shipped prerequisite. Both
-     * flip to opt-OUT via no_cached_mem.txt / no_gc_core3.txt if anything regresses. */
-    { FILE *cm = mcsm_open_setting("no_cached_mem.txt", "r");
-      if (cm) { fclose(cm); l_info("gl_init: vglUseCachedMem DISABLED (no_cached_mem.txt)"); }
-      else { vglUseCachedMem(GL_TRUE); l_info("gl_init: vglUseCachedMem(TRUE) default-on — faster CPU uploads"); } }
-    { FILE *gc = mcsm_open_setting("no_gc_core3.txt", "r");
-      if (gc) { fclose(gc); l_info("gl_init: GC-on-core3 DISABLED (no_gc_core3.txt)"); }
-      else { vglSetupGarbageCollector(160, 0x00080000); l_info("gl_init: vitaGL GC thread -> core3 default-on (frees engine core)"); } }
+     * Baked-in defaults: the workload is CPU-bound + upload-heavy, so cached GL pools
+     * (faster CPU->GPU uploads; vitaGL flushes caches before GPU reads) and pinning
+     * vitaGL's GC thread to core 3 (0x80000, freed by the shipped capUnlocker) so it
+     * doesn't steal render cycles are both real wins. vglUseCachedMem must precede vglInit. */
+    vglUseCachedMem(GL_TRUE);                    /* faster CPU->GPU uploads (baked-in default) */
+    vglSetupGarbageCollector(160, 0x00080000);   /* vitaGL GC thread -> core3, frees the engine core (baked-in default) */
+    l_info("gl_init: cached-mem + GC-on-core3 enabled (defaults)");
     vglInitExtended(0, RS_NATIVE_W, RS_NATIVE_H, ram_reserve_mb * 1024 * 1024, SCE_GXM_MULTISAMPLE_NONE);
     /* vsync ON (helps a little) + a steady 30fps pacing cap in the game loop
      * (see hook_gameengine_loop / mcsm_pace_frame) is the real judder fix. Plain
@@ -3825,16 +3822,6 @@ void glLinkProgram_soloader(GLuint program) {
      * THE TEST: play a scene, then replay it — misses should stop growing and
      * saveok should be > 0. If saveok stays 0, the fields above say why. */
     g_pc_links++;
-    { static unsigned s_statc = 0;
-      if ((s_statc++ & 15u) == 0u) {
-          char b[320];
-          int n = snprintf(b, sizeof(b),
-              "hits=%u misses=%u saveok=%u loadfail=%u\nlinks=%u key0=%u notlinked=%u nobin=%u openfail=%u lastopen=0x%08X\nloadfail>0 = saved binary won't restore (real bug); loadfail=0 = misses are just new/uncached content\n",
-              g_progcache_hits, g_progcache_misses, g_pc_saveok, g_pc_loadfail, g_pc_links,
-              g_pc_key0, g_pc_notlinked, g_pc_nobin, g_pc_openfail, (unsigned)g_pc_lastopen);
-          SceUID df = sceIoOpen("ux0:data/mcsm/progcache_diag.txt",
-                                SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
-          if (df >= 0) { if (n > 0) sceIoWrite(df, b, (SceSize)n); sceIoClose(df); } } }
     uint64_t pkey = progcache_key_for_program(program);
     if (pkey && progcache_try_load(program, pkey)) {
         /* Linked from disk — NO ShaccCg compile this run (the freeze killer). */
@@ -3848,25 +3835,8 @@ void glLinkProgram_soloader(GLuint program) {
         return;
     }
     launch_state_mark_gl_phase(2);
-    uint64_t _clt0 = sceKernelGetSystemTimeWide();
     glLinkProgram(program);
     launch_state_mark_gl_phase(0);
-    /* ASYNC-DESIGN DIAG (2026-07-20): record the compiling thread + duration on each
-     * cache MISS (the blocking ShaccCg compile). Tells us whether compiles run on the
-     * render/present thread (=> async needed) or a loader thread, how long each takes,
-     * and how they cluster (scene-load burst vs scattered gameplay). First 200/session,
-     * ux0:data/mcsm/shader_compile_diag.txt. Pure diagnostic. */
-    { extern int sceKernelGetThreadId(void);
-      static unsigned _cc = 0;
-      unsigned _dtms = (unsigned)((sceKernelGetSystemTimeWide() - _clt0) / 1000ull);
-      if (++_cc <= 200u) {
-          char b[112]; int n = snprintf(b, sizeof(b), "#%u tid=0x%08X dt=%ums scene=%d present=%u\n",
-              _cc, (unsigned)sceKernelGetThreadId(), _dtms,
-              launch_state_scene_active(), (unsigned)launch_state_get_present_count());
-          int flags = (_cc == 1u) ? (SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC)
-                                  : (SCE_O_WRONLY | SCE_O_CREAT | SCE_O_APPEND);
-          SceUID f = sceIoOpen("ux0:data/mcsm/shader_compile_diag.txt", flags, 0777);
-          if (f >= 0) { if (n > 0) sceIoWrite(f, b, (SceSize)n); sceIoClose(f); } } }
     if (pkey) {
         g_progcache_misses++;
         dump_miss_sources(program, pkey);

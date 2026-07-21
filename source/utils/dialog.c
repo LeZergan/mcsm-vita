@@ -15,7 +15,7 @@
 #include <psp2/appmgr.h>
 #include <psp2/common_dialog.h>
 #include <psp2/ime_dialog.h>
-#include <psp2/io/fcntl.h>   /* sceIoOpen/Write/Close for keyboard_diag */
+#include <psp2/io/fcntl.h>
 #include <psp2/message_dialog.h>
 #include <psp2/kernel/clib.h>
 #include <psp2/kernel/processmgr.h>
@@ -120,14 +120,6 @@ void mcsm_vkbd_reset(void) { g_vkbd_mode = 0; g_vkbd_finished = 0; g_vkbd_cancel
 void mcsm_ime_begin(const char *initial) {
     if (g_ime_active) return;
     int rc = init_ime_dialog("Enter name", (initial && initial[0]) ? initial : " ");
-    /* DIAG (2026-07-18): record that the hook fired + the sceImeDialogInit result,
-     * so if the keyboard doesn't appear we can tell whether luaPlatformShowKeyboard
-     * was even called (file absent = not called) vs the IME init failing (rc<0). */
-    { SceUID f = sceIoOpen("ux0:data/mcsm/keyboard_diag.txt",
-                           SCE_O_WRONLY | SCE_O_CREAT | SCE_O_APPEND, 0777);
-      if (f >= 0) { char b[80]; int n = sceClibSnprintf(b, sizeof(b),
-                        "mcsm_ime_begin: init_rc=0x%08X (>=0 ok)\n", (unsigned)rc);
-                    if (n > 0) sceIoWrite(f, b, (SceSize)n); sceIoClose(f); } }
     if (rc >= 0) g_ime_active = 1;
 }
 

@@ -22,7 +22,7 @@ No *Minecraft: Story Mode* code or assets are included or linked — supply your
 ## Requirements
 
 - Homebrew-enabled Vita / PS TV (HENkaku ensō, 3.60 / 3.65) with **VitaShell**.
-- `kubridge.skprx` in `ur0:tai/` (listed under `*KERNEL` in `config.txt`) and `libshacccg.suprx` in `ur0:data/`.
+- `kubridge.skprx` and `fd_fix.skprx` in `ur0:tai/` (both listed under `*KERNEL` in `config.txt`), and `libshacccg.suprx` in `ur0:data/`. `fd_fix.skprx` raises the open-file limit the loader needs to stream the game archives — without it, archive reads thrash on `EMFILE`. (Don't use it alongside the rePatch plugin.)
 - Your own legally-owned game: the `com.telltalegames.minecraft100` APK + its OBB. Target **v1.37** (`40137`).
 
 ## Data folder

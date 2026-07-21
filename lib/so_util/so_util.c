@@ -322,6 +322,29 @@ int so_file_load(so_module *mod, const char *filename, uintptr_t load_addr) {
     return _so_load(mod, so_blockid, so_data, load_addr);
 }
 
+/* PERF: a relocation into a USER_RW data segment (GOT / .data.rel.ro — ~99% of a
+ * C++ .so's relocs) is directly writable from user mode, so store it in place and
+ * skip the kubridge kernel round-trip. Only relocs that land in the RX text block
+ * need kuKernelCpuUnrestrictedMemcpy. Defaulting to the kernel copy means a wrong
+ * range guess degrades to "slow", never a fault. Per-reloc syscalls were the
+ * dominant cost of the ~30s boot; this removes them for the data segments. */
+static inline void so_reloc_store(so_module *mod, uintptr_t *ptr, uintptr_t val) {
+    uintptr_t p = (uintptr_t)ptr;
+    /* Direct store only for a 4-byte-aligned target inside a writable data
+     * segment. An unaligned target (rare — e.g. a relocated pointer in a packed
+     * struct) falls through to the byte-wise kubridge copy, which is what the
+     * original always used and which is alignment-agnostic. */
+    if ((p & 3u) == 0u) {
+        for (int j = 0; j < mod->n_data; j++) {
+            if (p >= mod->data_base[j] && p < mod->data_base[j] + mod->data_size[j]) {
+                *ptr = val;
+                return;
+            }
+        }
+    }
+    kuKernelCpuUnrestrictedMemcpy(ptr, &val, sizeof(uintptr_t));
+}
+
 int so_relocate(so_module *mod) {
     uintptr_t val;
     for (int i = 0; i < mod->num_reldyn + mod->num_relplt; i++) {
@@ -334,19 +357,19 @@ int so_relocate(so_module *mod) {
             case R_ARM_ABS32:
                 if (sym->st_shndx != SHN_UNDEF) {
                     val = *ptr + mod->text_base + sym->st_value;
-                    kuKernelCpuUnrestrictedMemcpy(ptr, &val, sizeof(uintptr_t));
+                    so_reloc_store(mod, ptr, val);
                 }
                 break;
             case R_ARM_RELATIVE:
                 val = *ptr + mod->text_base;
-                kuKernelCpuUnrestrictedMemcpy(ptr, &val, sizeof(uintptr_t));
+                so_reloc_store(mod, ptr, val);
                 break;
             case R_ARM_GLOB_DAT:
             case R_ARM_JUMP_SLOT:
             {
                 if (sym->st_shndx != SHN_UNDEF) {
                     val = mod->text_base + sym->st_value;
-                    kuKernelCpuUnrestrictedMemcpy(ptr, &val, sizeof(uintptr_t));
+                    so_reloc_store(mod, ptr, val);
                 }
                 break;
             }
@@ -449,10 +472,10 @@ int so_resolve(so_module *mod, so_default_dynlib *default_dynlib, int size_defau
                             sceClibPrintf("Resolved from dependencies: %s\n", mod->dynstr + sym->st_name);
                             if (type == R_ARM_ABS32) {
                                 val = *ptr + link;
-                                kuKernelCpuUnrestrictedMemcpy(ptr, &val, sizeof(uintptr_t));
+                                so_reloc_store(mod, ptr, val);
                             } else {
                                 val = link;
-                                kuKernelCpuUnrestrictedMemcpy(ptr, &val, sizeof(uintptr_t));
+                                so_reloc_store(mod, ptr, val);
                             }
                             resolved = 1;
                         }
@@ -461,7 +484,7 @@ int so_resolve(so_module *mod, so_default_dynlib *default_dynlib, int size_defau
                     for (int j = 0; j < size_default_dynlib / sizeof(so_default_dynlib); j++) {
                         if (strcmp(mod->dynstr + sym->st_name, default_dynlib[j].symbol) == 0) {
                             val = default_dynlib[j].func;
-                            kuKernelCpuUnrestrictedMemcpy(ptr, &val, sizeof(uintptr_t));
+                            so_reloc_store(mod, ptr, val);
                             resolved = 1;
                             break;
                         }

@@ -463,14 +463,6 @@ jmethodID GetMethodID(JNIEnv* env, jclass clazz, const char* _name, const char* 
         fjni_logv_dbg("[JNI] GetMethodID(env, 0x%x, \"%s\", \"%s\"): %i", (int)clazz, name, sig, (int)ret);
     } else {
         fjni_logv_err("[JNI] GetMethodID(env, 0x%x, \"%s\", \"%s\"): not found", (int)clazz, name, sig, (int)ret);
-        /* KEYBOARD HUNT (2026-07-18): logging is off in release, so append every
-         * UNRESOLVED JNI method the game requests to a diag file via sceIo. When
-         * text entry (rename) is attempted, the method it calls to raise the
-         * keyboard will appear here — that's the hook point we've been missing. */
-        { extern int sceIoOpen(const char *, int, int); extern int sceIoWrite(int, const void *, unsigned int); extern int sceIoClose(int);
-          int f = sceIoOpen("ux0:data/mcsm/jni_unresolved.txt", 0x0002 | 0x0200 | 0x0100 /*SCE_O_WRONLY|SCE_O_CREAT|SCE_O_APPEND*/, 0777);
-          if (f >= 0) { char b[160]; int n = snprintf(b, sizeof(b), "GetMethodID not-found: %s  sig=%s\n", name, sig ? sig : "?");
-                        if (n > 0) sceIoWrite(f, b, (unsigned)n); sceIoClose(f); } }
     }
 
     return ret;
@@ -1028,11 +1020,6 @@ jmethodID GetStaticMethodID(JNIEnv* env, jclass clazz, const char* _name, const 
         fjni_logv_dbg("[JNI] GetStaticMethodID(env, 0x%x, \"%s\", \"%s\"): %i", (int)clazz, name, sig, (int)ret);
     } else {
         fjni_logv_err("[JNI] GetStaticMethodID(env, 0x%x, \"%s\", \"%s\"): not found", (int)clazz, name, sig, (int)ret);
-        /* KEYBOARD HUNT (static path, 2026-07-18): log unresolved static methods too. */
-        { extern int sceIoOpen(const char *, int, int); extern int sceIoWrite(int, const void *, unsigned int); extern int sceIoClose(int);
-          int f = sceIoOpen("ux0:data/mcsm/jni_unresolved.txt", 0x0002 | 0x0200 | 0x0100, 0777);
-          if (f >= 0) { char b[160]; int n = snprintf(b, sizeof(b), "GetStaticMethodID not-found: %s  sig=%s\n", name, sig ? sig : "?");
-                        if (n > 0) sceIoWrite(f, b, (unsigned)n); sceIoClose(f); } }
     }
 
     return ret;
