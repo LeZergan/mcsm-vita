@@ -142,6 +142,7 @@ add_executable(${CMAKE_PROJECT_NAME}
                source/reimpl/sys.c
                source/reimpl/time64.c
                source/reimpl/asset_manager.cpp
+               source/utils/config.c
                source/utils/dialog.c
                source/utils/glutil.c
                source/utils/init.c

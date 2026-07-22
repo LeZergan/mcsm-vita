@@ -29,6 +29,7 @@
 #include "utils/launch_state.h"
 #include "utils/logger.h"
 #include "utils/utils.h"
+#include "utils/config.h"
 
 /* Live loading-screen hooks: track the current asset + a boot/load timer.
  * In PVR mode, redraws are opportunistic: loading_screen_tick() renders only
@@ -382,27 +383,18 @@ static uint32_t mcsm_frame_pace_us(void) {
     static int requested_fps = 30;
     if (!initialized) {
         initialized = 1;
-        FILE *f = mcsm_open_setting("fps_cap.txt", "r");
-        if (f) {
-            int fps = 0;
-            if (fscanf(f, "%d", &fps) == 1) {
-                if (fps <= 0 || fps > 120) {
-                    pace_us = 0; /* uncapped */
-                    requested_fps = fps;
-                } else {
-                    requested_fps = fps;
-                    /* Same vblank-quantized undershoot as the present-lock
-                     * (glutil.c gl_init) so the loop pace and present lock share one
-                     * phase and vsync catches the intended vblank instead of the
-                     * 33.3ms-on-boundary beat that dropped idle frames to 20fps. */
-                    const int vb = 16667;
-                    int per = 1000000 / fps;
-                    int k = (per + vb / 2) / vb;
-                    if (k < 1) k = 1;
-                    pace_us = (uint32_t)(k * vb - 2500);
-                }
-            }
-            fclose(f);
+        int fps = mcsm_cfg()->fps_cap;
+        requested_fps = fps;
+        if (fps <= 0 || fps > 120) {
+            pace_us = 0; /* uncapped */
+        } else {
+            /* Same vblank-quantized undershoot as the present-lock (glutil.c
+             * gl_init) so the loop pace and present lock share one phase. */
+            const int vb = 16667;
+            int per = 1000000 / fps;
+            int k = (per + vb / 2) / vb;
+            if (k < 1) k = 1;
+            pace_us = (uint32_t)(k * vb - 2500);
         }
         l_info("Frame pace: %u us (%s requested=%d)",
                pace_us,
@@ -1252,21 +1244,7 @@ static void resolve_animation_runtime_flags(void) {
  * real cost can be measured / the user can pick perf-vs-animation:
  * ux0:data/mcsm/anim_full.txt = "0" -> disable (faster, animation degraded),
  * absent or "1" -> full (default, current behaviour). */
-static int mcsm_anim_full(void) {
-    static int initialized = 0;
-    static int full = 1;
-    if (!initialized) {
-        initialized = 1;
-        FILE *f = fopen("ux0:data/mcsm/anim_full.txt", "r");
-        if (f) {
-            int v = 1;
-            if (fscanf(f, "%d", &v) == 1) full = (v != 0);
-            fclose(f);
-        }
-        l_info("ANIM: recursive contribution = %s", full ? "FULL" : "OFF(perf)");
-    }
-    return full;
-}
+static int mcsm_anim_full(void) { return mcsm_cfg()->skinning_full; }
 
 /* ANIMATION UPDATE-RATE THROTTLE (2026-07-20, priority-3 sim lever). The heaviest
  * scenes spend ~50ms in the sim, dominated by animation blend across many
@@ -3716,33 +3694,10 @@ static int mcsm_file_present(const char *path) {
 static signed char s_ch_txt[9];        /* [1..8]: 1=force-show, 0=force-hide, -1=unspecified */
 static int         s_ch_txt_loaded = 0;
 static void mcsm_load_chapters_txt(void) {
-    int i;
-    for (i = 0; i < 9; i++) s_ch_txt[i] = -1;
+    const McsmGame *g = mcsm_game();
+    s_ch_txt[0] = -1;
+    for (int i = 0; i < 8; i++) s_ch_txt[i + 1] = (signed char)g->chapters[i];
     s_ch_txt_loaded = 1;
-    FILE *f = mcsm_open_setting("chapters.txt", "rb");
-    if (!f) return;
-    char buf[1024];
-    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
-    fclose(f);
-    buf[n] = '\0';
-    /* forgiving scan for tokens "<N> = <value>" with N in 1..8 */
-    size_t k;
-    for (k = 0; k < n; k++) {
-        char d = buf[k];
-        if (d < '1' || d > '8') continue;
-        if (k > 0) {                                   /* digit must start a token */
-            char p = buf[k - 1];
-            if ((p >= '0' && p <= '9') || (p >= 'a' && p <= 'z') || (p >= 'A' && p <= 'Z')) continue;
-        }
-        size_t j = k + 1;
-        while (j < n && (buf[j] == ' ' || buf[j] == '\t')) j++;
-        if (j >= n || buf[j] != '=') continue;
-        j++;
-        while (j < n && (buf[j] == ' ' || buf[j] == '\t')) j++;
-        char v = (j < n) ? buf[j] : '\0';
-        if (v == 't' || v == 'T' || v == '1' || v == 'y' || v == 'Y')      s_ch_txt[d - '0'] = 1;
-        else if (v == 'f' || v == 'F' || v == '0' || v == 'n' || v == 'N') s_ch_txt[d - '0'] = 0;
-    }
 }
 /* Which chapter (1..8) is this availability query about, or 0 if we can't tell.
  * Handles both a string set-name ("...Minecraft10N...") and a numeric index. */
@@ -3850,11 +3805,9 @@ static void mcsm_forced_language_name(char *out, int outsz) {
     if (!s_resolved) {
         s_resolved = 1;
         s_name[0] = '\0';
-        FILE *f = mcsm_open_setting("language.txt", "r");
-        if (f) {
+        {
             char v[32] = "";
-            if (fscanf(f, "%31s", v) != 1) v[0] = '\0';
-            fclose(f);
+            strncpy(v, mcsm_game()->language, sizeof(v) - 1);
             if (v[0]) {
                 static const struct { const char *code; const char *name; } m[] = {
                     { "en", "English" }, { "ru", "Russian" }, { "fr", "French" },
@@ -4908,18 +4861,7 @@ static int hook_job_init(void) {
  * report FALSE makes the engine treat no light as a shadow caster, so it skips
  * the whole shadow setup + pass. Opt-in via ux0:data/mcsm/no_shadows.txt (visual
  * trade: objects lose cast shadows). */
-static int g_shadows_off = -1;
-static int shadows_disabled(void) {
-    if (g_shadows_off < 0) {
-        /* Perf baked in (no toggle needed): shadows OFF by default — the shadow
-         * setup + pass costs ~11% verts in dense scenes and is the single biggest
-         * safe GPU saving. Place settings/shadows.txt to force them back ON. */
-        FILE *on = mcsm_open_setting("shadows.txt", "r");
-        if (on) { fclose(on); g_shadows_off = 0; }
-        else    { g_shadows_off = 1; }
-    }
-    return g_shadows_off == 1;
-}
+static int shadows_disabled(void) { return !mcsm_cfg()->shadows; }
 static so_hook g_hook_is_shadow_light;
 static int hook_is_shadow_light(void *self) {
     if (shadows_disabled()) return 0;
@@ -5598,8 +5540,11 @@ static int render_quality_override(void) {
     static int v = -2;   /* -2 unread, -1 no override, >=0 forced level */
     if (v == -2) {
         v = -1;
+        /* MCSM boots at q=15 (logged) — outside the 0-4 desktop enum, so its mobile
+         * build uses a wider scale. Accept 0..15; the engine already runs 15 without
+         * crashing, so any value in range is safe to probe (revert = delete the file). */
         FILE *f = mcsm_open_setting("render_quality.txt", "r");
-        if (f) { int q = -1; if (fscanf(f, "%d", &q) == 1 && q >= 0 && q <= 2) v = q; fclose(f); }
+        if (f) { int q = -1; if (fscanf(f, "%d", &q) == 1 && q >= 0 && q <= 15) v = q; fclose(f); }
     }
     return v;
 }
@@ -5612,11 +5557,7 @@ static void hook_set_render_quality(void *self, int quality) {
     SO_CONTINUE_VOID(g_hook_set_render_quality, self, quality);
 }
 
-static int outlines_disabled(void) {
-    static int v = -1;
-    if (v < 0) { FILE *f = mcsm_open_setting("no_outlines.txt", "r"); v = f ? (fclose(f), 1) : 0; }
-    return v == 1;
-}
+static int outlines_disabled(void) { return !mcsm_cfg()->outlines; }
 static so_hook g_hook_set_toon_outline;
 static void hook_set_toon_outline(void *self, int on) {
     if (outlines_disabled()) on = 0;
@@ -5674,13 +5615,8 @@ static void hook_scene_near_detail(void *self, float v) {
  * visual pop at the boundary, scene-dependent (only helps scenes with distant
  * geometry), so default-off + per-scene tuned. Logs the natural far value. */
 static float far_clip_cap(void) {
-    static float v = -2.0f;
-    if (v < -1.0f) {
-        v = -1.0f;
-        FILE *f = mcsm_open_setting("far_clip.txt", "r");
-        if (f) { float x = 0.0f; if (fscanf(f, "%f", &x) == 1 && x >= 50.0f && x <= 100000.0f) v = x; fclose(f); }
-    }
-    return v;
+    int d = mcsm_cfg()->draw_distance;   /* 0 = engine default (no clamp) */
+    return d > 0 ? (float)d : -1.0f;
 }
 static so_hook g_hook_camera_far_clip;
 static void hook_camera_far_clip(void *self, float v) {

@@ -211,6 +211,24 @@ static int mcsm_resolve_core_mask(void) {
     return g_core3_mask;
 }
 
+/* Affinity mask for auxiliary threads we ask vitaGL to spawn (the GC thread).
+ * Returns system core 3 (0x00080000) ONLY if capUnlocker actually frees it this
+ * boot; otherwise the 3 user cores (0x00070000). Pinning a thread to the locked
+ * core 3 (as a hardcoded 0x00080000 does) leaves it unschedulable on any Vita
+ * WITHOUT capUnlocker -> vitaGL's GC never runs -> the GPU present wedges. Honors
+ * no_core3.txt via mcsm_resolve_core_mask(). */
+int mcsm_gc_core_mask(void) {
+    if (g_core3_mask < 0) {
+        /* Not yet resolved by a loader thread's probe — resolve + confirm now. */
+        if (mcsm_resolve_core_mask() & 0x00080000) {
+            SceUID self = sceKernelGetThreadId();
+            if (sceKernelChangeThreadCpuAffinityMask(self, 0x000F0000) < 0)
+                g_core3_mask = 0x00070000;   /* capUnlocker absent */
+        }
+    }
+    return (g_core3_mask & 0x00080000) ? 0x00080000 : 0x00070000;
+}
+
 typedef struct { void *(*start)(void *); void *param; } mcsm_thr_wrap;
 static void *mcsm_thr_entry(void *arg) {
     mcsm_thr_wrap *w = (mcsm_thr_wrap *)arg;

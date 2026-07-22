@@ -11,6 +11,7 @@
 
 #include "reimpl/egl.h"
 #include "utils/utils.h"
+#include "utils/config.h"
 #include "utils/dialog.h"
 #include "utils/logger.h"
 #include "utils/launch_state.h"
@@ -1157,8 +1158,15 @@ void gl_init() {
      * vitaGL's GC thread to core 3 (0x80000, freed by the shipped capUnlocker) so it
      * doesn't steal render cycles are both real wins. vglUseCachedMem must precede vglInit. */
     vglUseCachedMem(GL_TRUE);                    /* faster CPU->GPU uploads (baked-in default) */
-    vglSetupGarbageCollector(160, 0x00080000);   /* vitaGL GC thread -> core3, frees the engine core (baked-in default) */
-    l_info("gl_init: cached-mem + GC-on-core3 enabled (defaults)");
+    /* GC thread affinity: core 3 ONLY if capUnlocker actually freed it this boot,
+     * else the 3 user cores. A hardcoded core-3 pin makes the GC unschedulable on
+     * any Vita without capUnlocker -> GC never runs -> vglSwapBuffers wedges on the
+     * first menu frame (the "works on my Vita, hangs on testers'" stall). */
+    extern int mcsm_gc_core_mask(void);
+    int gc_mask = mcsm_gc_core_mask();
+    vglSetupGarbageCollector(160, gc_mask);
+    l_info("gl_init: cached-mem + GC affinity=0x%05X (%s)", (unsigned)gc_mask,
+           (gc_mask & 0x00080000) ? "core3 via capUnlocker" : "user cores (no capUnlocker)");
     vglInitExtended(0, RS_NATIVE_W, RS_NATIVE_H, ram_reserve_mb * 1024 * 1024, SCE_GXM_MULTISAMPLE_NONE);
     /* vsync ON (helps a little) + a steady 30fps pacing cap in the game loop
      * (see hook_gameengine_loop / mcsm_pace_frame) is the real judder fix. Plain
@@ -1170,11 +1178,8 @@ void gl_init() {
      * (novsync.txt) stops the CPU blocking on vblank = highest throughput, but
      * timing then rides the sleep clock -> can judder. Tunable so the user can
      * pick fastest-throughput vs smoothest. */
-    {
-        FILE *nv = fopen("ux0:data/mcsm/novsync.txt", "r");
-        if (nv) { fclose(nv); vglWaitVblankStart(GL_FALSE); l_info("presenter: vsync OFF (novsync.txt) — max throughput"); }
-        else { vglWaitVblankStart(GL_TRUE); l_info("presenter: vsync ON (precise vblank lock)"); }
-    }
+    if (!mcsm_cfg()->vsync) { vglWaitVblankStart(GL_FALSE); l_info("presenter: vsync OFF (graphics.txt) — max throughput"); }
+    else                    { vglWaitVblankStart(GL_TRUE);  l_info("presenter: vsync ON (precise vblank lock)"); }
 
     /* THE FIX (2026-06-22): shark_init returns 0 (libshacccg loads fine!), but
      * vitaGL's own startShaderCompiler uses vglMalloc — which fails — so it never
@@ -1232,10 +1237,8 @@ void gl_init() {
     /* Present-side frame lock period from fps_cap.txt (read once, here, where
      * file I/O is safe — NOT in gl_swap). */
     {
-        FILE *cf = mcsm_open_setting("fps_cap.txt", "r");
-        if (cf) {
-            int fps = 0;
-            if (fscanf(cf, "%d", &fps) == 1 && fps > 0 && fps <= 120) {
+        int fps = mcsm_cfg()->fps_cap;
+        if (fps > 0 && fps <= 120) {
                 /* VBLANK-QUANTIZED PRESENT LOCK (2026-07-17): a plain 1000000/fps
                  * period lands the sleep-release right ON a vblank boundary; adaptive
                  * vsync then misses it by a hair and snaps to the NEXT vblank -> idle
@@ -1248,8 +1251,6 @@ void gl_init() {
                 int k = (per + vb / 2) / vb;           /* nearest whole vblanks */
                 if (k < 1) k = 1;
                 g_present_period_us = k * vb - 2500;
-            }
-            fclose(cf);
         }
         /* DE-STACK PACING opt-in (2026-07-17, ux0:data/mcsm/no_present_lock.txt):
          * with vsync ON there are THREE period gates at the same rate but
@@ -3464,7 +3465,12 @@ static int neutralize_unsupported_glsl(char **src_io, size_t *len_io) {
     /* Disable fragment-depth writes without leaving unsupported built-ins for
      * ShaccCg. Assignments become writes to an ordinary throwaway float. */
     if (strstr(src, "gl_FragDepth")) {
-        changed += glsl_prepend_alloc(src_io, len_io, "float mcsm_unused_frag_depth;\n");
+        /* Explicit precision: this declaration is prepended to the TOP of the
+         * shader, i.e. BEFORE the `precision mediump float;` statement. A bare
+         * `float` there has no default precision yet — tolerant compilers assume
+         * one, but a STRICT libshacccg errors/HANGS on "no precision specified".
+         * Qualifying it mediump makes it valid regardless of position. */
+        changed += glsl_prepend_alloc(src_io, len_io, "mediump float mcsm_unused_frag_depth;\n");
         src = *src_io;
         changed += glsl_replace_alloc(src_io, len_io, "gl_FragDepthEXT", "mcsm_unused_frag_depth");
         src = *src_io;
@@ -3567,7 +3573,41 @@ void glShaderSource_soloader(GLuint shader, GLsizei count,
                    "(framebuffer-fetch/shadow/depth/lod) so the shader can compile.", shader);
         }
     }
+    /* FRAGMENT-SHADER highp GUARD — the real cross-Vita fix. GLSL ES guarantees
+     * highp in VERTEX shaders but makes it OPTIONAL in FRAGMENT shaders; a fragment
+     * shader using highp (Telltale's `uhi`/bare `highp`) must guard it or a STRICT
+     * libshacccg errors/HANGS, while a lenient one (the dev's .92) compiles it. This
+     * is exactly why vertex shaders compile on the testers but the first highp
+     * FRAGMENT shader hangs. Standard shim: demote highp->mediump ONLY where the
+     * compiler doesn't advertise fragment-highp support -> zero change on devices
+     * that do (no visual/behaviour change on a working setup). */
+    {
+        GLint stype = 0;
+        glGetShaderiv(shader, GL_SHADER_TYPE, &stype);
+        if (stype == GL_FRAGMENT_SHADER) {
+            static unsigned s_hp_logged = 0;
+            glsl_prepend_alloc(&str, &total_length,
+                "#ifndef GL_FRAGMENT_PRECISION_HIGH\n#define highp mediump\n#endif\n");
+            if (s_hp_logged++ < 4U)
+                l_info("glShaderSource(%u): added fragment highp compatibility guard.", shader);
+        }
+    }
 #endif
+
+    /* DIAG (opt-in via dump_shaders.txt): write the cooked (post-neutralization)
+     * source the compiler actually receives, to ux0:data/mcsm/cooked/shader_<id>.glsl,
+     * so it can be pulled + inspected. No effect on normal boots. */
+    {
+        static int s_dump = -1;
+        if (s_dump < 0) { FILE *df = mcsm_open_setting("dump_shaders.txt", "r");
+                          s_dump = df ? (fclose(df), 1) : 0;
+                          if (s_dump) sceIoMkdir("ux0:data/mcsm/cooked", 0777); }
+        if (s_dump) {
+            char p[96]; snprintf(p, sizeof(p), "ux0:data/mcsm/cooked/shader_%u.glsl", (unsigned)shader);
+            SceUID fd = sceIoOpen(p, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
+            if (fd >= 0) { sceIoWrite(fd, str, total_length); sceIoClose(fd); }
+        }
+    }
 
     track_shader_source(shader, str, total_length);
     load_shader(shader, str, total_length);

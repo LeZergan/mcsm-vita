@@ -8,6 +8,7 @@
 
 #include "utils/utils.h"
 #include "utils/logger.h"
+#include "utils/config.h"
 
 #include <psp2/io/fcntl.h>
 #include <psp2/io/stat.h>
@@ -115,43 +116,13 @@ FILE * mcsm_open_setting(const char * basename, const char * mode) {
 
 void mcsm_read_clock_cfg(McsmClockCfg * cfg) {
     if (!cfg) return;
-    /* Defaults: ARM PINNED at 444 (arm_min == arm_max -> single level -> the
-     * governor stays idle). Post-optimization the CPU has real frame-time
-     * headroom, so adaptive downclocking became counter-productive: a light
-     * frame drops the clock to 266, then the next heavy frame runs slow at 266
-     * before it ramps back = visible fps fluctuation. Pinning 444 gives the
-     * steadiest frame rate. Battery scaling is opt-in via clock.txt "min <MHz>". */
+    /* Pinned 444 by default (arm_min == arm_max -> governor idle -> steadiest
+     * fps). The battery profile sets clock=adaptive, dropping the floor to 266 so
+     * the governor can downclock light frames to save power. */
     cfg->governor_off = 0;
-    cfg->arm_min = 444;
-    cfg->arm_max = 444;
-    cfg->gpu     = 222;
-
-    FILE * f = mcsm_open_setting("clock.txt", "r");
-    if (!f) return;
-
-    char line[96];
-    while (fgets(line, sizeof(line), f)) {
-        if (line[0] == '#' || line[0] == ';') continue;   /* comment */
-        char tok[16] = "";
-        if (sscanf(line, " %15s", tok) == 1) {
-            if (strcmp(tok, "off") == 0 || strcmp(tok, "OFF") == 0 ||
-                strcmp(tok, "disable") == 0 || strcmp(tok, "disabled") == 0) {
-                cfg->governor_off = 1;
-                continue;
-            }
-        }
-        int v;
-        if (sscanf(line, " min %d", &v) == 1 || sscanf(line, " min=%d", &v) == 1) {
-            if (v >= 111 && v <= 500) cfg->arm_min = v;
-        } else if (sscanf(line, " max %d", &v) == 1 || sscanf(line, " max=%d", &v) == 1) {
-            if (v >= 222 && v <= 500) cfg->arm_max = v;
-        } else if (sscanf(line, " gpu %d", &v) == 1 || sscanf(line, " gpu=%d", &v) == 1) {
-            if (v >= 111 && v <= 266) cfg->gpu = v;
-        }
-    }
-    fclose(f);
-
-    if (cfg->arm_min > cfg->arm_max) cfg->arm_min = cfg->arm_max;
+    cfg->gpu = 222;
+    if (mcsm_cfg()->clock_adaptive) { cfg->arm_min = 266; cfg->arm_max = 444; }
+    else                            { cfg->arm_min = 444; cfg->arm_max = 444; }
 }
 
 bool file_load(const char * path, uint8_t ** buffer, size_t * size) {

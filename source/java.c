@@ -15,6 +15,7 @@
 #include "utils/launch_state.h"
 #include "utils/logger.h"
 #include "utils/utils.h"
+#include "utils/config.h"
 #include "reimpl/controls.h"
 
 enum mcsm_method_ids {
@@ -172,45 +173,25 @@ static void sanitize_framebuffer_override(int *w, int *h, int *sanitized) {
 static void ensure_framebuffer_override_loaded(void) {
     if (g_fb_override_loaded) return;
     g_fb_override_loaded = 1;
-    FILE *fp = mcsm_open_setting("fb_override.txt", "r");
-    if (!fp) {
-        l_info("Render-scale: %dx%d (default Vita performance mode)", g_fb_width, g_fb_height);
-        return;
-    }
-    char line[64];
-    int parsed = 0;
-    if (fgets(line, sizeof(line), fp)) {
-        int w = 0, h = 0;
-        if (sscanf(line, "%dx%d", &w, &h) == 2 || sscanf(line, "%d %d", &w, &h) == 2) {
-            if (w > 0 && h > 0) {
-                const int requested_w = w;
-                const int requested_h = h;
-                int sanitized = 0;
-                sanitize_framebuffer_override(&w, &h, &sanitized);
-                g_fb_override_enabled = 1;
-                g_fb_override_width = w;
-                g_fb_override_height = h;
-                g_fb_width = w;
-                g_fb_height = h;
-                parsed = 1;
-                if (sanitized) {
-                    l_info("Render-scale: %dx%d (from fb_override.txt, requested=%dx%d sanitized)", w, h, requested_w, requested_h);
-                } else {
-                    l_info("Render-scale: %dx%d (from fb_override.txt)", w, h);
-                }
-            }
-        }
-    }
-    if (!parsed) {
+    int w = mcsm_cfg()->render_w, h = mcsm_cfg()->render_h;
+    if (w > 0 && h > 0) {
+        const int requested_w = w;
+        const int requested_h = h;
+        int sanitized = 0;
+        sanitize_framebuffer_override(&w, &h, &sanitized);
         g_fb_override_enabled = 1;
-        g_fb_override_width = MCSM_DEFAULT_RENDER_W;
-        g_fb_override_height = MCSM_DEFAULT_RENDER_H;
-        g_fb_width = MCSM_DEFAULT_RENDER_W;
-        g_fb_height = MCSM_DEFAULT_RENDER_H;
-        l_info("Render-scale: %dx%d (invalid fb_override.txt, using default Vita performance mode)",
-               g_fb_width, g_fb_height);
+        g_fb_override_width = w;
+        g_fb_override_height = h;
+        g_fb_width = w;
+        g_fb_height = h;
+        if (sanitized) {
+            l_info("Render-scale: %dx%d (from graphics.txt, requested=%dx%d sanitized)", w, h, requested_w, requested_h);
+        } else {
+            l_info("Render-scale: %dx%d (from graphics.txt)", w, h);
+        }
+    } else {
+        l_info("Render-scale: %dx%d (engine default)", g_fb_width, g_fb_height);
     }
-    fclose(fp);
 }
 
 static int clamp_audio_rate(int rate) {
@@ -609,8 +590,7 @@ static jobject GetLocale(jmethodID id, va_list args) {
     static char loc[16] = "";
     static int logged = 0;
     if (!loc[0]) {
-        FILE *f = mcsm_open_setting("language.txt", "r");
-        if (f) { if (fscanf(f, "%15s", loc) != 1) loc[0] = '\0'; fclose(f); }
+        strncpy(loc, mcsm_game()->language, sizeof(loc) - 1);
         if (!loc[0]) { strcpy(loc, "en_US"); }
     }
     if (!logged) { logged = 1; l_info("LANG: getLocale -> \"%s\"", loc); }
