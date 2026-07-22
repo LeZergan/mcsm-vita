@@ -583,7 +583,7 @@ void soloader_init_all() {
     /* BUILD STAMP — first line of every log so old vs new eboot is unmistakable.
      * If this line is ABSENT, an OLD eboot is running (VitaShell kept it on a
      * same-Title-ID install → delete the bubble and reinstall). */
-    telemetry_log("BOOT", "BUILD=2026-07-22-r4-coreFIX+settings (GC user-core fallback; profile+override cfg; chapters auto/toggles)");
+    telemetry_log("BOOT", "BUILD=2026-07-23-r14-signedin (GetCredential returns fake stored credential string = signed-in; +IsRegistered/Online; choices online; season owned)");
     telemetry_log("BOOT", "soloader_init_all start");
 
 	// Launch `app0:configurator.bin` on `-config` init param

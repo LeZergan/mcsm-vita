@@ -122,6 +122,12 @@ static int g_animation_flag_symbols_resolved = 0;
  * threads doing async resource loading aren't starved by the render thread
  * spinning at ~490fps (it presents but vsync is off, so it never blocks). */
 static volatile int g_boot_scene_active = 0;
+/* 1 while the current opened scene is a MENU (ui_boot / ui_menuMain / episode
+ * select). Set in hook_lua_sceneopen. Used to report "online" (internet +
+ * license server) ONLY during gameplay: the crowd-choice stats need online at
+ * end-of-episode, but reporting online at the MENU makes it show the "sign up
+ * for full access" upsell banner. Default 1 (we start at the boot menu). */
+static volatile int g_at_menu = 1;
 static volatile uintptr_t g_overlay_render_frame = 0;
 
 enum {
@@ -2901,6 +2907,7 @@ BOOT_LUA_TRACER(hook_lua_rset_loadingcall, "luaResourceSetLoadingCall", g_hook_l
 // which is defined later (after the ChorePlay/scene tracers that need
 // LuaToLStringFn etc.).
 static int lua_push_forced_bool(void *L, int value, const char *label);
+static int lua_push_forced_string(void *L, const char *value, const char *label);
 static int lua_push_forced_integer(void *L, int value, const char *label);
 
 // Login/connect/cloud-sync bypass (2026-06-21). The Telltale authentication
@@ -2930,7 +2937,20 @@ static int lua_push_forced_integer(void *L, int value, const char *label);
 LOGIN_BYPASS(hook_lua_show_password_box, "luaShowPasswordBox", g_hook_lua_show_password_box)
 LOGIN_BYPASS(hook_lua_is_password_box_finished, "luaIsPasswordBoxFinished", g_hook_lua_is_password_box_finished)
 LOGIN_BYPASS(hook_lua_get_password_box_results, "luaGetPasswordBoxResults", g_hook_lua_get_password_box_results)
-LOGIN_BYPASS(hook_lua_network_get_credential, "luaNetworkAPIGetCredential", g_hook_lua_network_get_credential)
+/* GetCredential returns a fake NON-EMPTY credential (2026-07-23). The LOGIN_BYPASS
+ * version returned bool true, which the menu read as "no stored credential" -> the
+ * "sign up for full access" MyTelltale banner. A non-empty string reads as a valid
+ * stored credential = already signed in. Network I/O that would USE the credential
+ * (SessionLog/CloudSync/uploads) is still bypassed to no-ops, so nothing reaches
+ * the dead auth server. */
+static so_hook g_hook_lua_network_get_credential;
+static int hook_lua_network_get_credential(void *L) {
+    static uint32_t count = 0;
+    launch_state_mark_progress();
+    if (++count <= 8U) l_info("FIX: luaNetworkAPIGetCredential -> stored credential (signed-in) count=%u", count);
+    int ret = lua_push_forced_string(L, "mcsm_local_ttg_cred", "NetworkAPIGetCredential");
+    return ret >= 0 ? ret : SO_CONTINUE(int, g_hook_lua_network_get_credential, L);
+}
 LOGIN_BYPASS(hook_lua_session_log_process, "luaSessionLogProcess", g_hook_lua_session_log_process)
 LOGIN_BYPASS(hook_lua_cloud_sync_userdata, "luaNetworkAPICloudSyncUserData", g_hook_lua_cloud_sync_userdata)
 LOGIN_BYPASS(hook_lua_upload_cached, "luaUploadCachedObjectToServer", g_hook_lua_upload_cached)
@@ -3345,6 +3365,13 @@ static int hook_lua_sceneopen(void *L) {
     launch_state_mark_progress();
     const char *nm = trace_arg_str(L, 1);
     l_info("Diag: luaSceneOpen #%u scene='%s'", count, nm ? nm : "(non-string)");
+    /* Menu vs gameplay (see g_at_menu): menu scenes are ui_boot / *menuMain* /
+     * ui_select* (episode select). Anything else is gameplay -> report online so
+     * end-of-episode crowd-choice stats work; menu stays offline -> no upsell. */
+    if (nm) {
+        g_at_menu = (strstr(nm, "menu") || strstr(nm, "ui_boot") ||
+                     strstr(nm, "ui_select") || strstr(nm, "episodeSelect")) ? 1 : 0;
+    }
 #ifndef USE_PVR_PSP2
     /* SceneOpen loads the scene's textures synchronously (multi-second freeze).
      * Flag it so glutil's texture-upload path animates the loading screen, and
@@ -3632,18 +3659,31 @@ static so_hook g_hook_platform_android_is_user_space_available;
 
 static int hook_lua_platform_is_connected_to_internet(void *L) {
     static uint32_t count = 0;
-    int ret = hook_forced_lua_bool(L, 0, "PlatformIsConnectedToInternet", &count);
+    /* CROWD-CHOICE STATS (2026-07-22): the end-of-episode "% of players" screen
+     * checks THIS right before reading the (locally-served) choice.prop and shows
+     * "offline" when it's false. Every real call happens in-game (device logs: all
+     * at frame ~3000+, none during the boot DLC verification), so report connected
+     * ONCE A SCENE IS LIVE and stay false during pure boot. License server stays
+     * false; internet-true+license-false is a benign real state (not the documented
+     * license-true+internet-false boot loop). Online once a scene is live (menu
+     * included) so the crowd-choice stats work; the upsell banner is killed
+     * separately by forcing the season purchased (IsEpisodePurchased=1). */
+    int forced = launch_state_scene_active() ? 1 : 0;
+    int ret = hook_forced_lua_bool(L, forced, "PlatformIsConnectedToInternet", &count);
     return ret >= 0 ? ret : SO_CONTINUE(int, g_hook_lua_platform_is_connected_to_internet, L);
 }
 
 static int hook_lua_platform_is_connected_to_license_server(void *L) {
     static uint32_t count = 0;
-    /* Must be false when internet is also false. Returning true while
-     * luaPlatformIsConnectedToInternet returns false creates an impossible
-     * state (license server reachable without internet) that traps the boot
-     * flow in a DLC verification retry loop (DLCStatus/PurchaseManager/
-     * DownloadManager loaded 8+ times as timestamp evidence). */
-    int ret = hook_forced_lua_bool(L, 0, "PlatformIsConnectedToLicenseServer", &count);
+    /* Tracks IsConnectedToInternet EXACTLY (both false at boot, both true once a
+     * scene is live). The documented DLC boot-loop is the "license-true +
+     * internet-false" IMPOSSIBLE state; keeping the two coupled means that combo
+     * never occurs. Reporting license-server connected in-game (alongside internet)
+     * makes the game consider full access VERIFIED, so the online menu stops
+     * showing the "sign up for full access" upsell banner. (2026-07-22)
+     * Gameplay-only (not the menu), coupled to the internet flag above. */
+    int forced = launch_state_scene_active() ? 1 : 0;
+    int ret = hook_forced_lua_bool(L, forced, "PlatformIsConnectedToLicenseServer", &count);
     return ret >= 0 ? ret : SO_CONTINUE(int, g_hook_lua_platform_is_connected_to_license_server, L);
 }
 
@@ -3773,8 +3813,14 @@ static int hook_lua_is_episode_purchased(void *L) {
     /* Gate "purchased/owned" by the same per-chapter availability as Available/
      * Downloaded. Previously hardcoded 1 (every episode owned), which made the
      * menu present CH2-8 as "installed" (and offer "restart chapter") even with
-     * no data. CH1 stays owned (mcsm_episode_available==1); empty chapters ->0. */
-    int ret = hook_forced_lua_bool(L, mcsm_episode_available(L), "IsEpisodePurchased", &count);
+     * no data.
+     * FORCED 1 AGAIN (2026-07-23): the online menu shows a "sign up for full
+     * access" upsell whenever ANY episode reads as not-purchased. Report the whole
+     * season as OWNED to kill it. The menu no longer presents empty chapters off
+     * THIS flag -- visibility/"installed" now runs off IsEpisodeAvailable +
+     * IsEpisodeDownloaded (both still per-chapter below), so CH3-8 without data
+     * stay hidden while the season counts as bought. */
+    int ret = hook_forced_lua_bool(L, 1, "IsEpisodePurchased", &count);
     return ret >= 0 ? ret : SO_CONTINUE(int, g_hook_lua_is_episode_purchased, L);
 }
 
@@ -3874,7 +3920,13 @@ static int hook_lua_platform_get_trial_timeout(void *L) {
 
 static int hook_lua_platform_can_user_make_purchases(void *L) {
     static uint32_t count = 0;
-    int ret = hook_forced_lua_bool(L, 1, "PlatformCanUserMakePurchases", &count);
+    /* FORCED FALSE (2026-07-22): every episode is already forced owned+licensed
+     * (IsEpisodePurchased->available, IsEpisodeUnlicensed->false, Licensed->true),
+     * so there is nothing to buy. Once the game reports "online" in-game (for the
+     * crowd-choice stats), true here made the menu show the Amazon store "sign up
+     * for full access" upsell banner. False = no store entry = no banner, and owned
+     * content is unaffected. */
+    int ret = hook_forced_lua_bool(L, 0, "PlatformCanUserMakePurchases", &count);
     return ret >= 0 ? ret : SO_CONTINUE(int, g_hook_lua_platform_can_user_make_purchases, L);
 }
 
@@ -4604,6 +4656,35 @@ static int hook_lua_platform_request_sign_in(void *L) {
     if (count <= 8U) l_info("FIX: luaPlatformRequestSignIn -> true (#%u)", count);
     int ret = lua_push_forced_bool(L, 1, "PlatformRequestSignIn");
     return ret >= 0 ? ret : SO_CONTINUE(int, g_hook_lua_platform_request_sign_in, L);
+}
+
+/* MyTelltale ACCOUNT (2026-07-23): when the game reports online (needed for the
+ * crowd-choice stats), the menu shows a "sign up for full access" banner unless
+ * it believes a MyTelltale account is registered. The auth server is dead, so
+ * force the registration/online checks TRUE — the game then treats the local
+ * offline user as a fully-registered account and drops the banner. Network I/O
+ * that would use the account is already bypassed (GetCredential/SessionLog/
+ * CloudSync return immediately), so nothing tries to actually reach the server. */
+static so_hook g_hook_lua_is_registered;
+static int hook_lua_is_registered(void *L) {
+    static uint32_t count = 0;
+    if (++count <= 8U) l_info("FIX: luaIsRegistered -> true (#%u)", count);
+    int ret = lua_push_forced_bool(L, 1, "IsRegistered");
+    return ret >= 0 ? ret : SO_CONTINUE(int, g_hook_lua_is_registered, L);
+}
+static so_hook g_hook_lua_platform_is_registered;
+static int hook_lua_platform_is_registered(void *L) {
+    static uint32_t count = 0;
+    if (++count <= 8U) l_info("FIX: luaPlatformIsRegistered -> true (#%u)", count);
+    int ret = lua_push_forced_bool(L, 1, "PlatformIsRegistered");
+    return ret >= 0 ? ret : SO_CONTINUE(int, g_hook_lua_platform_is_registered, L);
+}
+static so_hook g_hook_lua_is_user_online;
+static int hook_lua_is_user_online(void *L) {
+    static uint32_t count = 0;
+    if (++count <= 8U) l_info("FIX: luaIsUserOnline -> true (#%u)", count);
+    int ret = lua_push_forced_bool(L, 1, "IsUserOnline");
+    return ret >= 0 ? ret : SO_CONTINUE(int, g_hook_lua_is_user_online, L);
 }
 
 /* Prompt/platform identity: the Android binary contains the official Vita Lua
@@ -5389,6 +5470,21 @@ static void patch_dlc_fast_path_hooks(void) {
                               "luaIsUserSignedIn",
                               (uintptr_t)&hook_lua_is_user_signed_in,
                               &g_hook_lua_is_user_signed_in);
+    (void)hook_symbol_checked(&so_mod_gameengine,
+                              "_Z15luaIsRegisteredP9lua_State",
+                              "luaIsRegistered",
+                              (uintptr_t)&hook_lua_is_registered,
+                              &g_hook_lua_is_registered);
+    (void)hook_symbol_checked(&so_mod_gameengine,
+                              "_Z23luaPlatformIsRegisteredP9lua_State",
+                              "luaPlatformIsRegistered",
+                              (uintptr_t)&hook_lua_platform_is_registered,
+                              &g_hook_lua_platform_is_registered);
+    (void)hook_symbol_checked(&so_mod_gameengine,
+                              "_Z15luaIsUserOnlineP9lua_State",
+                              "luaIsUserOnline",
+                              (uintptr_t)&hook_lua_is_user_online,
+                              &g_hook_lua_is_user_online);
     (void)hook_symbol_checked(&so_mod_gameengine,
                               "_Z24luaPlatformRequestSignInP9lua_State",
                               "luaPlatformRequestSignIn",

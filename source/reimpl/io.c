@@ -293,7 +293,12 @@ static const char *ensure_android_virtual_file(const char *path) {
  * this removes essentially all redundant open/close churn during loads. The
  * RETRY_TARGET path still trims to 8 if the OS ever refuses a new fd (EMFILE), so
  * raising this is safe — worst case it degrades to the old behavior. */
-#define ASSET_VFD_RAW_CACHE_SOFT_MAX 96u
+#define ASSET_VFD_RAW_CACHE_SOFT_MAX 48u   /* LOWERED 96->48 (2026-07-22): 96 cached fds + the
+                                            * game's own + concurrent reads overran the OS fd
+                                            * limit once Chapter 2+ archives were added (EMFILE ->
+                                            * infinite loading). 48 leaves headroom for all
+                                            * chapters; the EMFILE trim+retry in the read paths is
+                                            * the safety net. Slightly more re-open churn on CH1. */
 #define ASSET_VFD_RAW_CACHE_RETRY_TARGET 8u
 
 typedef struct AssetVfd {
@@ -527,6 +532,15 @@ ssize_t asset_vfd_read(int fd, void *buf, size_t count) {
         asset_vfd_unlock();
         if (!ok) { errno = EBADF; return -1; }
         int tmp = open(path, O_RDONLY);
+        if (tmp < 0 && errno == EMFILE) {
+            /* Out of file descriptors. The other open paths already trim-and-retry;
+             * this cold re-open used to just give up, so a scene needing more
+             * archives than the fd budget (e.g. after adding Chapter 2) failed the
+             * read -> the asset never loaded -> INFINITE LOADING. Free cached fds
+             * and retry so we recover instead of wedging the load. */
+            asset_vfd_trim_cached_fds(ASSET_VFD_RAW_CACHE_RETRY_TARGET);
+            tmp = open(path, O_RDONLY);
+        }
         if (tmp < 0) {
             l_warn("[ASSETVFD] read fd=%d open failed path=%s errno=%d", fd, path, errno);
             return -1;
@@ -615,6 +629,12 @@ ssize_t asset_vfd_pread(int fd, void *buf, size_t count, off_t offset) {
         asset_vfd_unlock();
         if (!ok) { errno = EBADF; return -1; }
         int tmp = open(path, O_RDONLY);
+        if (tmp < 0 && errno == EMFILE) {
+            /* Out of fds -> free cached ones and retry (same as asset_vfd_read).
+             * This is the path that was hanging Chapter 2+ loads on EMFILE. */
+            asset_vfd_trim_cached_fds(ASSET_VFD_RAW_CACHE_RETRY_TARGET);
+            tmp = open(path, O_RDONLY);
+        }
         if (tmp < 0) {
             l_warn("[ASSETVFD] pread fd=%d open failed path=%s errno=%d", fd, path, errno);
             return -1;

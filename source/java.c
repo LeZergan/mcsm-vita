@@ -451,8 +451,20 @@ static void UpdatePurchases(jmethodID id, va_list args) {
 
 static jboolean IsNetworkAvailable(jmethodID id, va_list args) {
     static unsigned log_count = 0; (void)id; (void)args;
-    if (log_count < 16U) { l_info("DLC isNetworkAvailable -> false (offline local-data mode)"); log_count++; }
-    return JNI_FALSE;
+    /* CROWD-CHOICE STATS (2026-07-22): the end-of-episode "how your choices
+     * compare" screen shows "you are offline" when this returns false, even though
+     * the crowd data is shipped as a pre-baked choice.prop and served via the
+     * <User>->Temp redirect. Report "available" ONCE A SCENE IS LIVE so that flow
+     * runs and reads the local stats; stay false during pure boot (pre-scene) so
+     * the DLC verification sequence is unchanged. The Lua internet/license checks
+     * stay false regardless, so the documented DLC boot-loop can't trigger. */
+    jboolean avail = launch_state_scene_active() ? JNI_TRUE : JNI_FALSE;
+    if (log_count < 16U) {
+        l_info("DLC isNetworkAvailable -> %s", avail ? "true (scene live: crowd-stats path)"
+                                                     : "false (boot / offline)");
+        log_count++;
+    }
+    return avail;
 }
 
 static jobject GetPurchaseProvider(jmethodID id, va_list args) {
