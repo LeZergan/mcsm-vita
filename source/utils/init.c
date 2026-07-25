@@ -583,7 +583,7 @@ void soloader_init_all() {
     /* BUILD STAMP — first line of every log so old vs new eboot is unmistakable.
      * If this line is ABSENT, an OLD eboot is running (VitaShell kept it on a
      * same-Title-ID install → delete the bubble and reinstall). */
-    telemetry_log("BOOT", "BUILD=2026-07-25-r19 (rear touch = L3/R3 pulse; prop-persist Jesse+choices; full skinning; L/R both IDs; touch slot-leak; anim_rate+clock MHz)");
+    telemetry_log("BOOT", "BUILD=2026-07-25-r20 (VRAM reclaim under pressure; detail+render_quality levers; rear-touch L3/R3; prop-persist; touch leak-proof)");
     telemetry_log("BOOT", "soloader_init_all start");
 
 	// Launch `app0:configurator.bin` on `-config` init param

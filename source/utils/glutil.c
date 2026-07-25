@@ -1617,7 +1617,30 @@ void glActiveTexture_soloader(GLenum texture) {
 #ifdef USE_PVR_PSP2
 #define TEXLRU_MAXTEX 180u  /* PVR_PSP2 has a ~220-260 texture-OBJECT ceiling; cap live objects under it. */
 #else
-#define TEXLRU_MAXTEX 1000000u  /* vitaGL has NO texture-object limit — eviction is unnecessary AND harmful (glDeleteTextures-ing textures the engine still uses crashes during scene loads). Effectively disabled. */
+#define TEXLRU_MAXTEX 1000000u  /* vitaGL has no texture-OBJECT limit; the object cap stays off. */
+
+/* vitaGL RECLAIM (2026-07-25) --------------------------------------------------
+ * The engine never calls glDeleteTextures, so GPU texture memory only grows:
+ * measured 80MB -> 8MB free across a 79-minute session (transiently 0). Nothing
+ * failed in that run, but the end state is documented and ugly -- an upload OOMs,
+ * the render thread cannot finish the frame, FinishFrame waits forever, black
+ * screen.
+ *
+ * Eviction was tried twice before and BOTH attempts made things worse, so this
+ * one is built to not repeat either:
+ *   - Attempt 1 used a fixed 40MB byte budget. Gameplay legitimately needs more
+ *     than that, so it evicted CONSTANTLY and inevitably deleted textures still
+ *     in use -> garbage blocks + PVRTC re-upload thrash down to ~10fps.
+ *     => Here there is NO budget. Nothing is evicted until free VRAM is actually
+ *        low, so in a normal session this code never runs at all.
+ *   - Both attempts relied on "not bound right now" as the safety check. That is
+ *     too weak: a texture not bound this instant can still be needed next draw.
+ *     => Here a victim must ALSO be untouched for TEXLRU_MIN_AGE binds, i.e. it
+ *        belongs to a scene that is long gone. Currently-bound is still excluded.
+ * Work per call is capped so a reclaim can never turn into a long stall. */
+#define TEXLRU_VRAM_LOW      (12u * 1024u * 1024u) /* reclaim only under this much free VRAM */
+#define TEXLRU_MIN_AGE       20000u                /* binds a texture must be idle to be evictable */
+#define TEXLRU_EVICT_PER_RUN 32u                   /* bound the stall */
 #endif
 typedef struct { GLuint id; GLuint bytes; uint32_t use; } texlru_ent;
 static texlru_ent s_texlru[TEXLRU_SLOTS];
@@ -1652,14 +1675,57 @@ static int texlru_is_live(GLuint id) {
     return 0;
 }
 static void texlru_touch(GLuint id) {
-    /* vitaGL (TEXLRU_MAXTEX==1000000) never evicts, so the per-bind LRU hash lookup
-     * is pure dead weight — skip it. s_texlru_bound is set separately in glBindTexture,
-     * so this doesn't affect the bound-id tracking. Constant-folds out on PVR. */
-    if (!id || TEXLRU_MAXTEX >= 1000000u) return;
+    /* The per-bind timestamp IS the safety mechanism for the vitaGL reclaim below
+     * (a victim must be idle for TEXLRU_MIN_AGE binds), so it can no longer be
+     * skipped there. One hash probe per bind. */
+    if (!id) return;
     texlru_ent *e = texlru_lookup(id, 0);
     if (e) e->use = ++s_texlru_clock;
 }
+#ifndef USE_PVR_PSP2
+/* vitaGL: reclaim only under real VRAM pressure, and only textures that have been
+ * idle long enough to be certain they belong to an unloaded scene. Returns without
+ * touching anything in the overwhelmingly common case. */
+static void texlru_reclaim_vitagl(GLuint keep_id) {
+    if ((uint32_t)vglMemFree(VGL_MEM_VRAM) >= TEXLRU_VRAM_LOW) return;   /* no pressure */
+
+    unsigned freed = 0;
+    uint32_t freed_kb = 0;
+    for (unsigned n = 0; n < TEXLRU_EVICT_PER_RUN; n++) {
+        texlru_ent *victim = NULL;
+        for (uint32_t i = 0; i < TEXLRU_SLOTS; i++) {
+            texlru_ent *e = &s_texlru[i];
+            if (!e->bytes || e->id == keep_id || texlru_is_live(e->id)) continue;
+            if (s_texlru_clock - e->use < TEXLRU_MIN_AGE) continue;      /* still recent */
+            if (!victim || e->use < victim->use) victim = e;
+        }
+        if (!victim) break;            /* nothing is old enough -> leave it alone */
+        GLuint vid = victim->id;
+        glDeleteTextures(1, &vid);
+        (void)glGetError();
+        s_texlru_total -= victim->bytes;
+        s_texlru_count--;
+        freed_kb += victim->bytes / 1024u;
+        victim->id = 0; victim->bytes = 0; victim->use = 0;
+        freed++;
+    }
+    if (freed) {
+        s_texlru_evicted += freed;
+        l_info("TEXLRU: reclaimed %u idle textures (%uKB) under VRAM pressure; "
+               "live=%u total=%uKB free=%uKB",
+               freed, freed_kb, s_texlru_count, s_texlru_total / 1024u,
+               (unsigned)(vglMemFree(VGL_MEM_VRAM) / 1024u));
+        glFinish();                    /* make the frees actually land before uploading */
+    }
+}
+#endif
+
 static void texlru_make_room(GLuint need, GLuint keep_id) {
+#ifndef USE_PVR_PSP2
+    (void)need;
+    texlru_reclaim_vitagl(keep_id);
+    return;
+#else
     int did_evict = 0;
     while (s_texlru_count >= TEXLRU_MAXTEX || s_texlru_total + need > TEXLRU_BUDGET) {
         texlru_ent *victim = NULL;
@@ -1686,11 +1752,13 @@ static void texlru_make_room(GLuint need, GLuint keep_id) {
      * uploads. Slow, but only fires while we're over the cap during a load burst
      * (a one-time cost), and correctness beats speed here. */
     if (did_evict) glFinish();
+#endif
 }
 static void texlru_record(GLuint id, GLuint bytes) {
-    /* vitaGL: no eviction -> the table is never read, so skip the per-upload hash
-     * insert entirely (~2900/scene load). Constant-folds out on PVR (MAXTEX=180). */
-    if (!id || TEXLRU_MAXTEX >= 1000000u) return;
+    /* Recording is required on BOTH backends now: vitaGL's pressure-gated reclaim
+     * needs the byte/age table to pick safe victims. ~2900 hash inserts per scene
+     * load, which is noise next to the uploads themselves. */
+    if (!id) return;
     if (bytes == 0) bytes = 1;               /* keep slot nonzero = live */
     texlru_ent *e = texlru_lookup(id, 1);
     if (!e) return;                          /* table full: skip (rare) */
