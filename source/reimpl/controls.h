@@ -48,6 +48,11 @@ enum {
     AKEYCODE_BUTTON_Y = 100,
     AKEYCODE_BUTTON_L1 = 102,
     AKEYCODE_BUTTON_R1 = 103,
+    /* Stick click. The Vita's sticks do not physically click, so these are
+     * synthesized from the REAR touchpad (left half = L3, right half = R3) --
+     * see poll_touch_back() in controls.c. */
+    AKEYCODE_BUTTON_THUMBL = 106,
+    AKEYCODE_BUTTON_THUMBR = 107,
     AKEYCODE_BUTTON_START = 108,
     AKEYCODE_BUTTON_SELECT = 109,
 };

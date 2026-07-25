@@ -814,8 +814,10 @@ static int rs_map_px_y(float y960) {
 #define MCSM_VITA_CROSS 0x1503
 #define MCSM_VITA_L1 0x1504
 #define MCSM_VITA_L2 0x1505
+#define MCSM_VITA_L3 0x1506   /* the gap in the run; PlayStation order is L1,L2,L3,R1,R2,R3 */
 #define MCSM_VITA_R1 0x1507
 #define MCSM_VITA_R2 0x1508
+#define MCSM_VITA_R3 0x1509
 #define MCSM_VITA_START 0x150A
 #define MCSM_VITA_SELECT 0x150B
 #define MCSM_VITA_LEFT 0x150C
@@ -1174,6 +1176,10 @@ static int controls_vita_platform_code_for_keycode(int32_t keycode) {
             return MCSM_VITA_L2;   /* Vita has one shoulder pair; MCSM binds L/R to console L2/R2 */
         case AKEYCODE_BUTTON_R1:
             return MCSM_VITA_R2;
+        case AKEYCODE_BUTTON_THUMBL:
+            return MCSM_VITA_L3;   /* synthesized from the rear touchpad */
+        case AKEYCODE_BUTTON_THUMBR:
+            return MCSM_VITA_R3;
         case AKEYCODE_BUTTON_START:
             return MCSM_VITA_START;
         case AKEYCODE_BUTTON_SELECT:
@@ -1311,6 +1317,8 @@ static int is_android_gamepad_button_keycode(int32_t keycode) {
         case AKEYCODE_BUTTON_Y:
         case AKEYCODE_BUTTON_L1:
         case AKEYCODE_BUTTON_R1:
+        case AKEYCODE_BUTTON_THUMBL:   /* rear touchpad, left half  */
+        case AKEYCODE_BUTTON_THUMBR:   /* rear touchpad, right half */
         case AKEYCODE_BUTTON_START:
         case AKEYCODE_BUTTON_SELECT:
             return 1;
@@ -1515,6 +1523,18 @@ void controls_handler_key(int32_t keycode, ControlsAction action) {
         controls_queue_engine_input(g_platform_input_queue,
                                     "platform-shoulder-2",
                                     is_left ? MCSM_VITA_L2 : MCSM_VITA_R2,
+                                    action,
+                                    0.0f,
+                                    0.0f);
+    }
+    /* Stick clicks (rear touchpad). Same reasoning as the shoulders: SDL takes the
+     * pad event, which would otherwise skip Telltale's native queue entirely and
+     * leave L3/R3 dead on any screen that reads the native mapper. Emit both. */
+    else if (keycode == AKEYCODE_BUTTON_THUMBL || keycode == AKEYCODE_BUTTON_THUMBR) {
+        controls_queue_engine_input(g_platform_input_queue,
+                                    "platform-stickclick",
+                                    (keycode == AKEYCODE_BUTTON_THUMBL) ? MCSM_VITA_L3
+                                                                        : MCSM_VITA_R3,
                                     action,
                                     0.0f,
                                     0.0f);

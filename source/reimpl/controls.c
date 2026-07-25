@@ -77,12 +77,16 @@ void controls_init() {
     // Enable analog sticks and touchscreen
     sceCtrlSetSamplingModeExt(SCE_CTRL_MODE_ANALOG_WIDE);
     sceTouchSetSamplingState(SCE_TOUCH_PORT_FRONT, 1);
+    /* REAR panel drives the stick clicks the Vita has no buttons for (L3/R3).
+     * The front panel is gameplay input, so it cannot be reused for this. */
+    sceTouchSetSamplingState(SCE_TOUCH_PORT_BACK, 1);
 
     // Enable accelerometer
     sceMotionStartSampling();
 }
 
 void poll_touch();
+void poll_touch_back();
 void poll_pad();
 
 void poll_stick(ControlsStickId which, float raw_x, float raw_y, float * readings_x, float * readings_y, float deadzone);
@@ -90,8 +94,66 @@ void poll_stick(ControlsStickId which, float raw_x, float raw_y, float * reading
 void controls_poll() {
     pthread_mutex_lock(&g_controls_mutex);
     poll_touch();
+    poll_touch_back();
     poll_pad();
     pthread_mutex_unlock(&g_controls_mutex);
+}
+
+/* ---- REAR TOUCHPAD -> L3 / R3 ------------------------------------------------
+ * The Vita's analog sticks do not click, so the two stick-click buttons have no
+ * hardware to come from. The rear panel is otherwise completely unused here (the
+ * front panel is the game's pointer), which makes it the natural home for them --
+ * and it is what Vita ports conventionally do, so it is what players expect.
+ *
+ * Left half of the pad = L3, right half = R3. Held state is edge-detected per
+ * half, so a press emits exactly one DOWN and one UP no matter how the finger
+ * slides or how many fingers land. Fingers resting on the back therefore cost a
+ * single stuck DOWN at worst, never a repeat storm.
+ *
+ * Deliberately crude: these actions are not precision inputs in this game, so the
+ * whole pad is live rather than a small target the player has to find blind. */
+typedef struct {
+    int contact_prev;   /* was this half being touched on the previous poll? */
+    int pulse_active;   /* a DOWN was emitted and still owes its UP          */
+} BackClickState;
+
+static BackClickState g_back_l3;
+static BackClickState g_back_r3;
+
+/* Emit a one-poll DOWN/UP PULSE on the rising edge of contact, then stay quiet
+ * until the finger lifts and touches again.
+ *
+ * Deliberately not a held button: players rest their fingers on the back of a
+ * Vita constantly, and mapping "contact" straight to "button held" would leave
+ * L3/R3 stuck down for whole scenes. A pulse means a resting hand costs one
+ * click when it lands and nothing afterwards, which is the failure mode we want.
+ * These are momentary actions in this game, so nothing needs the held state. */
+static void back_click_update(BackClickState *s, int contact, int32_t keycode) {
+    if (contact && !s->contact_prev) {
+        controls_handler_key(keycode, CONTROLS_ACTION_DOWN);
+        s->pulse_active = 1;
+    } else if (s->pulse_active) {
+        controls_handler_key(keycode, CONTROLS_ACTION_UP);
+        s->pulse_active = 0;
+    }
+    s->contact_prev = contact;
+}
+
+void poll_touch_back() {
+    SceTouchData back;
+    if (sceTouchPeek(SCE_TOUCH_PORT_BACK, &back, 1) < 0) {
+        return;
+    }
+
+    /* Rear panel reports in the same 1920-wide space as the front. */
+    int contact_l = 0, contact_r = 0;
+    for (int i = 0; i < back.reportNum; i++) {
+        if (back.report[i].x < 960) contact_l = 1;
+        else                        contact_r = 1;
+    }
+
+    back_click_update(&g_back_l3, contact_l, AKEYCODE_BUTTON_THUMBL);
+    back_click_update(&g_back_r3, contact_r, AKEYCODE_BUTTON_THUMBR);
 }
 
 SceTouchData touch;
