@@ -5702,8 +5702,10 @@ static int render_quality_override(void) {
         /* MCSM boots at q=15 (logged) — outside the 0-4 desktop enum, so its mobile
          * build uses a wider scale. Accept 0..15; the engine already runs 15 without
          * crashing, so any value in range is safe to probe (revert = delete the file). */
-        FILE *f = mcsm_open_setting("render_quality.txt", "r");
-        if (f) { int q = -1; if (fscanf(f, "%d", &q) == 1 && q >= 0 && q <= 15) v = q; fclose(f); }
+        /* Consolidated into settings/graphics.txt (`render_quality`); -1 = leave
+         * the engine's own value (it boots at 15). */
+        const int q = mcsm_cfg()->render_quality;
+        if (q >= 0 && q <= 15) v = q;
     }
     return v;
 }
@@ -5735,13 +5737,12 @@ static void hook_set_toon_outline(void *self, int on) {
  * installed without it, so the default build is zero-risk. Logs the engine's
  * natural detail values so the scale can be tuned from a device run. */
 static float detail_scale(void) {
-    static float v = -2.0f;               /* < -1 = unread */
-    if (v < -1.0f) {
-        v = -1.0f;                        /* -1 = no file / no override */
-        FILE *f = mcsm_open_setting("detail_scale.txt", "r");
-        if (f) { float x = 0.0f; if (fscanf(f, "%f", &x) == 1 && x >= 0.1f && x <= 1.0f) v = x; fclose(f); }
-    }
-    return v;
+    /* Consolidated into settings/graphics.txt (`detail`, stored x1000). Returns
+     * -1 for "no override" so the hooks stay uninstalled at the default, exactly
+     * as the stray-file version did -- the default build is unchanged. */
+    const int d = mcsm_cfg()->detail;
+    if (d <= 0 || d >= 1000) return -1.0f;
+    return (float)d / 1000.0f;
 }
 static so_hook g_hook_scene_far_detail, g_hook_scene_near_detail;
 #define MCSM_DETAIL_TRAMPOLINE(H, SELF, V) do { \

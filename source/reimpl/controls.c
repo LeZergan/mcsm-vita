@@ -160,7 +160,14 @@ SceTouchData touch;
 SceTouchData touch_old;
 
 void poll_touch() {
-    sceTouchPeek(SCE_TOUCH_PORT_FRONT, &touch, 1);
+    /* A failed peek leaves `touch` holding the PREVIOUS poll's contents, which
+     * this function would then diff against touch_old as if it were fresh --
+     * re-reporting stale fingers, or (worse) never producing the UP that frees a
+     * slot in the engine-facing table. Bail instead: skipping a poll is harmless,
+     * inventing input is not. */
+    if (sceTouchPeek(SCE_TOUCH_PORT_FRONT, &touch, 1) < 0) {
+        return;
+    }
 
     for (int i = 0; i < touch.reportNum; i++) {
         float x = (float) touch.report[i].x * 960.f / 1920.0f;

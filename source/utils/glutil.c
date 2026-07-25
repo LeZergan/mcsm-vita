@@ -1360,6 +1360,31 @@ void gl_swap() {
                (unsigned)(vglMemFree(VGL_MEM_RAM) / 1024u),
                (unsigned)(vglMemFree(VGL_MEM_SLOW) / 1024u));
     }
+    /* LOW-VRAM EARLY WARNING (2026-07-25). The engine never calls glDeleteTextures
+     * and vitaGL's texture eviction is deliberately disabled (enabling it deleted
+     * textures the engine was still using -> garbage blocks + upload thrash), so
+     * GPU texture memory only grows. Measured across a 79-minute session: 80MB ->
+     * 8MB free, transiently 0, but with ZERO GL_OUT_OF_MEMORY errors -- i.e. a
+     * standing risk, not a live failure, which is why eviction has NOT been
+     * re-enabled on a guess. Warn once per threshold crossing so that if it ever
+     * does start failing, the log says so plainly instead of surfacing as a
+     * mystery black screen (the documented end state: an upload OOMs, the render
+     * thread cannot finish the frame, and FinishFrame waits forever). Cheap: the
+     * query only runs on the same throttled tick as the log above. */
+    {
+        static unsigned s_vram_warn_level = 0;   /* 0 none, 1 <16MB, 2 <4MB */
+        if ((s_swap_counter & 0x3ffU) == 0U) {
+            const unsigned free_kb = (unsigned)(vglMemFree(VGL_MEM_VRAM) / 1024u);
+            unsigned level = (free_kb < 4096u) ? 2u : (free_kb < 16384u) ? 1u : 0u;
+            if (level > s_vram_warn_level) {
+                s_vram_warn_level = level;
+                l_warn("VRAM LOW: %uKB free (texture memory only grows on this port; "
+                       "uploads may start failing). frame=%u", free_kb, s_swap_counter);
+            } else if (level == 0u) {
+                s_vram_warn_level = 0;           /* recovered -> re-arm */
+            }
+        }
+    }
 }
 #endif /* !USE_PVR_PSP2 */
 

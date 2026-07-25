@@ -26,6 +26,16 @@ typedef struct {
                                * PlaybackControllers dominates the sim, so N>1 is the
                                * biggest remaining CPU lever -- at the cost of motion
                                * and lip-sync stepping at 30/N Hz.                  */
+    int  detail;              /* brush-geometry LOD scale x1000 (100..1000, 1000 =
+                               * engine default / no change). Scene::SetBrushNear/
+                               * FarDetail biases the engine toward coarser BAKED
+                               * LODs, so it is the only runtime lever that attacks
+                               * the vertex count itself -- and vertex count is what
+                               * slow frames actually track. Stored x1000 to keep the
+                               * config struct integer-only.                        */
+    int  render_quality;      /* engine RenderConfiguration quality, 0..15. MCSM boots
+                               * at 15 (its mobile build uses a wider scale than the
+                               * 0-4 desktop enum). -1 = leave the engine's own value. */
     /* system */
     int  clock_adaptive;      /* 0 = ARM pinned, 1 = adaptive floor (battery)    */
     int  clock_mhz;           /* ARM target MHz. 444 = stock max. Higher only has
