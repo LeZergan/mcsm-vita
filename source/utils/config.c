@@ -24,20 +24,39 @@ static void apply_profile(McsmCfg *c, int prof) {
     case PROF_QUALITY:     /* best looks, ~20-24fps in heavy scenes */
         c->render_w = 960; c->render_h = 544; c->fps_cap = 30; c->vsync = 1;
         c->outlines = 1;   c->shadows = 1;    c->draw_distance = 0; c->skinning_full = 1;
-        c->clock_adaptive = 0; break;
+        c->anim_rate = 1;
+        c->clock_adaptive = 0; c->clock_mhz = 444; break;
     case PROF_PERFORMANCE: /* steady 30, effects trimmed to hold it in heavy scenes */
+        /* skinning stays FULL (2026-07-25): "reduced" turns off the engine's
+         * recursive per-bone contribution, which is what propagates a parent
+         * bone's transform to attached geometry in the SAME frame. Without it,
+         * attached parts visibly TRAIL the body they are attached to (Reuben's
+         * costume lagging as he moves, chest lids lagging as they open). That
+         * reads as a bug, not a quality setting, so it is no longer part of the
+         * performance preset -- only "battery" still trades it away. Anyone who
+         * wants the CPU back can still set `skinning = reduced` explicitly, which
+         * now overrides on top of any profile. */
         c->render_w = 720; c->render_h = 408; c->fps_cap = 30; c->vsync = 1;
-        c->outlines = 0;   c->shadows = 0;    c->draw_distance = 4000; c->skinning_full = 0;
-        c->clock_adaptive = 0; break;
-    case PROF_BATTERY:     /* lower power + clock */
-        c->render_w = 640; c->render_h = 360; c->fps_cap = 30; c->vsync = 1;
-        c->outlines = 0;   c->shadows = 0;    c->draw_distance = 4000; c->skinning_full = 0;
-        c->clock_adaptive = 1; break;
+        c->outlines = 0;   c->shadows = 0;    c->draw_distance = 4000; c->skinning_full = 1;
+        c->anim_rate = 1;
+        c->clock_adaptive = 0; c->clock_mhz = 444; break;
+    case PROF_BATTERY:     /* lowest power: the only profile that trades quality away */
+        /* Was 640x360 + the same effect set as "performance", so the two profiles
+         * were visually near-identical and battery looked no cheaper than it is.
+         * 480x272 is exactly HALF of native 960x544, which both halves the fill
+         * cost again and upscales cleanly (integer ratio) instead of resampling.
+         * Shorter draw distance culls more geometry -- the engine is sim/vertex
+         * bound, so that is where the real power saving is. */
+        c->render_w = 480; c->render_h = 272; c->fps_cap = 30; c->vsync = 1;
+        c->outlines = 0;   c->shadows = 0;    c->draw_distance = 3000; c->skinning_full = 0;
+        c->anim_rate = 2;
+        c->clock_adaptive = 1; c->clock_mhz = 444; break;
     case PROF_BALANCED:    /* default */
     default:
         c->render_w = 800; c->render_h = 452; c->fps_cap = 30; c->vsync = 1;
         c->outlines = 1;   c->shadows = 0;    c->draw_distance = 6000; c->skinning_full = 1;
-        c->clock_adaptive = 0; break;
+        c->anim_rate = 1;
+        c->clock_adaptive = 0; c->clock_mhz = 444; break;
     }
 }
 
@@ -67,7 +86,7 @@ static int split_kv(const char *line, char *k, int ksz, char *v, int vsz) {
 static void load_cfg(void) {
     char prof[16] = "balanced";
     char res[16] = "", fps[16] = "", vsync[16] = "", outl[16] = "", shad[16] = "";
-    char dist[16] = "", skin[16] = "", clk[16] = "";
+    char dist[16] = "", skin[16] = "", clk[16] = "", arate[16] = "";
 
     FILE *f = mcsm_open_setting("graphics.txt", "r");
     if (f) {
@@ -83,6 +102,7 @@ static void load_cfg(void) {
             else if (!strcmp(k, "draw_distance")) strncpy(dist,  v, sizeof(dist)  - 1);
             else if (!strcmp(k, "skinning"))      strncpy(skin,  v, sizeof(skin)  - 1);
             else if (!strcmp(k, "clock"))         strncpy(clk,   v, sizeof(clk)   - 1);
+            else if (!strcmp(k, "anim_rate"))     strncpy(arate, v, sizeof(arate) - 1);
         }
         fclose(f);
     }
@@ -108,14 +128,19 @@ static void load_cfg(void) {
         if (shad[0])  g_cfg.shadows        = parse_bool(shad, g_cfg.shadows);
         if (dist[0])  g_cfg.draw_distance  = atoi(dist);
         if (skin[0])  g_cfg.skinning_full  = parse_bool(skin, g_cfg.skinning_full);
-        if (clk[0])   g_cfg.clock_adaptive = (!strcmp(clk, "adaptive") || !strcmp(clk, "battery")) ? 1 : 0;
+        if (clk[0]) {
+            g_cfg.clock_adaptive = (!strcmp(clk, "adaptive") || !strcmp(clk, "battery")) ? 1 : 0;
+            const int mhz = atoi(clk);            /* "444"/"500"/... ; 0 for "adaptive" */
+            if (mhz >= 111 && mhz <= 600) g_cfg.clock_mhz = mhz;
+        }
+        if (arate[0]) { int r = atoi(arate); if (r >= 1 && r <= 3) g_cfg.anim_rate = r; }
     }
 
     g_cfg_loaded = 1;
-    l_info("CONFIG(graphics): profile=%s res=%dx%d fps=%d vsync=%d outlines=%d shadows=%d dist=%d skinning=%s clock=%s",
+    l_info("CONFIG(graphics): profile=%s res=%dx%d fps=%d vsync=%d outlines=%d shadows=%d dist=%d skinning=%s anim_rate=1/%d clock=%s(%dMHz)",
            prof, g_cfg.render_w, g_cfg.render_h, g_cfg.fps_cap, g_cfg.vsync, g_cfg.outlines,
-           g_cfg.shadows, g_cfg.draw_distance, g_cfg.skinning_full ? "full" : "reduced",
-           g_cfg.clock_adaptive ? "adaptive" : "444");
+           g_cfg.shadows, g_cfg.draw_distance, g_cfg.skinning_full ? "full" : "reduced", g_cfg.anim_rate,
+           g_cfg.clock_adaptive ? "adaptive" : "pinned", g_cfg.clock_mhz);
 }
 
 const McsmCfg *mcsm_cfg(void) {

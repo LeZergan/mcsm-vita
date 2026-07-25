@@ -1012,13 +1012,13 @@ void gl_preload() {
 #endif
 }
 
-/* ---- Render-scale (opt-in via ux0:data/mcsm/fb_override.txt = "WxH") --------
+/* ---- Render-scale (opt-in via ux0:data/mcsm/graphics.txt (resolution) = "WxH") --------
  * Render the game into a low-res FBO and bilinear-upscale it to the native
  * 960x544 display on present. Fewer fragment-shaded pixels => higher fps on this
  * fragment-bound 3D engine, while the picture stays native/fullscreen.
  * SAFE BY DEFAULT: with no override file the game's render res == native, so this
  * stays inactive and rendering goes straight to the display (the working path).
- * TUNABLE with no rebuild: edit fb_override.txt (e.g. 640x363, 576x326, 480x272). */
+ * TUNABLE with no rebuild: edit graphics.txt (resolution) (e.g. 640x363, 576x326, 480x272). */
 #define RS_NATIVE_W 960
 #define RS_NATIVE_H 544
 static GLboolean g_rs_active = GL_FALSE;
@@ -1210,7 +1210,7 @@ void gl_init() {
     }
 
     /* Only spin up the low-res FBO if the game's render res is BELOW native
-     * (fb_override.txt set it). Otherwise leave the direct-to-display path alone. */
+     * (graphics.txt (resolution) set it). Otherwise leave the direct-to-display path alone. */
     if (render_w < RS_NATIVE_W || render_h < RS_NATIVE_H) {
         rs_init(render_w, render_h);
     }

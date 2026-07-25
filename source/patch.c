@@ -375,13 +375,13 @@ static uint64_t now_ms(void) {
  * chores/animation by an uneven amount each frame = stutter. Pacing the game loop
  * to a fixed period makes the delta the engine sees constant -> smooth motion.
  * Default 30fps (the cadence the original console builds used). Tunable at runtime
- * with no rebuild via ux0:data/mcsm/fps_cap.txt (an integer fps; <=0 = uncapped).
+ * with no rebuild via ux0:data/mcsm/graphics.txt (fps_cap) (an integer fps; <=0 = uncapped).
  * This must honor the user's configured cap directly; forcing 60 down to 30
  * made character/menu animation visibly regress in heavy scenes. */
 static uint32_t mcsm_frame_pace_us(void) {
     static int initialized = 0;
     /* Default 30 fps, vblank-quantized (2*16667 - 2500 = 30834) — identical to what
-     * the fps_cap.txt=30 path below computes. A plain 33333 lands the sleep-release
+     * the graphics.txt (fps_cap)=30 path below computes. A plain 33333 lands the sleep-release
      * exactly ON the 2-vblank boundary, so adaptive vsync misses it by a hair and
      * snaps to the next vblank -> idle frames beat to 20fps. Undershooting by 2500us
      * makes the frame ready just before vblank so vsync catches the intended one. */
@@ -443,7 +443,7 @@ static void mcsm_pace_frame(void) {
  * Provably non-oscillating: down-threshold 0.55*budget and up-threshold
  * 0.80*budget leave a 1.45x gap, wider than any single step's work-inflation
  * ratio (444/333=1.33, 333/266=1.25) — so a step-down can't immediately trip
- * the step-up. Budget follows the configured pace (fps_cap.txt), default 30.
+ * the step-up. Budget follows the configured pace (graphics.txt (fps_cap)), default 30.
  * RENDER-BOUND GUARD: sim_us can't see the render thread's ~900-draw submission
  * cost, so the step-down is ALSO gated on the TRUE present cadence
  * (g_mcsm_present_dt_us from gl_swap) — it never downclocks a scene whose frame
@@ -797,7 +797,7 @@ static void force_native_render_dimensions(const char *phase) {
 
     /* RENDER-SCALE FIX 2026-06-29: force the engine's render dimensions to the
      * RENDER-SCALE size (= the FBO size), not hardcoded native 960x544. With
-     * fb_override.txt set to a lower res, the engine was still rendering full
+     * graphics.txt (resolution) set to a lower res, the engine was still rendering full
      * native into the smaller FBO -> the image filled only a corner / spilled off
      * one side. Matching the engine dims to the FBO makes it render fullscreen at
      * the low res, then gl_swap bilinear-upscales the FBO to native. At native
@@ -1248,7 +1248,7 @@ static void resolve_animation_runtime_flags(void) {
  * work, but recursive per-bone contribution is CPU-heavy and is the prime
  * suspect for the ~40ms sim spikes in animated scenes. Make it tunable so its
  * real cost can be measured / the user can pick perf-vs-animation:
- * ux0:data/mcsm/anim_full.txt = "0" -> disable (faster, animation degraded),
+ * ux0:data/mcsm/graphics.txt (skinning) = "0" -> disable (faster, animation degraded),
  * absent or "1" -> full (default, current behaviour). */
 static int mcsm_anim_full(void) { return mcsm_cfg()->skinning_full; }
 
@@ -1260,13 +1260,13 @@ static int mcsm_anim_full(void) { return mcsm_cfg()->skinning_full; }
  * Visual trade: close-up motion + lip-sync step at ~15Hz (N=2), so it's for heavy
  * gameplay/crowd scenes, not dialogue. Default 1 = zero change. */
 static int mcsm_anim_rate(void) {
-    static int rate = -1;
-    if (rate < 0) {
-        rate = 1;
-        FILE *f = mcsm_open_setting("anim_rate.txt", "r");
-        if (f) { int v = 1; if (fscanf(f, "%d", &v) == 1 && v >= 1 && v <= 3) rate = v; fclose(f); }
-        l_info("ANIM: update-rate = 1/%d", rate);
-    }
+    /* Consolidated into settings/graphics.txt (`anim_rate`) — it used to be a
+     * stray anim_rate.txt, which left the single biggest remaining sim lever
+     * undiscoverable next to every other tunable. mcsm_cfg() caches, so this is
+     * just a field read; the value is already clamped to 1..3 at parse time. */
+    static int logged = 0;
+    const int rate = mcsm_cfg()->anim_rate;
+    if (!logged) { logged = 1; l_info("ANIM: update-rate = 1/%d", rate); }
     return rate;
 }
 
@@ -3127,7 +3127,24 @@ static int redirect_logical_user_to_temp(void *L, int idx) {
              * written/shipped file -> stats never displayed. Redirect the bare read to
              * <Temp> too so read and write resolve to the SAME place. EXACT match
              * (strcmp) so unrelated names like module_dialog_choice.prop are untouched. */
-            strcmp(s, "choice.prop") == 0 || strcmp(s, "choicestats.prop") == 0) {
+            strcmp(s, "choice.prop") == 0 || strcmp(s, "choicestats.prop") == 0 ||
+            /* PLAYER-SELECTION PERSISTENCE FIX (2026-07-24). Same root cause as the
+             * saveslot/choice.prop entries above, just never extended to the engine's
+             * OWN property sets: prefs.prop / user.prop / game_prefs.prop are saved
+             * and loaded by BARE name (SavePrefs -> Save('prefs.prop')), so with no
+             * redirect they resolve against a NULL location that does not bind on
+             * this port -- the write silently goes nowhere and the read finds nothing.
+             * Device evidence (79-min session): SavePrefs ran 15 times, yet all three
+             * files are still 0 bytes on the memory card and NONE of them ever appears
+             * in the save-IO path, while the redirected saveslot/estore writes land
+             * fine. Consequences the player sees: the chosen Jesse model reverts to the
+             * default male on an existing save (a fresh save works because the choice
+             * is still in memory that session), and the choices made in a session are
+             * gone on the next launch. Redirect these to <Temp> so read and write
+             * resolve to the same real, writable place -- exact-match only, so
+             * unrelated *_prefs.prop resources are untouched. */
+            strcmp(s, "prefs.prop") == 0 || strcmp(s, "user.prop") == 0 ||
+            strcmp(s, "game_prefs.prop") == 0) {
             suffix = s;
         }
     }
@@ -3251,7 +3268,20 @@ REDIRECT_ARG1_HOOK(hook_lua_bundle_get_resources, g_hook_lua_bundle_get_resource
 REDIRECT_ARG1_HOOK(hook_lua_bundle_remove_resource, g_hook_lua_bundle_remove_resource)
 REDIRECT_ARG1_HOOK(hook_lua_unload, g_hook_lua_unload)
 REDIRECT_ARG1_HOOK(hook_lua_resource_delete, g_hook_lua_resource_delete)
-REDIRECT_ARG1_HOOK(hook_lua_query_event_log, g_hook_lua_query_event_log)
+/* CHOICE-LOSS DIAGNOSTIC (2026-07-24): this is how the Choices screen reads the
+ * player's own past decisions out of the event log. Log it (capped) so we can see
+ * whether it is even called, and against which log, when the screen comes up
+ * empty on a fresh launch. */
+static so_hook g_hook_lua_query_event_log;
+static int hook_lua_query_event_log(void *L) {
+    static uint32_t count = 0;
+    const char *a1 = trace_arg_str(L, 1);
+    if (++count <= 24U) {
+        l_info("EVENTLOG: QueryEventLog #%u arg1='%s'", count, a1 ? a1 : "(?)");
+    }
+    redirect_logical_user_to_temp(L, 1);
+    return SO_CONTINUE(int, g_hook_lua_query_event_log, L);
+}
 /* CHOICES FIX (2026-07-20): the crowd choice.prop was redirected to <Temp> for
  * ResourceExists but NOT for PropertyExists/PropertyGet, so the file was FOUND
  * (=1) yet PARSED under the bare name (NULL location) -> empty stats screen after
@@ -3272,12 +3302,45 @@ REDIRECT_ARG1_HOOK(hook_lua_property_exists, g_hook_lua_property_exists)
  * with no location, so they resolve against whatever EventLogCreate bound --
  * fixing EventLogCreate's resource arg fixes the whole chain.) */
 REDIRECT_ARG1_HOOK(hook_lua_resource_set_nonpurgable, g_hook_lua_resource_set_nonpurgable)
-REDIRECT_ARG1_HOOK(hook_lua_delete_all_events_after, g_hook_lua_delete_all_events_after)
+
+/* CHOICE-LOSS DIAGNOSTIC (2026-07-24): player choices survive the session they
+ * are made in but are gone on the next launch. Device evidence: the .estore
+ * index is rewritten O_TRUNC ~20x per session, and older event PAGES that exist
+ * on the memory card (_saveslot1_id_PageNNNN.epage from earlier sessions) are
+ * NEVER re-opened -- only the live page is. So the events are on disk but the
+ * log never loads its history back. The two candidates are (a) the log being
+ * re-created empty instead of opened, and (b) DeleteAllEventsAfterEvent wiping
+ * the log when the engine rolls it back to the loaded save point (if the anchor
+ * event is not found, "delete everything after" can mean "delete all"). Both are
+ * silent today. Log the whole lifecycle so one test session identifies which. */
+static so_hook g_hook_lua_delete_all_events_after;
+static int hook_lua_delete_all_events_after(void *L) {
+    static uint32_t count = 0;
+    const char *a1 = trace_arg_str(L, 1);
+    const char *a2 = trace_arg_str(L, 2);
+    if (++count <= 24U) {
+        l_info("EVENTLOG: DeleteAllEventsAfterEvent #%u log='%s' afterEvent='%s'",
+               count, a1 ? a1 : "(?)", a2 ? a2 : "(?)");
+    }
+    redirect_logical_user_to_temp(L, 1);
+    return SO_CONTINUE(int, g_hook_lua_delete_all_events_after, L);
+}
 
 static so_hook g_hook_lua_event_log_create;
 static int hook_lua_event_log_create(void *L) {
+    static uint32_t count = 0;
+    const char *name = trace_arg_str(L, 1);
+    const char *res  = trace_arg_str(L, 3);
+    if (++count <= 24U) {
+        l_info("EVENTLOG: EventLogCreate #%u name='%s' resource='%s'",
+               count, name ? name : "(?)", res ? res : "(?)");
+    }
     redirect_logical_user_to_temp(L, 3); /* the backing-resource path arg */
-    return SO_CONTINUE(int, g_hook_lua_event_log_create, L);
+    int ret = SO_CONTINUE(int, g_hook_lua_event_log_create, L);
+    if (count <= 24U) {
+        l_info("EVENTLOG: EventLogCreate #%u RETURN ret=%d", count, ret);
+    }
+    return ret;
 }
 
 /* 2026-07-16 CROWD-CHOICE / CROSS-CHAPTER FIX. StatChoicesHandler.lua persists
@@ -4940,7 +5003,7 @@ static int hook_job_init(void) {
  * Scene::PrepareToRenderShadows — a big chunk of the 488k-vert/100ms-CPU heavy
  * frames. Hooking LightInstance::IsShadowLight / IsContributingShadowLight to
  * report FALSE makes the engine treat no light as a shadow caster, so it skips
- * the whole shadow setup + pass. Opt-in via ux0:data/mcsm/no_shadows.txt (visual
+ * the whole shadow setup + pass. Opt-in via ux0:data/mcsm/graphics.txt (shadows) (visual
  * trade: objects lose cast shadows). */
 static int shadows_disabled(void) { return !mcsm_cfg()->shadows; }
 static so_hook g_hook_is_shadow_light;
@@ -4962,7 +5025,7 @@ static void patch_boot_diag_hooks(void) {
         (void)hook_symbol_checked(&so_mod_gameengine, "_ZN13LightInstance25IsContributingShadowLightEv",
                                   "LightInstance::IsContributingShadowLight",
                                   (uintptr_t)&hook_is_contributing_shadow, &g_hook_is_contributing_shadow);
-        l_info("PERF: shadows DISABLED (no_shadows.txt) — shadow geometry pass skipped.");
+        l_info("PERF: shadows DISABLED (graphics.txt shadows=off) — shadow geometry pass skipped.");
     }
 #if ENABLE_UNSAFE_ARCHIVE_DIAG_HOOKS
     (void)hook_symbol_checked(&so_mod_gameengine,
@@ -5629,7 +5692,7 @@ static void patch_login_diag_hooks(void) {
  *       logs the natural values the game sets (so a diagnostic run reveals the enum
  *       in loader.log) and only OVERRIDES when settings/render_quality.txt = <int>.
  *   (2) toon OUTLINE pass — RenderObject_Mesh::SetRenderToonOutline(bool). Forcing
- *       it off skips the per-mesh outline submit. Opt-in: settings/no_outlines.txt.
+ *       it off skips the per-mesh outline submit. Opt-in: settings/graphics.txt (outlines).
  * Both alter visuals, so both are OFF by default — zero effect on the shader-key-fix
  * validation; enable to A/B toward reliable 30fps. */
 static int render_quality_override(void) {
@@ -5738,7 +5801,7 @@ static void patch_render_perf_hooks(void) {
                                   "_ZN17RenderObject_Mesh20SetRenderToonOutlineEb",
                                   "RenderObject_Mesh::SetRenderToonOutline",
                                   (uintptr_t)&hook_set_toon_outline, &g_hook_set_toon_outline);
-        l_info("PERF: toon outlines DISABLED (no_outlines.txt) — outline submit skipped.");
+        l_info("PERF: toon outlines DISABLED (graphics.txt outlines=off) — outline submit skipped.");
     }
     if (detail_scale() > 0.0f) {
         (void)hook_symbol_checked(&so_mod_gameengine, "_ZN5Scene17SetBrushFarDetailEf",

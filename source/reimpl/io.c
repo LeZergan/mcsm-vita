@@ -72,7 +72,13 @@ static int path_is_savedata_bundle(const char *path) {
            strstr(path, "saveslot") ||
            strstr(path, "autosave") ||
            strstr(path, "user.prop") ||
-           strstr(path, "prefs.prop");
+           strstr(path, "prefs.prop") ||
+           /* Also trace the property sets that carry player selections (chosen
+            * Jesse model, choice records). Without these in the filter their
+            * writes were invisible in the log, which is why "SavePrefs ran but
+            * nothing was written" took a full session to spot. */
+           strstr(path, "choice.prop") ||
+           strstr(path, "choicestats.prop");
 }
 
 static int savedata_flags_can_write(int flags) {

@@ -21,8 +21,16 @@ typedef struct {
     int  shadows;             /* 1 = cast shadows on, 0 = off (fewer draws)      */
     int  draw_distance;       /* far-clip cap in world units; 0 = engine default */
     int  skinning_full;       /* 1 = full char animation, 0 = reduced (less CPU) */
+    int  anim_rate;           /* advance animation every Nth frame: 1=every frame
+                               * (default), 2=half, 3=third. Animation blend across
+                               * PlaybackControllers dominates the sim, so N>1 is the
+                               * biggest remaining CPU lever -- at the cost of motion
+                               * and lip-sync stepping at 30/N Hz.                  */
     /* system */
-    int  clock_adaptive;      /* 0 = ARM pinned 444, 1 = adaptive (battery)      */
+    int  clock_adaptive;      /* 0 = ARM pinned, 1 = adaptive floor (battery)    */
+    int  clock_mhz;           /* ARM target MHz. 444 = stock max. Higher only has
+                               * an effect with a CPU-overclock plugin installed;
+                               * without one the kernel clamps back to 444.       */
 } McsmCfg;
 
 typedef struct {

@@ -877,7 +877,22 @@ static int active_touch_add(int32_t id) {
             return i;
         }
     }
-    return -1;
+    /* SELF-HEAL (2026-07-23): a full table is impossible with real fingers -- the
+     * Vita front panel reports at most 6 simultaneous touches -- so every slot
+     * being taken means UP events went missing and leaked them. Without this the
+     * table stays full for the rest of the session, every touch falls back to
+     * slot 0 with a non-zero active count, and the engine sees POINTER_DOWN
+     * (another finger in a gesture) instead of a fresh DOWN, so taps stop
+     * registering. Drop the stale state and start clean. */
+    for (int i = 0; i < MAX_ACTIVE_TOUCH_IDS; ++i) {
+        g_active_touch_used[i] = 0;
+        g_active_touch_ids[i] = 0;
+    }
+    g_active_touch_used[0] = 1;
+    g_active_touch_ids[0] = id;
+    g_active_touch_count = 1;
+    l_warn("INPUT touch: slot table was full (leaked UPs) -> reset, reusing slot 0");
+    return 0;
 }
 
 static void active_touch_remove(int32_t id) {
@@ -1476,7 +1491,33 @@ void controls_handler_key(int32_t keycode, ControlsAction action) {
     sdl_pad_sent = controls_emit_sdl_pad_button(keycode, action);
 
     if (is_shoulder_remap) {
+        /* SHOULDER FIX (2026-07-23): "L and R are very inconsistent". MCSM binds
+         * shoulder actions to L1/R1 on some screens and L2/R2 on others, and reads
+         * them over THREE routes: SDL shoulder buttons, SDL trigger axes, and
+         * Telltale's own native platform queue. Previously L/R drove only the two
+         * SDL routes and were excluded from the native queue entirely, so any
+         * screen reading the native mapper saw nothing -> worked in some places,
+         * dead in others. Now one physical shoulder press reports BOTH identities
+         * on BOTH stacks: SDL button (L1/R1) + SDL trigger axis (L2/R2), plus the
+         * native platform codes for L1 AND L2 (R1 AND R2).
+         * NOTE: the generic InputMapper route is deliberately NOT used here --
+         * it has no L2/R2 codes (MCSM_INPUT_BUTTON_6/7 are aliased to BACK/START,
+         * so emitting them would fire back/start), and it duplicates the same
+         * shoulder identity SDL already delivers. */
         controls_emit_sdl_trigger(keycode, action);
+        const int is_left = (keycode == AKEYCODE_BUTTON_L1);
+        controls_queue_engine_input(g_platform_input_queue,
+                                    "platform-shoulder-1",
+                                    is_left ? MCSM_VITA_L1 : MCSM_VITA_R1,
+                                    action,
+                                    0.0f,
+                                    0.0f);
+        controls_queue_engine_input(g_platform_input_queue,
+                                    "platform-shoulder-2",
+                                    is_left ? MCSM_VITA_L2 : MCSM_VITA_R2,
+                                    action,
+                                    0.0f,
+                                    0.0f);
     }
     /* SDL is the primary controller route. Queue Telltale's native mapper only
      * if SDL could not take the pad event; double-delivery makes menu focus move
@@ -1530,6 +1571,16 @@ void controls_handler_touch(int32_t id, float x, float y, ControlsAction action)
     static unsigned log_count = 0;
     static unsigned gated_log_count = 0;
     if (!input_delivery_ready()) {
+        /* TOUCH SLOT LEAK FIX (2026-07-23): the compact slot table is only freed
+         * on UP, inside android_motion_action_for_touch() below -- which this early
+         * return skips. Input delivery is gated during the multi-second scene-load
+         * freezes, so a finger lifted mid-load leaked its slot permanently. After
+         * MAX_ACTIVE_TOUCH_IDS such events touch dies for the rest of the session
+         * ("touch stops working after playing a long time"). Release the slot even
+         * when the event itself is not delivered, so the table can never drift. */
+        if (action == CONTROLS_ACTION_UP) {
+            active_touch_remove(id);
+        }
         if (gated_log_count < 8U) {
             l_info("INPUT touch gated before input-ready id=%d action=%d xy=%.1f,%.1f scene=%d frames=%u",
                    id,

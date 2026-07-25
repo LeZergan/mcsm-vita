@@ -121,8 +121,19 @@ void mcsm_read_clock_cfg(McsmClockCfg * cfg) {
      * the governor can downclock light frames to save power. */
     cfg->governor_off = 0;
     cfg->gpu = 222;
-    if (mcsm_cfg()->clock_adaptive) { cfg->arm_min = 266; cfg->arm_max = 444; }
-    else                            { cfg->arm_min = 444; cfg->arm_max = 444; }
+    /* OVERCLOCK SUPPORT (2026-07-25). This used to hard-code 444 (stock max), so a
+     * console running a CPU-overclock plugin gained nothing: the game simply never
+     * asked for more. That mattered because the workload is ~70% SIM-bound, where
+     * ARM MHz is close to a linear multiplier -- it is the single biggest remaining
+     * performance lever, and it was capped by us rather than by the hardware.
+     * `clock = <MHz>` in graphics.txt is now honoured (clamped to a sane 111..600).
+     * With no OC plugin the kernel just clamps the request back to 444, so asking
+     * for more is harmless -- the CLOCK: log line reports what was actually granted
+     * ("got=") so it is obvious whether the plugin took effect. */
+    const int want = mcsm_cfg()->clock_mhz;
+    const int arm  = (want >= 111 && want <= 600) ? want : 444;
+    if (mcsm_cfg()->clock_adaptive) { cfg->arm_min = 266; cfg->arm_max = arm; }
+    else                            { cfg->arm_min = arm; cfg->arm_max = arm; }
 }
 
 bool file_load(const char * path, uint8_t ** buffer, size_t * size) {

@@ -94,11 +94,11 @@ enum mcsm_method_ids {
  * governor can downclock further) while staying WELL above the old unreadable
  * 480x272 potato — text/UI at 720 wide is only ~10% smaller than at 800 and
  * still comfortably legible. The engine sizes its intermediate render targets
- * from this at boot, so it drives text/UI sharpness. Tunable via fb_override.txt:
+ * from this at boot, so it drives text/UI sharpness. Tunable via graphics.txt (resolution):
  * 960x544 = native (sharpest, heaviest), 800x452 = the old sharper default,
  * 640x363 = lighter still, 480x272 = max fps. Height kept EVEN (408) — GXM
  * render targets are happiest with even dims and the fb_override sanitizer forces
- * even too, so this compile-time default matches an fb_override.txt of "720x408". */
+ * even too, so this compile-time default matches an graphics.txt (resolution) of "720x408". */
 #define MCSM_DEFAULT_RENDER_W 720
 #define MCSM_DEFAULT_RENDER_H 408
 
@@ -650,7 +650,7 @@ static jint GetHeight(jmethodID id, va_list args) { (void)id; (void)args; ensure
 int mcsm_get_framebuffer_width(void) { ensure_framebuffer_override_loaded(); return (g_fb_width > 0) ? g_fb_width : MCSM_DEFAULT_RENDER_W; }
 int mcsm_get_framebuffer_height(void) { ensure_framebuffer_override_loaded(); return (g_fb_height > 0) ? g_fb_height : MCSM_DEFAULT_RENDER_H; }
 /* Render-scale = the low-res the GAME's frame is rendered at into the FBO before
- * upscaling to native. From fb_override.txt, independent of the game's logical res. */
+ * upscaling to native. From graphics.txt (resolution), independent of the game's logical res. */
 int mcsm_get_render_scale_width(void) { ensure_framebuffer_override_loaded(); return g_fb_override_enabled ? g_fb_override_width : MCSM_DEFAULT_RENDER_W; }
 int mcsm_get_render_scale_height(void) { ensure_framebuffer_override_loaded(); return g_fb_override_enabled ? g_fb_override_height : MCSM_DEFAULT_RENDER_H; }
 
