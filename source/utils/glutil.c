@@ -1638,8 +1638,30 @@ void glActiveTexture_soloader(GLenum texture) {
  *     => Here a victim must ALSO be untouched for TEXLRU_MIN_AGE binds, i.e. it
  *        belongs to a scene that is long gone. Currently-bound is still excluded.
  * Work per call is capped so a reclaim can never turn into a long stall. */
-#define TEXLRU_VRAM_LOW      (12u * 1024u * 1024u) /* reclaim only under this much free VRAM */
-#define TEXLRU_MIN_AGE       20000u                /* binds a texture must be idle to be evictable */
+/* GRADUATED reclaim. The AGE gate is what makes this safe -- a texture nothing has
+ * bound in a very long time belongs to a scene that is gone, and that is equally
+ * true whether we notice it early or late. So we do NOT wait for near-exhaustion:
+ * we start trimming while there is still plenty of headroom, and only get less
+ * patient as free VRAM actually falls. Starting at 8MB free (the old plan) meant
+ * running the tank down to nothing first and reclaiming in a panic; starting at
+ * 40MB keeps VRAM in a healthy band all session.
+ *
+ * Tier            free VRAM        evict textures idle for      rationale
+ * ---------------------------------------------------------------------------
+ * (none)          > 40MB           nothing                      plenty spare
+ * relaxed         24..40MB         240000 binds (~1 min+)       certainly dead
+ * normal          12..24MB         80000  binds (~20s)          very likely dead
+ * urgent          < 12MB           20000  binds (~4s)           take what we can
+ *
+ * Bind rate is roughly 5-12k/s in gameplay, so those ages are seconds-to-minutes
+ * of being untouched, not frames. Anything still part of the live working set is
+ * re-bound every frame and can never qualify. */
+#define TEXLRU_VRAM_RELAXED  (40u * 1024u * 1024u)
+#define TEXLRU_VRAM_NORMAL   (24u * 1024u * 1024u)
+#define TEXLRU_VRAM_URGENT   (12u * 1024u * 1024u)
+#define TEXLRU_AGE_RELAXED   240000u
+#define TEXLRU_AGE_NORMAL    80000u
+#define TEXLRU_AGE_URGENT    20000u
 #define TEXLRU_EVICT_PER_RUN 32u                   /* bound the stall */
 #endif
 typedef struct { GLuint id; GLuint bytes; uint32_t use; } texlru_ent;
@@ -1687,7 +1709,12 @@ static void texlru_touch(GLuint id) {
  * idle long enough to be certain they belong to an unloaded scene. Returns without
  * touching anything in the overwhelmingly common case. */
 static void texlru_reclaim_vitagl(GLuint keep_id) {
-    if ((uint32_t)vglMemFree(VGL_MEM_VRAM) >= TEXLRU_VRAM_LOW) return;   /* no pressure */
+    const uint32_t free_vram = (uint32_t)vglMemFree(VGL_MEM_VRAM);
+    uint32_t min_age;
+    if      (free_vram >= TEXLRU_VRAM_RELAXED) return;                  /* plenty spare */
+    else if (free_vram >= TEXLRU_VRAM_NORMAL)  min_age = TEXLRU_AGE_RELAXED;
+    else if (free_vram >= TEXLRU_VRAM_URGENT)  min_age = TEXLRU_AGE_NORMAL;
+    else                                       min_age = TEXLRU_AGE_URGENT;
 
     unsigned freed = 0;
     uint32_t freed_kb = 0;
@@ -1696,7 +1723,7 @@ static void texlru_reclaim_vitagl(GLuint keep_id) {
         for (uint32_t i = 0; i < TEXLRU_SLOTS; i++) {
             texlru_ent *e = &s_texlru[i];
             if (!e->bytes || e->id == keep_id || texlru_is_live(e->id)) continue;
-            if (s_texlru_clock - e->use < TEXLRU_MIN_AGE) continue;      /* still recent */
+            if (s_texlru_clock - e->use < min_age) continue;             /* still recent */
             if (!victim || e->use < victim->use) victim = e;
         }
         if (!victim) break;            /* nothing is old enough -> leave it alone */
@@ -1711,9 +1738,10 @@ static void texlru_reclaim_vitagl(GLuint keep_id) {
     }
     if (freed) {
         s_texlru_evicted += freed;
-        l_info("TEXLRU: reclaimed %u idle textures (%uKB) under VRAM pressure; "
-               "live=%u total=%uKB free=%uKB",
-               freed, freed_kb, s_texlru_count, s_texlru_total / 1024u,
+        l_info("TEXLRU: reclaimed %u idle textures (%uKB) [age>=%u, free was %uKB]; "
+               "live=%u total=%uKB free now=%uKB",
+               freed, freed_kb, (unsigned)min_age, free_vram / 1024u,
+               s_texlru_count, s_texlru_total / 1024u,
                (unsigned)(vglMemFree(VGL_MEM_VRAM) / 1024u));
         glFinish();                    /* make the frees actually land before uploading */
     }
