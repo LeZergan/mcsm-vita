@@ -5,6 +5,47 @@
  * slCreateEngine, creates an AudioPlayer with an Android simple buffer queue,
  * and feeds signed 16-bit PCM through Enqueue. This file provides that OpenSL
  * surface and sends the queued PCM to sceAudioOutOutput.
+ *
+ * =====================================================================
+ * TODO / KNOWN-WRONG BY DESIGN: REPLACE WITH A REAL FMOD OUTPUT PLUGIN
+ * =====================================================================
+ * This works, but it is the wrong mechanism and should be rewritten.
+ *
+ * What we do here is impersonate Android's OpenSL ES stack -- ~900 lines of
+ * fake SL objects, interfaces and vtables -- purely so FMOD's *Android*
+ * backend believes it is on Android and hands us PCM. FMOD does not require
+ * any of that: libfmod.so exports FMOD_System_RegisterOutput and
+ * FMOD_System_SetOutputByPlugin (plus the C++ FMOD::System::registerOutput),
+ * which is FMOD's OFFICIAL extension point for adding a new platform backend
+ * -- the same mechanism console ports use.
+ *
+ * The correct implementation is an FMOD_OUTPUT_DESCRIPTION with ~6 callbacks
+ * (getnumdrivers / getdriverinfo / init / start / stop / getposition +
+ * lock / unlock), registered on the low-level system in the same
+ * Studio::initialize hook that currently forces FMOD_OUTPUTTYPE_OPENSL
+ * (see hook_fmod_studio_initialize in patch.c). FMOD would then drive
+ * timing off getposition() -- the real hardware play cursor, which its
+ * mixer is designed around -- and this whole file could be deleted.
+ *
+ * Concrete defects of the current approach, for whoever picks this up:
+ *   - player_android_bq_get_state() always reports count = 0. In real OpenSL
+ *     that is "buffers currently queued", i.e. flow-control state FMOD may
+ *     read; we permanently claim the queue is empty.
+ *   - Enqueue is SYNCHRONOUS: it calls audio_output_i16_frames() inline, so
+ *     FMOD's mixer thread blocks on sceAudioOut. Real Enqueue hands the
+ *     buffer over and returns immediately.
+ *   - There is no actual queue. Clear() is a no-op returning success, and
+ *     there is no double buffering; pacing is an accident of the blocking
+ *     write rather than an audio clock.
+ *   - The feed thread busy-polls FMOD's callback with a 1ms sleep.
+ *   - Interface support is a hand-written whitelist, so anything FMOD asks
+ *     for that we did not anticipate fails silently.
+ *
+ * ABI caveat when doing the rewrite: FMOD_OUTPUT_DESCRIPTION is version
+ * sensitive. This is FMOD Studio 1.x (low-level API v5 -- note the FMOD5_*
+ * exports); confirm the exact build with FMOD_System_GetVersion at runtime
+ * and match the corresponding fmod_output.h, or it will crash inside the
+ * mixer rather than fail cleanly.
  */
 
 #include <pthread.h>

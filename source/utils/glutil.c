@@ -1678,9 +1678,19 @@ static uint32_t   s_texlru_evicted = 0;
  * guard rejected the upload thread and made the whole cap a silent no-op. */
 static GLuint     s_texlru_bound = 0;
 
+/* Bounded linear probe. The unbounded version was safe only while this table was
+ * dead code on vitaGL; now that every glBindTexture touches it, an unbounded probe
+ * is a trap. The engine re-uploads textures under FRESH GL names constantly, so the
+ * table fills, and once it has no empty slot every MISS would walk all 8192 entries
+ * -- at ~12k binds/s that is ~100M probes/s, which would cost far more than the
+ * texture memory it was added to reclaim. 32 probes is generous for this hash at
+ * any sane load factor; past that we report "not found", which is always safe:
+ * a missed touch just leaves a stale age (the entry looks older, so at worst it
+ * becomes evictable sooner), and a missed insert simply skips tracking one texture. */
+#define TEXLRU_MAX_PROBE 32u
 static texlru_ent *texlru_lookup(GLuint id, int insert) {
     uint32_t h = (id * 2654435761u) & (TEXLRU_SLOTS - 1u);
-    for (uint32_t i = 0; i < TEXLRU_SLOTS; i++) {
+    for (uint32_t i = 0; i < TEXLRU_MAX_PROBE; i++) {
         uint32_t s = (h + i) & (TEXLRU_SLOTS - 1u);
         if (s_texlru[s].bytes && s_texlru[s].id == id) return &s_texlru[s];
         if (s_texlru[s].bytes == 0) {
