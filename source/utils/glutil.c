@@ -1791,6 +1791,35 @@ static void texlru_touch(GLuint id) {
  * idle long enough to be certain they belong to an unloaded scene. Returns without
  * touching anything in the overwhelmingly common case. */
 static void texlru_reclaim_vitagl(GLuint keep_id) {
+    /* DISABLED (2026-07-29) — THIRD failed attempt at reclaiming texture memory on
+     * this engine. Do not re-enable without a fundamentally different idea.
+     *
+     * Device evidence: with the MOST conservative tier active (age >= 240000 binds,
+     * 32MB free) it reclaimed 52 textures and visibly broke the chapter-selector
+     * art. No OOM, no VRAM pressure -- it simply deleted textures the game was
+     * still going to draw.
+     *
+     * The age heuristic cannot work here, and the reason is structural: the engine
+     * NEVER calls glDeleteTextures, so it believes every texture it has ever
+     * created is still live and never re-uploads one. Menu and selector art is
+     * uploaded at boot and then not bound again for the whole time the player is in
+     * gameplay -- so by any "recently used" measure it looks long dead, while the
+     * engine still holds and expects it. From the engine's side NOTHING is ever
+     * dead, so no idle-time threshold can separate "cold" from "finished". The two
+     * earlier attempts (40MB byte budget, texture-object cap) died of the same
+     * cause with different symptoms.
+     *
+     * Unbounded texture growth is the lesser evil and is what we ship: measured
+     * across a 79-minute session VRAM fell 80MB -> 8MB with ZERO GL_OUT_OF_MEMORY
+     * errors. A standing risk that has never once fired beats corrupting what the
+     * player is looking at. The low-VRAM warning in gl_swap stays, so if it ever
+     * does start failing the log will say so.
+     *
+     * Anything that replaces this needs a real liveness signal from the engine --
+     * scene/resource-set unload boundaries, say -- not a timer. */
+    (void)keep_id;
+    return;
+
     /* Throttle: this sits on BOTH upload paths (~2900 uploads per scene load), and
      * below the relaxed threshold it would otherwise sweep the whole table on every
      * one of them -- landing squarely on the scene loads this port is already slow
