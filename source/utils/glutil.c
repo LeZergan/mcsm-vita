@@ -1738,8 +1738,17 @@ static int texlru_is_live(GLuint id) {
 static void texlru_touch(GLuint id) {
     /* The per-bind timestamp IS the safety mechanism for the vitaGL reclaim below
      * (a victim must be idle for TEXLRU_MIN_AGE binds), so it can no longer be
-     * skipped there. One hash probe per bind. */
-    if (!id) return;
+     * skipped there. One hash probe per bind.
+     *
+     * Except for the commonest case by far: consecutive draws re-binding the SAME
+     * texture. Re-probing for an id we just stamped buys nothing -- it is already
+     * the freshest entry in the table -- so short-circuit it. Ageing is unaffected:
+     * a run of repeated binds now advances the clock once instead of N times, and
+     * since every timestamp is measured against that same clock, relative ages (all
+     * the reclaim compares) are unchanged. */
+    static GLuint s_last_touched = 0;
+    if (!id || id == s_last_touched) return;
+    s_last_touched = id;
     texlru_ent *e = texlru_lookup(id, 0);
     if (e) e->use = ++s_texlru_clock;
 }
