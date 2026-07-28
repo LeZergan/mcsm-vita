@@ -36,6 +36,12 @@ typedef struct {
     int  render_quality;      /* engine RenderConfiguration quality, 0..15. MCSM boots
                                * at 15 (its mobile build uses a wider scale than the
                                * 0-4 desktop enum). -1 = leave the engine's own value. */
+    int  gpu_tier;            /* device GPU tier reported to the game's Lua via
+                               * PlatformGetGPUQuality: 0 = weakest .. 3 = strongest,
+                               * -1 = leave the engine's own answer alone. The game
+                               * configures its own quality from this, so forcing 0
+                               * selects the engine's built-in low-spec path -- the
+                               * same one budget Android phones get.               */
     /* system */
     int  clock_adaptive;      /* 0 = ARM pinned, 1 = adaptive floor (battery)    */
     int  clock_mhz;           /* ARM target MHz. 444 = stock max. Higher only has

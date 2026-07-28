@@ -41,7 +41,41 @@ char next_shader_fname[256];
 void load_shader(GLuint shader, const char * string, size_t length);
 
 static const char k_gl_vendor[] = "Imagination Technologies";
-static const char k_gl_renderer[] = "PowerVR SGX 543MP";
+
+/* GPU IDENTITY -> ENGINE QUALITY TIER (2026-07-29).
+ * libGameEngine.so carries a GPU database and keys its quality decisions off the
+ * GL_RENDERER string. The names it knows are, from weakest to strongest:
+ *     PowerVR SGX 540 / 541 / 542 / 543 / 543MP / 544 / 544MP
+ *     Mali-400, Adreno (TM) 2 / 30 / 305 / 320 / 330, Tegra 3, NVIDIA X1
+ * We were reporting "PowerVR SGX 543MP" -- an iPad-3-class part, high in that
+ * list -- so the game recognised a capable device and configured itself to match.
+ * That is a real reason it boots at maximum render quality on hardware weaker
+ * than anything in the table.
+ *
+ * `gpu_tier` in graphics.txt now picks which identity we present:
+ *     0 -> "PowerVR SGX 540"   weakest PowerVR the engine knows
+ *     1 -> "PowerVR SGX 541"
+ *     2 -> "PowerVR SGX 543"
+ *     3 / -1 -> "PowerVR SGX 543MP"  (unchanged default, the Vita's real part)
+ * Deliberately staying inside the PowerVR family: the engine has vendor-specific
+ * paths, and claiming to be an Adreno or Mali could send it down a branch written
+ * for hardware we are not. Same family, lower rung -- the engine's own low-spec
+ * configuration, which is what a budget PowerVR phone would get.
+ *
+ * NOTE: this is the SECOND thing tried for tier selection. The Lua-side
+ * PlatformGetGPUQuality hook was the obvious candidate and is a confirmed dead
+ * end -- device logs show MCSM never calls it (nor RenderSetQualityLevel /
+ * RenderSetCurQualityLevel / RenderGetQualityLevels). The renderer string is
+ * consulted; those functions are not. */
+static const char *mcsm_gl_renderer(void) {
+    switch (mcsm_cfg()->gpu_tier) {
+        case 0:  return "PowerVR SGX 540";
+        case 1:  return "PowerVR SGX 541";
+        case 2:  return "PowerVR SGX 543";
+        default: return "PowerVR SGX 543MP";
+    }
+}
+#define k_gl_renderer (mcsm_gl_renderer())
 static const char k_gl_version[] = "OpenGL ES 2.0 build 1.10@2516585";
 static const char k_glsl_version[] = "OpenGL ES GLSL ES 1.00";
 static int g_gl_identity_logged = 0;

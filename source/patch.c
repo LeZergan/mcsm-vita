@@ -3971,6 +3971,34 @@ static int hook_lua_get_demo_timeout(void *L) {
     return ret >= 0 ? ret : SO_CONTINUE(int, g_hook_lua_get_demo_timeout, L);
 }
 
+/* GPU TIER (2026-07-29). PlatformGetGPUQuality is how the game's own Lua asks
+ * "how strong is this device's GPU?", and it drives the quality the engine then
+ * configures itself with. Disassembling it shows a 0..3 tier derived from the
+ * platform enum: >18 -> 3, 15..18 -> 2, 10..14 -> 1, 1..9 -> 0, else 2. We report
+ * as Android, so the game sees a mid/high tier and sets itself up accordingly --
+ * which is why it boots at maximum render quality on hardware far weaker than any
+ * phone in that bracket.
+ *
+ * Forcing 0 makes the game select the SAME low-spec path budget Android phones
+ * get. That is the engine's own supported configuration rather than us guessing at
+ * internal quality numbers, so it should scale every chapter consistently and can
+ * be undone by deleting one config line. Default is -1 (untouched) -- this only
+ * does anything if graphics.txt asks for it. */
+static so_hook g_hook_lua_platform_get_gpu_quality;
+static int hook_lua_platform_get_gpu_quality(void *L) {
+    static uint32_t count = 0;
+    const int tier = mcsm_cfg()->gpu_tier;
+    if (++count <= 8U) {
+        l_info("GPUTIER: PlatformGetGPUQuality -> %s (cfg gpu_tier=%d)",
+               tier >= 0 ? "forced" : "engine default", tier);
+    }
+    if (tier < 0) {
+        return SO_CONTINUE(int, g_hook_lua_platform_get_gpu_quality, L);
+    }
+    int ret = lua_push_forced_integer(L, tier, "PlatformGetGPUQuality");
+    return ret >= 0 ? ret : SO_CONTINUE(int, g_hook_lua_platform_get_gpu_quality, L);
+}
+
 static int hook_lua_platform_get_trial_timeout(void *L) {
     static uint32_t count = 0;
     count++;
@@ -5231,6 +5259,11 @@ static void patch_dlc_fast_path_hooks(void) {
                               "_ZN10TTPlatform24GetVirtualKeyboardResultER6StringRb",
                               "TTPlatform::GetVirtualKeyboardResult",
                               (uintptr_t)&hook_get_virtual_keyboard_result, &g_hook_get_vkbd_result);
+    (void)hook_symbol_checked(&so_mod_gameengine,
+                              "_Z24luaPlatformGetGPUQualityP9lua_State",
+                              "luaPlatformGetGPUQuality",
+                              (uintptr_t)&hook_lua_platform_get_gpu_quality,
+                              &g_hook_lua_platform_get_gpu_quality);
     (void)hook_symbol_checked(&so_mod_gameengine,
                               "_Z32luaPlatformIsConnectedToInternetP9lua_State",
                               "luaPlatformIsConnectedToInternet",
