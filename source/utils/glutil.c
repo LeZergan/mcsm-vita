@@ -1688,16 +1688,45 @@ static GLuint     s_texlru_bound = 0;
  * a missed touch just leaves a stale age (the entry looks older, so at worst it
  * becomes evictable sooner), and a missed insert simply skips tracking one texture. */
 #define TEXLRU_MAX_PROBE 32u
+/* Slot states, encoded in (id, bytes):
+ *     bytes != 0                -> LIVE, holding texture `id`
+ *     bytes == 0 && id != 0     -> TOMBSTONE (evicted; the chain continues through it)
+ *     bytes == 0 && id == 0     -> never used; a probe may stop here
+ *
+ * The tombstone is load-bearing, not bookkeeping. Eviction used to clear a victim
+ * to a plain hole, which SEVERS the probe chain: any entry that had been pushed
+ * past that slot by a collision became unreachable. Two ways that turned into
+ * deleting a texture the engine was still drawing with:
+ *   (a) texlru_touch() for the orphaned entry returned NULL, so its `use` stopped
+ *       being refreshed. It then looked like the OLDEST entry in the table and the
+ *       reclaim -- which deliberately picks the oldest -- chose it first, even
+ *       though it was in the live working set.
+ *   (b) the next texlru_record() for that id landed on the hole and inserted a
+ *       SECOND entry for it. The stale duplicate kept ageing and was deleted while
+ *       the fresh one was in use.
+ * Either way glDeleteTextures hits a live texture, which is precisely the
+ * "deleted-but-still-used textures sampled as GARBAGE" failure documented above --
+ * the thing the age gate exists to prevent. texlru_is_live() cannot save it: that
+ * only knows the handful of units bound at this instant.
+ * Insert prefers the first tombstone seen so the table still gets reused. */
 static texlru_ent *texlru_lookup(GLuint id, int insert) {
     uint32_t h = (id * 2654435761u) & (TEXLRU_SLOTS - 1u);
+    texlru_ent *tomb = NULL;
     for (uint32_t i = 0; i < TEXLRU_MAX_PROBE; i++) {
-        uint32_t s = (h + i) & (TEXLRU_SLOTS - 1u);
-        if (s_texlru[s].bytes && s_texlru[s].id == id) return &s_texlru[s];
-        if (s_texlru[s].bytes == 0) {
-            if (!insert) return NULL;
-            s_texlru[s].id = id; s_texlru[s].use = 0; return &s_texlru[s];
+        texlru_ent *e = &s_texlru[(h + i) & (TEXLRU_SLOTS - 1u)];
+        if (e->bytes) {
+            if (e->id == id) return e;          /* live hit */
+            continue;                            /* occupied by someone else */
         }
+        if (e->id != 0) {                        /* tombstone: remember, keep probing */
+            if (!tomb) tomb = e;
+            continue;
+        }
+        if (!insert) return NULL;                /* virgin slot: chain genuinely ends */
+        if (tomb) { tomb->id = id; tomb->use = 0; return tomb; }
+        e->id = id; e->use = 0; return e;
     }
+    if (insert && tomb) { tomb->id = id; tomb->use = 0; return tomb; }
     return NULL;
 }
 static int texlru_is_live(GLuint id) {
@@ -1719,6 +1748,14 @@ static void texlru_touch(GLuint id) {
  * idle long enough to be certain they belong to an unloaded scene. Returns without
  * touching anything in the overwhelmingly common case. */
 static void texlru_reclaim_vitagl(GLuint keep_id) {
+    /* Throttle: this sits on BOTH upload paths (~2900 uploads per scene load), and
+     * below the relaxed threshold it would otherwise sweep the whole table on every
+     * one of them -- landing squarely on the scene loads this port is already slow
+     * at. VRAM pressure moves slowly, so sampling it periodically is equivalent and
+     * costs ~1/64th as much. */
+    static unsigned s_tick = 0;
+    if ((s_tick++ & 0x3fU) != 0U) return;
+
     const uint32_t free_vram = (uint32_t)vglMemFree(VGL_MEM_VRAM);
     uint32_t min_age;
     if      (free_vram >= TEXLRU_VRAM_RELAXED) return;                  /* plenty spare */
@@ -1726,24 +1763,47 @@ static void texlru_reclaim_vitagl(GLuint keep_id) {
     else if (free_vram >= TEXLRU_VRAM_URGENT)  min_age = TEXLRU_AGE_NORMAL;
     else                                       min_age = TEXLRU_AGE_URGENT;
 
+    /* Snapshot the bound units ONCE. texlru_is_live() re-reads this array for every
+     * candidate, so calling it inside the sweep meant ~16 loads per tracked entry
+     * per pass (~3000 entries = ~50k needless loads). */
+    GLuint bound[GL_DIAG_TEX_UNIT_CAP];
+    for (int u = 0; u < GL_DIAG_TEX_UNIT_CAP; u++) bound[u] = g_diag_bound_texture_2d[u];
+
+    /* ONE pass collects the oldest eligible victims. The previous shape re-swept all
+     * 8192 slots for each individual victim (up to 32 sweeps per call). */
+    texlru_ent *victims[TEXLRU_EVICT_PER_RUN];
+    unsigned nv = 0;
+    for (uint32_t i = 0; i < TEXLRU_SLOTS; i++) {
+        texlru_ent *e = &s_texlru[i];
+        if (!e->bytes || e->id == keep_id) continue;
+        if (s_texlru_clock - e->use < min_age) continue;                /* still recent */
+        int live = 0;
+        for (int u = 0; u < GL_DIAG_TEX_UNIT_CAP; u++) if (bound[u] == e->id) { live = 1; break; }
+        if (live) continue;
+        if (nv < TEXLRU_EVICT_PER_RUN) {
+            victims[nv++] = e;
+        } else {
+            /* Replace the youngest of the chosen set, so we keep the oldest N. */
+            unsigned worst = 0;
+            for (unsigned k = 1; k < nv; k++) if (victims[k]->use > victims[worst]->use) worst = k;
+            if (e->use < victims[worst]->use) victims[worst] = e;
+        }
+    }
+
     unsigned freed = 0;
     uint32_t freed_kb = 0;
-    for (unsigned n = 0; n < TEXLRU_EVICT_PER_RUN; n++) {
-        texlru_ent *victim = NULL;
-        for (uint32_t i = 0; i < TEXLRU_SLOTS; i++) {
-            texlru_ent *e = &s_texlru[i];
-            if (!e->bytes || e->id == keep_id || texlru_is_live(e->id)) continue;
-            if (s_texlru_clock - e->use < min_age) continue;             /* still recent */
-            if (!victim || e->use < victim->use) victim = e;
-        }
-        if (!victim) break;            /* nothing is old enough -> leave it alone */
+    for (unsigned n = 0; n < nv; n++) {
+        texlru_ent *victim = victims[n];
         GLuint vid = victim->id;
         glDeleteTextures(1, &vid);
         (void)glGetError();
         s_texlru_total -= victim->bytes;
         s_texlru_count--;
         freed_kb += victim->bytes / 1024u;
-        victim->id = 0; victim->bytes = 0; victim->use = 0;
+        /* TOMBSTONE: keep `id` so the probe chain through this slot survives.
+         * Clearing it to 0 severs the chain and gets live textures deleted -- see
+         * the state table above texlru_lookup(). */
+        victim->bytes = 0; victim->use = 0;
         freed++;
     }
     if (freed) {

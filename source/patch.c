@@ -4259,7 +4259,17 @@ static int mcsm_ch2_forced_visible(void) {
     if (!s_ch_txt_loaded) mcsm_load_chapters_txt();
     if (s_ch_txt[2] == 1) return 1;
     if (s_ch_txt[2] == 0) return 0;
-    return mcsm_file_present(DATA_PATH "assets/MCSM_android_Minecraft102_data.ttarch2");
+    /* Memoized: this is reached from the resource-set hooks, which fire hundreds of
+     * times during a load, and the probe is an fopen on a .ttarch2 path. Chapter
+     * archives are copied in before boot and never appear or vanish mid-session, so
+     * one probe is as good as hundreds -- the same reasoning (and the same fix) as
+     * the per-episode s_present memo in mcsm_episode_available(). */
+    static signed char s_ch2_present = -1;
+    if (s_ch2_present < 0) {
+        s_ch2_present = (signed char)(
+            mcsm_file_present(DATA_PATH "assets/MCSM_android_Minecraft102_data.ttarch2") ? 1 : 0);
+    }
+    return s_ch2_present;
 }
 
 static int resource_set_name_is_episode2_local(const char *name) {

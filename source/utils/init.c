@@ -583,7 +583,7 @@ void soloader_init_all() {
     /* BUILD STAMP — first line of every log so old vs new eboot is unmistakable.
      * If this line is ABSENT, an OLD eboot is running (VitaShell kept it on a
      * same-Title-ID install → delete the bubble and reinstall). */
-    telemetry_log("BOOT", "BUILD=2026-07-25-r22 (texlru probe cap - fixes bind-path scan; graduated VRAM reclaim; detail+render_quality; rear-touch L3/R3)");
+    telemetry_log("BOOT", "BUILD=2026-07-25-r23 (CRITICAL texlru tombstone fix - eviction no longer severs probe chain; reclaim single-pass + throttled; ch2 probe memoized)");
     telemetry_log("BOOT", "soloader_init_all start");
 
 	// Launch `app0:configurator.bin` on `-config` init param
