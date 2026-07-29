@@ -82,10 +82,31 @@ void mcsm_fmod_native_probe(void) {
     if (!fp) return;
     fclose(fp);
 
+    /* r41 tried ux0:data/mcsm/ and got 0x8002D003 with the file definitely present
+     * (verified 1156243 bytes over FTP). That is the sandbox, not a missing file:
+     * a user app may read ux0:data freely but sceKernelLoadStartModule will only
+     * take modules from the application's OWN mount. NetStream ships these under
+     * its CONTENTS/module/ for exactly that reason. app0: is our package root, so
+     * try there first and keep the old paths last to confirm the diagnosis. */
     const char *paths[] = {
+        "app0:module/libfmodstudio.suprx",
+        "app0:libfmodstudio.suprx",
         DATA_PATH "libfmodstudio.suprx",
-        "ux0:data/mcsm/libfmodstudio.suprx",
     };
+
+    /* libfmodngpext is FMOD's Vita ("next generation portable") platform layer.
+     * If libfmodstudio depends on it, it must be resident FIRST or the load fails
+     * on an unresolved import rather than telling us anything useful. Failure here
+     * is not fatal to the probe -- log it and continue. */
+    {
+        const char *ext[] = { "app0:module/libfmodngpext.suprx", "app0:libfmodngpext.suprx" };
+        for (unsigned e = 0; e < sizeof(ext) / sizeof(ext[0]); e++) {
+            SceUID x = sceKernelLoadStartModule(ext[e], 0, NULL, 0, NULL, NULL);
+            l_info("FMODNATIVE: dep %s -> 0x%08X%s", ext[e], (unsigned)x,
+                   x >= 0 ? " (loaded)" : "");
+            if (x >= 0) break;
+        }
+    }
 
     l_info("FMODNATIVE: probe enabled (fmod_native_probe.txt present)");
     for (unsigned i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
@@ -116,5 +137,5 @@ void mcsm_fmod_native_probe(void) {
                (unsigned)mod, (unsigned)stop_rc);
         return;
     }
-    l_warn("FMODNATIVE: no libfmodstudio.suprx found — copy it to " DATA_PATH);
+    l_warn("FMODNATIVE: every path failed. If all returned 0x8002D003 the module is present but the sandbox refuses it; if app0: paths differ, the module itself is being rejected (wrong authid/signature for this title).");
 }
