@@ -583,7 +583,7 @@ void soloader_init_all() {
     /* BUILD STAMP — first line of every log so old vs new eboot is unmistakable.
      * If this line is ABSENT, an OLD eboot is running (VitaShell kept it on a
      * same-Title-ID install → delete the bubble and reinstall). */
-    telemetry_log("BOOT", "BUILD=2026-07-29-r42 (FMOD 1.06.08 confirmed; native probe retried from app0: with ngpext dep - ux0:data load was sandbox-refused 0x8002D003; POSTFX chain confirmed ALREADY OFF)");
+    telemetry_log("BOOT", "BUILD=2026-07-29-r43 (REAL FMOD OUTPUT PLUGIN for sceAudioOut, FMOD 1.06.08 ABI, polling mode - opt-in via fmod_output.txt=plugin; replaces the OpenSL ES impersonation + feed thread)");
     telemetry_log("BOOT", "soloader_init_all start");
 
 	// Launch `app0:configurator.bin` on `-config` init param

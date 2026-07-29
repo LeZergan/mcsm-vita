@@ -271,6 +271,26 @@ static int hook_fmod_studio_initialize(void *studio_system,
             } else {
                 set_output_result = 0;
             }
+            /* REAL FMOD OUTPUT PLUGIN. If fmod_output.txt says "plugin", register the
+             * sceAudioOut backend and switch the engine onto it instead of forcing
+             * FMOD's Android OpenSL backend and impersonating OpenSL ES underneath.
+             * Done here because this is the one place the low-level System exists
+             * before init, which is the only point registerOutput is legal. Falls
+             * back silently to the old path on any failure. */
+            {
+                extern int mcsm_fmod_output_wanted(void);
+                extern int mcsm_fmod_output_install(void *, int (*)(void *, const void *, unsigned int *),
+                                                    int (*)(void *, unsigned int));
+                if (low_level && mcsm_fmod_output_wanted()) {
+                    typedef int (*reg_fn)(void *, const void *, unsigned int *);
+                    typedef int (*setp_fn)(void *, unsigned int);
+                    reg_fn  reg  = (reg_fn)so_symbol(&so_mod_fmod,  "FMOD_System_RegisterOutput");
+                    setp_fn setp = (setp_fn)so_symbol(&so_mod_fmod, "FMOD_System_SetOutputByPlugin");
+                    if (mcsm_fmod_output_install(low_level, reg, setp)) {
+                        l_info("FMODOUT: opensl_audio.c is now BYPASSED for this session");
+                    }
+                }
+            }
             if (g_fmod_system_get_output) {
                 (void)g_fmod_system_get_output(low_level, &output_after);
             }

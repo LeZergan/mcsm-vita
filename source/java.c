@@ -281,6 +281,10 @@ static int audio_ensure_scratch(int samples) {
     return 1;
 }
 
+/* Exposed so the FMOD output plugin can hand the port to sceAudioOutOutput from
+ * its own drain thread; the port itself stays owned by this file. */
+int mcsm_audio_port_id(void) { return g_audio_port; }
+
 int audio_open_port(int sample_rate, int channels, int desired_frames) {
     const int rate = clamp_audio_rate(sample_rate);
     const int out_channels = clamp_audio_channels(channels);
