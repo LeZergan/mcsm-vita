@@ -1229,15 +1229,39 @@ void gl_init() {
     l_info("gl_init: shark_init = 0x%08X (%d)", (unsigned)sk, sk);
     if (sk >= 0) {
         is_shark_online = GL_TRUE;
-        /* ANTI-STUTTER 2026-06-30: the runtime shader compiler (ShaccCg) used a
-         * heavy default opt level, so every new Telltale shader took 400-900ms to
-         * compile mid-gameplay = the "mega stutter" (confirmed: each glLinkProgram
-         * was immediately followed by a 400-900ms sim freeze). SHARK_OPT_SLOW is
-         * O0 = MINIMAL optimization = FASTEST compile (the shaders run a hair
-         * slower but compile in a fraction of the time). +fastmath/precision/int
-         * speed it further. Must be set before any shader compiles. */
-        vglSetupRuntimeShaderCompiler(SHARK_OPT_SLOW, GL_TRUE, GL_TRUE, GL_TRUE);
-        l_info("gl_init: shader compiler -> SHARK_OPT_SLOW (fast compile, anti-stutter)");
+        /* 2026-06-30 (ANTI-STUTTER, superseded below): the runtime shader compiler
+         * used a heavy default opt level, so every new Telltale shader took
+         * 400-900ms to compile mid-gameplay = the "mega stutter" (each
+         * glLinkProgram was immediately followed by a 400-900ms sim freeze).
+         * SHARK_OPT_SLOW (O0) traded shader speed for compile speed to kill it.
+         *
+         * 2026-07-29: RAISED TO O2. Two things changed that invert that trade:
+         *
+         *   1. The compile cost is no longer paid repeatedly. The progcache
+         *      (glGetProgramBinary -> ux0:data/mcsm_progcache) now actually hits
+         *      -- 274 programs cached on the test console -- since the key-drift
+         *      bug was fixed. A shader compiles ONCE per console, ever, and is
+         *      reloaded from disk afterwards. The O0 penalty, by contrast, was
+         *      being paid on every frame of every session forever.
+         *
+         *   2. The bottleneck moved. O0 was chosen while the console was
+         *      CPU-bound (sim 49-71ms/frame with the GPU idle), so shader quality
+         *      was irrelevant. At the current performance profile (576x326,
+         *      uncapped, 47.5 fps avg) the GPU is now the limit -- so the code
+         *      the GPU runs is suddenly what matters.
+         *
+         * O0 means no instruction scheduling and no register-allocation work,
+         * which on the USSE costs occupancy as well as instructions.
+         * SHARK_OPT_DEFAULT is O2 -- the compiler's own default, not the risky
+         * -Ofast. fastmath/fastprecision/fastint stay on as before; those already
+         * carry whatever precision risk exists here.
+         *
+         * COST: the first launch after this change recompiles the cache, so
+         * shaders stutter once each as they are re-encountered, then never again.
+         * PROGCACHE_MAGIC is bumped in lockstep -- without that the O0 binaries
+         * already on disk would keep loading and this change would do nothing. */
+        vglSetupRuntimeShaderCompiler(SHARK_OPT_DEFAULT, GL_TRUE, GL_TRUE, GL_TRUE);
+        l_info("gl_init: shader compiler -> SHARK_OPT_DEFAULT (O2; progcache absorbs compile cost)");
         l_info("gl_init: forced is_shark_online=1 (runtime shader compiler up via malloc)");
     } else {
         l_warn("gl_init: shark_init FAILED (%d) — shaders will not compile", sk);
@@ -3992,7 +4016,9 @@ extern void glGetAttachedShaders(GLuint, GLsizei, GLsizei *, GLuint *);
 #endif
 
 #define PROGCACHE_DIR    "ux0:data/mcsm_progcache"
-#define PROGCACHE_MAGIC  0x4d435034u   /* 'MCP4' — bumped 2026-07-20b: MCP3 clamped the engine's
+#define PROGCACHE_MAGIC  0x4d435035u   /* 'MCP5' — bumped 2026-07-29: shader compiler O0 -> O2,
+                                        * so every cached binary on disk was built by the old
+                                        * compiler settings and must be recompiled. Previously 'MCP4' — bumped 2026-07-20b: MCP3 clamped the engine's
                                         * over-long _length but device missdumps proved FRAGMENT
                                         * shaders still carried a NUL+varying-garbage tail (from
                                         * glsl_replace_alloc's strlen-copy / arithmetic-length
