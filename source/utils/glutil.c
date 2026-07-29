@@ -2943,6 +2943,25 @@ void glTexImage2D_soloader(GLenum target, GLint level, GLint internalformat,
     GLint tlru_bound = (level == 0) ? (GLint)s_texlru_bound : 0;
     GLsizei tlru_bytes = (GLsizei)((long)width * (long)height * 4L); /* RGBA8888 (post-downsample) */
     GLint old_unpack_align = push_unpack_alignment_one();
+    /* TEXTURE-ERROR ISOLATION (2026-07-29). Device logs show err=0x500
+     * (GL_INVALID_ENUM) on 100% of UNCOMPRESSED uploads (2120/2120 allocs and
+     * 2061/2061 subimages) while 100% of compressed PVRTC uploads are clean --
+     * and uncompressed is exactly where lightmaps, gradients and effect art live,
+     * which matches "lighting is wrong in places until the area is reloaded".
+     * pre_err is drained well ABOVE this point, and push_unpack_alignment_one()
+     * runs in between, so the existing log cannot tell whether the error comes
+     * from the alignment helper or from glTexImage2D itself. Sample the error
+     * state right here, after the helper and immediately before the upload, so
+     * one device run separates the two. Gated to the first uploads so it costs
+     * nothing in steady state. */
+    GLenum align_err = GL_NO_ERROR;
+    if (s_count <= 24U) {
+        align_err = glGetError();
+        if (align_err != GL_NO_ERROR) {
+            l_warn("TEXDIAG: error 0x%X was ALREADY set by push_unpack_alignment_one "
+                   "(before glTexImage2D) upload #%u", (unsigned)align_err, s_count);
+        }
+    }
     texlru_before_upload(tlru_bound, tlru_bytes);
     /* WHITE-SURFACE FIX (2026-07-20): a GL_RGBA source with GL_HALF_FLOAT_OES type but
      * a plain GL_RGBA internalformat makes vitaGL store it as 8-bit U8 — the F16 bit

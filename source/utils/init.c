@@ -583,7 +583,7 @@ void soloader_init_all() {
     /* BUILD STAMP — first line of every log so old vs new eboot is unmistakable.
      * If this line is ABSENT, an OLD eboot is running (VitaShell kept it on a
      * same-Title-ID install → delete the bubble and reinstall). */
-    telemetry_log("BOOT", "BUILD=2026-07-29-r29 (profiles rebuilt around gpu_tier: quality/default/performance/battery/auto/custom; 20fps locks are 3-vblank exact)");
+    telemetry_log("BOOT", "BUILD=2026-07-29-r32 (quality gpu_tier 3->1; TEXDIAG isolates the 100pct GL_INVALID_ENUM on uncompressed uploads - suspected lighting bug)");
     telemetry_log("BOOT", "soloader_init_all start");
 
 	// Launch `app0:configurator.bin` on `-config` init param

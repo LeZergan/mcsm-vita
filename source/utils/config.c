@@ -45,16 +45,23 @@ static void apply_profile(McsmCfg *c, int prof) {
          * itself at full quality -- then locked to 20 (3 vblanks), which it can
          * actually sustain. Steady 20 reads far better than a 25-30 that lurches. */
         c->render_w = 960; c->render_h = 544; c->fps_cap = 20; c->vsync = 1;
-        c->outlines = 1;   c->shadows = 1;    c->draw_distance = 0; c->skinning_full = 1;
-        c->anim_rate = 1;   c->detail = 1000; c->render_quality = -1; c->gpu_tier = 3;
+        /* draw_distance is NOT unlimited here, even though this is the pretty
+         * profile. Device data: the GPU idles around 40% while frames take 55ms,
+         * i.e. the CPU is the entire limit -- so pixels and shadows are nearly
+         * free, and culling distant objects is what actually buys stability.
+         * Unlimited distance made the CPU walk every far object for almost no
+         * visible gain, and sim work measured p50 49ms / p90 71ms against the
+         * 50ms budget -- half the frames missed 20fps before drawing anything. */
+        c->outlines = 1;   c->shadows = 1;    c->draw_distance = 6000; c->skinning_full = 1;
+        c->anim_rate = 1;   c->detail = 1000; c->render_quality = -1; c->gpu_tier = 1;
         c->clock_adaptive = 0; c->clock_mhz = 444; break;
 
     case PROF_BALANCED:    /* "default" -- good visuals AND good performance */
         /* Middle GPU identity so the engine trims its heaviest effects but keeps the
          * look, outlines kept (they carry the art style), shadows off (biggest cheap
          * win), 800x452 stays sharp for text. Targets 30. */
-        c->render_w = 800; c->render_h = 452; c->fps_cap = 30; c->vsync = 1;
-        c->outlines = 1;   c->shadows = 0;    c->draw_distance = 6000; c->skinning_full = 1;
+        c->render_w = 720; c->render_h = 408; c->fps_cap = 30; c->vsync = 1;
+        c->outlines = 1;   c->shadows = 0;    c->draw_distance = 5000; c->skinning_full = 1;
         c->anim_rate = 1;   c->detail = 1000; c->render_quality = -1; c->gpu_tier = 1;
         c->clock_adaptive = 0; c->clock_mhz = 444; break;
 
@@ -64,7 +71,10 @@ static void apply_profile(McsmCfg *c, int prof) {
          * decorated with untested levers: weakest GPU identity, outlines and shadows
          * off, shorter draw distance, 720x408. skinning stays full because reduced
          * is a visual DEFECT (attached parts trail the body), not a quality tier. */
-        c->render_w = 720; c->render_h = 408; c->fps_cap = 30; c->vsync = 1;
+        /* fps_cap 0 = uncapped: take every frame the hardware will give. vsync
+         * stays ON so there is no tearing; it just stops holding frames back to
+         * a target. */
+        c->render_w = 576; c->render_h = 326; c->fps_cap = 0; c->vsync = 1;
         c->outlines = 0;   c->shadows = 0;    c->draw_distance = 4000; c->skinning_full = 1;
         c->anim_rate = 1;   c->detail = 1000; c->render_quality = -1; c->gpu_tier = 0;
         c->clock_adaptive = 0; c->clock_mhz = 444; break;
