@@ -133,6 +133,7 @@ add_executable(${CMAKE_PROJECT_NAME}
                source/reimpl/controls.c
                source/reimpl/controls.h
                 source/reimpl/opensl_audio.c
+                    source/reimpl/fmod_native_probe.c
                 source/reimpl/errno.c
                source/reimpl/io.c
                source/reimpl/log.c

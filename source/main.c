@@ -454,6 +454,7 @@ static void *run_game(void *arg) {
     telemetry_log("BOOT", "run_game thread started");
 
     // FMOD keeps a JavaVM pointer in JNI_OnLoad; without this it can crash in audio bring-up.
+    { extern void mcsm_fmod_native_probe(void); mcsm_fmod_native_probe(); }
     call_module_jni_onload("libfmod.so", &so_mod_fmod, LS_JNI_ONLOAD_FMOD);
     call_module_jni_onload("libfmodstudio.so", &so_mod_fmodstudio, LS_JNI_ONLOAD_FMODSTUDIO);
     call_module_jni_onload("libSDL2.so", &so_mod_sdl2, LS_JNI_ONLOAD_SDL2);
