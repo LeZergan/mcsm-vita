@@ -42,6 +42,14 @@ typedef struct {
                                * configures its own quality from this, so forcing 0
                                * selects the engine's built-in low-spec path -- the
                                * same one budget Android phones get.               */
+    int  shader_opt;          /* runtime shader compiler optimisation level, 0..4
+                               * (0=O0 .. 2=O2 default .. 4=Ofast). Was hardcoded to 0
+                               * as an anti-stutter measure back when the progcache never
+                               * hit; now that it does, compile cost is paid once per
+                               * console while the O0 penalty was paid every frame.
+                               * The progcache key includes this value, so each level
+                               * keeps its OWN binaries -- flipping back to 0 reuses the
+                               * pre-existing cache with no recompile.               */
     /* system */
     int  clock_adaptive;      /* 0 = ARM pinned, 1 = adaptive floor (battery)    */
     int  clock_mhz;           /* ARM target MHz. 444 = stock max. Higher only has

@@ -54,7 +54,7 @@ static void apply_profile(McsmCfg *c, int prof) {
          * 50ms budget -- half the frames missed 20fps before drawing anything. */
         c->outlines = 1;   c->shadows = 1;    c->draw_distance = 6000; c->skinning_full = 1;
         c->anim_rate = 1;   c->detail = 1000; c->render_quality = -1; c->gpu_tier = 1;
-        c->clock_adaptive = 0; c->clock_mhz = 444; break;
+        c->shader_opt = 0; c->clock_adaptive = 0; c->clock_mhz = 444; break;
 
     case PROF_BALANCED:    /* "default" -- good visuals AND good performance */
         /* Middle GPU identity so the engine trims its heaviest effects but keeps the
@@ -63,7 +63,7 @@ static void apply_profile(McsmCfg *c, int prof) {
         c->render_w = 720; c->render_h = 408; c->fps_cap = 30; c->vsync = 1;
         c->outlines = 1;   c->shadows = 0;    c->draw_distance = 5000; c->skinning_full = 1;
         c->anim_rate = 1;   c->detail = 1000; c->render_quality = -1; c->gpu_tier = 1;
-        c->clock_adaptive = 0; c->clock_mhz = 444; break;
+        c->shader_opt = 0; c->clock_adaptive = 0; c->clock_mhz = 444; break;
 
     case PROF_PERFORMANCE:
         /* Frames over everything. This is the exact configuration measured at
@@ -77,7 +77,7 @@ static void apply_profile(McsmCfg *c, int prof) {
         c->render_w = 576; c->render_h = 326; c->fps_cap = 0; c->vsync = 1;
         c->outlines = 0;   c->shadows = 0;    c->draw_distance = 4000; c->skinning_full = 1;
         c->anim_rate = 1;   c->detail = 1000; c->render_quality = -1; c->gpu_tier = 0;
-        c->clock_adaptive = 0; c->clock_mhz = 444; break;
+        c->shader_opt = 0; c->clock_adaptive = 0; c->clock_mhz = 444; break;
 
     case PROF_BATTERY:
         /* Longest play time. Power on this console tracks CPU clock and pixels, so:
@@ -88,7 +88,7 @@ static void apply_profile(McsmCfg *c, int prof) {
         c->render_w = 480; c->render_h = 272; c->fps_cap = 20; c->vsync = 1;
         c->outlines = 0;   c->shadows = 0;    c->draw_distance = 3000; c->skinning_full = 0;
         c->anim_rate = 2;   c->detail = 700;  c->render_quality = -1; c->gpu_tier = 0;
-        c->clock_adaptive = 1; c->clock_mhz = 444; break;
+        c->shader_opt = 0; c->clock_adaptive = 1; c->clock_mhz = 444; break;
 
     case PROF_AUTO:
         /* Engine-managed: every knob the ENGINE decides is left at its pass-through
@@ -100,13 +100,13 @@ static void apply_profile(McsmCfg *c, int prof) {
         c->render_w = 720; c->render_h = 408; c->fps_cap = 30; c->vsync = 1;
         c->outlines = 1;   c->shadows = 1;    c->draw_distance = 0; c->skinning_full = 1;
         c->anim_rate = 1;   c->detail = 1000; c->render_quality = -1; c->gpu_tier = -1;
-        c->clock_adaptive = 0; c->clock_mhz = 444; break;
+        c->shader_opt = 0; c->clock_adaptive = 0; c->clock_mhz = 444; break;
 
     default:               /* custom -- starts from "default" then applies your lines */
         c->render_w = 800; c->render_h = 452; c->fps_cap = 30; c->vsync = 1;
         c->outlines = 1;   c->shadows = 0;    c->draw_distance = 6000; c->skinning_full = 1;
         c->anim_rate = 1;   c->detail = 1000; c->render_quality = -1; c->gpu_tier = 1;
-        c->clock_adaptive = 0; c->clock_mhz = 444; break;
+        c->shader_opt = 0; c->clock_adaptive = 0; c->clock_mhz = 444; break;
     }
 }
 
@@ -136,7 +136,7 @@ static int split_kv(const char *line, char *k, int ksz, char *v, int vsz) {
 static void load_cfg(void) {
     char prof[16] = "balanced";
     char res[16] = "", fps[16] = "", vsync[16] = "", outl[16] = "", shad[16] = "";
-    char dist[16] = "", skin[16] = "", clk[16] = "", arate[16] = "", det[16] = "", rq[16] = "", gt[16] = "";
+    char dist[16] = "", skin[16] = "", clk[16] = "", arate[16] = "", det[16] = "", rq[16] = "", gt[16] = "", sopt[16] = "";
 
     FILE *f = mcsm_open_setting("graphics.txt", "r");
     if (f) {
@@ -156,6 +156,7 @@ static void load_cfg(void) {
             else if (!strcmp(k, "detail"))        strncpy(det,   v, sizeof(det)   - 1);
             else if (!strcmp(k, "render_quality")) strncpy(rq,   v, sizeof(rq)    - 1);
             else if (!strcmp(k, "gpu_tier"))      strncpy(gt,   v, sizeof(gt)    - 1);
+            else if (!strcmp(k, "shader_opt"))    strncpy(sopt, v, sizeof(sopt)  - 1);
         }
         fclose(f);
     }
@@ -193,12 +194,13 @@ static void load_cfg(void) {
         if (det[0])   { int d = atoi(det);   if (d >= 100 && d <= 1000) g_cfg.detail = d; }
         if (rq[0])    { int q = atoi(rq);    if (q >= 0   && q <= 15)   g_cfg.render_quality = q; }
         if (gt[0])    { int t = atoi(gt);    if (t >= 0   && t <= 3)    g_cfg.gpu_tier = t; }
+        if (sopt[0])  { int o = atoi(sopt); if (o >= 0   && o <= 4)    g_cfg.shader_opt = o; }
     }
 
     g_cfg_loaded = 1;
-    l_info("CONFIG(graphics): profile=%s res=%dx%d fps=%d vsync=%d outlines=%d shadows=%d dist=%d skinning=%s anim_rate=1/%d detail=%d/1000 rquality=%d gpu_tier=%d clock=%s(%dMHz)",
+    l_info("CONFIG(graphics): profile=%s res=%dx%d fps=%d vsync=%d outlines=%d shadows=%d dist=%d skinning=%s anim_rate=1/%d detail=%d/1000 rquality=%d gpu_tier=%d shader_opt=%d clock=%s(%dMHz)",
            prof, g_cfg.render_w, g_cfg.render_h, g_cfg.fps_cap, g_cfg.vsync, g_cfg.outlines,
-           g_cfg.shadows, g_cfg.draw_distance, g_cfg.skinning_full ? "full" : "reduced", g_cfg.anim_rate, g_cfg.detail, g_cfg.render_quality, g_cfg.gpu_tier,
+           g_cfg.shadows, g_cfg.draw_distance, g_cfg.skinning_full ? "full" : "reduced", g_cfg.anim_rate, g_cfg.detail, g_cfg.render_quality, g_cfg.gpu_tier, g_cfg.shader_opt,
            g_cfg.clock_adaptive ? "adaptive" : "pinned", g_cfg.clock_mhz);
 }
 

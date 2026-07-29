@@ -1260,8 +1260,14 @@ void gl_init() {
          * shaders stutter once each as they are re-encountered, then never again.
          * PROGCACHE_MAGIC is bumped in lockstep -- without that the O0 binaries
          * already on disk would keep loading and this change would do nothing. */
-        vglSetupRuntimeShaderCompiler(SHARK_OPT_DEFAULT, GL_TRUE, GL_TRUE, GL_TRUE);
-        l_info("gl_init: shader compiler -> SHARK_OPT_DEFAULT (O2; progcache absorbs compile cost)");
+        {
+            static const char *opt_name[5] = { "O0/SLOW", "O1/SAFE", "O2/DEFAULT", "O3/FAST", "Ofast/UNSAFE" };
+            int so = mcsm_cfg()->shader_opt;
+            if (so < 0 || so > 4) so = 2;
+            vglSetupRuntimeShaderCompiler((shark_opt)so, GL_TRUE, GL_TRUE, GL_TRUE);
+            l_info("gl_init: shader compiler -> %s (shader_opt=%d; progcache keyed per opt level, "
+                   "so opt 0 reuses the pre-existing cache verbatim)", opt_name[so], so);
+        }
         l_info("gl_init: forced is_shark_online=1 (runtime shader compiler up via malloc)");
     } else {
         l_warn("gl_init: shark_init FAILED (%d) — shaders will not compile", sk);
@@ -4016,15 +4022,27 @@ extern void glGetAttachedShaders(GLuint, GLsizei, GLsizei *, GLuint *);
 #endif
 
 #define PROGCACHE_DIR    "ux0:data/mcsm_progcache"
-#define PROGCACHE_MAGIC  0x4d435035u   /* 'MCP5' — bumped 2026-07-29: shader compiler O0 -> O2,
-                                        * so every cached binary on disk was built by the old
-                                        * compiler settings and must be recompiled. Previously 'MCP4' — bumped 2026-07-20b: MCP3 clamped the engine's
+/* NOT bumped for the 2026-07-29 O0->O2 compiler change. Bumping the magic
+ * invalidates EVERY binary on disk, which would have thrown away the CH1+CH2
+ * cache that took real playthroughs to build. The compiler setting is mixed into
+ * the KEY instead (see progcache_key_for_program), so O0 and O2 binaries get
+ * different filenames and coexist -- switching shader_opt back to 0 re-derives
+ * the original keys and the existing cache loads untouched, with no recompile. */
+#define PROGCACHE_MAGIC  0x4d435034u   /* 'MCP4' — bumped 2026-07-20b: MCP3 clamped the engine's
                                         * over-long _length but device missdumps proved FRAGMENT
                                         * shaders still carried a NUL+varying-garbage tail (from
                                         * glsl_replace_alloc's strlen-copy / arithmetic-length
                                         * mismatch). track_shader_source now clamps the hashed source
                                         * to the first embedded NUL — the final, path-independent fix.
                                         * Keys change again vs MCP3, so those caches must invalidate. */
+/* 'MCP5' was briefly written by r33, which raised the shader compiler to O2 and
+ * bumped the magic -- that combination rewrote 31 of the 274 cached binaries in
+ * place before it was caught. Those files are perfectly valid compiled programs;
+ * only the compiler settings behind them differ, and a compiled binary is
+ * self-contained, so mixing O0- and O2-built programs in one session is harmless.
+ * ACCEPT them on read rather than rejecting them, which would force 31 needless
+ * recompiles. Only MCP4 is ever WRITTEN, so the cache converges back on its own. */
+#define PROGCACHE_MAGIC_O2 0x4d435035u
 #define PROGCACHE_MAXBIN (1024u * 1024u)
 static int g_progcache_dir_ready = 0;
 static unsigned g_progcache_hits = 0, g_progcache_misses = 0;
@@ -4041,6 +4059,17 @@ static uint64_t progcache_key_for_program(GLuint program) {
     glGetAttachedShaders(program, 8, &n, sh);
     if (n <= 0) return 0;
     uint64_t h = 1469598103934665603ull;
+    /* 2026-07-29: fold the shader compiler opt level into the key so binaries
+     * built at different opt levels never alias -- the cache stores a COMPILED
+     * binary but is keyed on shader SOURCE, so without this an O0 binary would be
+     * handed back while the compiler is set to O2 (and the change would silently
+     * do nothing). Deliberately a no-op at opt 0: that keeps every key already on
+     * disk bit-identical, so the existing CH1+CH2 cache stays valid and switching
+     * shader_opt back to 0 costs zero recompiles. */
+    {
+        int opt = mcsm_cfg()->shader_opt;
+        if (opt != 0) { h ^= (uint64_t)(unsigned)opt; h *= 1099511628211ull; }
+    }
     for (GLsizei i = 0; i < n; i++) {
         shader_diag_entry *e = get_shader_diag_entry(sh[i], 0);
         if (!e || !e->owned_source || e->owned_source_len == 0) return 0;
@@ -4065,7 +4094,8 @@ static int progcache_try_load(GLuint program, uint64_t key) {
     if (fd < 0) return 0;
     uint32_t hdr[4];   /* magic, version, binaryFormat, length */
     if (sceIoRead(fd, hdr, sizeof(hdr)) != (int)sizeof(hdr) ||
-        hdr[0] != PROGCACHE_MAGIC || hdr[3] == 0 || hdr[3] > PROGCACHE_MAXBIN) {
+        (hdr[0] != PROGCACHE_MAGIC && hdr[0] != PROGCACHE_MAGIC_O2) ||
+        hdr[3] == 0 || hdr[3] > PROGCACHE_MAXBIN) {
         sceIoClose(fd); return 0;   /* stale/garbage -> recompile + overwrite */
     }
     void *buf = malloc(hdr[3]);
