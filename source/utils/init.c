@@ -583,7 +583,7 @@ void soloader_init_all() {
     /* BUILD STAMP — first line of every log so old vs new eboot is unmistakable.
      * If this line is ABSENT, an OLD eboot is running (VitaShell kept it on a
      * same-Title-ID install → delete the bubble and reinstall). */
-    telemetry_log("BOOT", "BUILD=2026-07-29-r37 (shader_opt=2 DEFAULT: device-measured median 45.3->59.3 fps on identical scenes; + removed self-inflicted GL_INVALID_ENUM per upload)");
+    telemetry_log("BOOT", "BUILD=2026-07-29-r38 (REAL 24fps: exact-timeline pacer does fractional vblanks = 3:2 pulldown, avg exactly 24.000; quality profile now fps_cap 24)");
     telemetry_log("BOOT", "soloader_init_all start");
 
 	// Launch `app0:configurator.bin` on `-config` init param

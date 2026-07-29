@@ -1112,7 +1112,9 @@ void glScissor_soloader(GLint x, GLint y, GLsizei width, GLsizei height) {
 /* Present-side frame-lock period (us) = 1/fps_cap. Read ONCE in gl_init (safe
  * context), used by gl_swap. 0 = no lock. (Reading the file in gl_swap's hot
  * render path crashed boot — fopen there races the engine/loader I/O.) */
-static int g_present_period_us = 0;
+static int g_present_period_us = 0;   /* whole-microsecond part of the present period */
+static int g_present_period_rem = 0;  /* numerator of the leftover fraction (rem/den us) */
+static int g_present_period_den = 0;  /* denominator; 0 = no fractional part */
 
 /* Last present-to-present interval (us), written every frame by gl_swap. Read
  * (racy but benign — a heuristic on an aligned 32-bit word) by the clock
@@ -1310,11 +1312,31 @@ void gl_init() {
                  * whole vblank count and UNDERSHOOT by ~2.5ms so the frame is always
                  * ready before the target vblank and vsync catches it cleanly. This
                  * makes fps_cap=30 (or 33) both resolve to a rock-steady 30fps. */
-                const int vb = 16667;                 /* one 60Hz vblank (us) */
-                int per = 1000000 / fps;
-                int k = (per + vb / 2) / vb;           /* nearest whole vblanks */
-                if (k < 1) k = 1;
-                g_present_period_us = k * vb - 2500;
+                /* EXACT-TIMELINE PACING (2026-07-29). The quantize-to-whole-vblanks
+                 * rule above cannot express a rate whose period is not a whole
+                 * number of vblanks -- 24fps needs 60/24 = 2.5 -- so fps_cap=24
+                 * rounded to k=2 and silently delivered 30. Rates that are not
+                 * 60/N were therefore unreachable.
+                 *
+                 * Track the IDEAL presentation timeline instead of a fixed period:
+                 * advance a target timestamp by the exact fractional period each
+                 * frame and present at the first vblank at or after it. For 24fps
+                 * the targets land at 2.5, 5.0, 7.5, 10.0 vblanks, so vsync catches
+                 * them on vblanks 3, 5, 8, 10 -- a repeating 3:2:3:2 cadence
+                 * averaging exactly 24.000fps with no drift, which is precisely how
+                 * 24fps film is shown on 60Hz displays.
+                 *
+                 * Whole-vblank rates are unaffected: 30fps still lands on every 2nd
+                 * vblank and 20fps on every 3rd, identical to before, and they gain
+                 * drift-free long-term accuracy since the target advances by the
+                 * exact period rather than an integer approximation.
+                 *
+                 * g_present_period_us keeps its old meaning (nominal period, used
+                 * as the enable flag and for the catch-up clamp); the fractional
+                 * remainder rides alongside it. */
+                g_present_period_us  = 1000000 / fps;
+                g_present_period_rem = 1000000 % fps;   /* exact period = whole + rem/fps */
+                g_present_period_den = fps;
         }
         /* DE-STACK PACING opt-in (2026-07-17, ux0:data/mcsm/no_present_lock.txt):
          * with vsync ON there are THREE period gates at the same rate but
@@ -1326,9 +1348,11 @@ void gl_init() {
          * original anti-60<->30 purpose); this can only be judged on-device, so
          * it's a toggle the user can A/B for the smoothest result. */
         { FILE *npl = mcsm_open_setting("no_present_lock.txt", "r");
-          if (npl) { fclose(npl); g_present_period_us = 0;
+          if (npl) { fclose(npl); g_present_period_us = 0; g_present_period_rem = 0; g_present_period_den = 0;
                      l_info("present frame-lock DISABLED (no_present_lock.txt) — vsync+sim-pace only"); } }
-        l_info("present frame-lock period = %d us (vblank-quantized)", g_present_period_us);
+        l_info("present frame-lock = %d+%d/%d us per frame (exact timeline; %s)", g_present_period_us,
+               g_present_period_rem, g_present_period_den ? g_present_period_den : 1,
+               (g_present_period_den && g_present_period_rem) ? "fractional vblank cadence e.g. 3:2 pulldown" : "whole vblanks");
     }
 }
 
@@ -1366,15 +1390,34 @@ void gl_swap() {
      * minimum present interval so the display rate is consistent (no beating).
      * Period = 1/fps_cap.txt (e.g. 30 -> 33.3ms). fps_cap 0/absent = off. */
     if (g_present_period_us > 0) {
-        static uint64_t s_last_present_us = 0;
+        /* Advance the ideal timeline by the EXACT period (whole + rem/den us) and
+         * sleep until just before it, so vsync snaps the frame onto the correct
+         * vblank. Carrying the remainder is what makes non-60/N rates like 24fps
+         * reachable, and it keeps whole-vblank rates drift-free over a session. */
+        static uint64_t s_target_us = 0;
+        static int      s_rem_acc   = 0;
         uint64_t pnow = sceKernelGetSystemTimeWide();
-        if (s_last_present_us) {
-            uint64_t el = pnow - s_last_present_us;
-            if (el < (uint64_t)g_present_period_us) {
-                sceKernelDelayThread((SceUInt)((uint64_t)g_present_period_us - el));
-            }
+        if (!s_target_us) s_target_us = pnow;
+
+        s_target_us += (uint64_t)g_present_period_us;
+        if (g_present_period_den) {
+            s_rem_acc += g_present_period_rem;
+            if (s_rem_acc >= g_present_period_den) { s_rem_acc -= g_present_period_den; s_target_us++; }
         }
-        s_last_present_us = sceKernelGetSystemTimeWide();
+
+        /* A heavy scene can push us past the target. Without a clamp the pacer
+         * would then present several frames back-to-back trying to catch up, which
+         * looks worse than the dropped frame did. Resync instead. */
+        if (pnow > s_target_us + 4ULL * (uint64_t)g_present_period_us) {
+            s_target_us = pnow;
+            s_rem_acc = 0;
+        }
+
+        /* Undershoot so the frame is ready BEFORE its vblank and vsync catches it
+         * cleanly rather than slipping to the next one (the original 2.5ms rule). */
+        const uint64_t undershoot = 2500;
+        uint64_t wake = (s_target_us > undershoot) ? s_target_us - undershoot : 0;
+        if (pnow < wake) sceKernelDelayThread((SceUInt)(wake - pnow));
     }
     launch_state_mark_gl_phase(1);   /* in vglSwapBuffers (present) */
     vglSwapBuffers(GL_FALSE);

@@ -44,7 +44,7 @@ static void apply_profile(McsmCfg *c, int prof) {
          * Native res, every effect on, real GPU reported so the engine configures
          * itself at full quality -- then locked to 20 (3 vblanks), which it can
          * actually sustain. Steady 20 reads far better than a 25-30 that lurches. */
-        c->render_w = 960; c->render_h = 544; c->fps_cap = 20; c->vsync = 1;
+        c->render_w = 960; c->render_h = 544; c->fps_cap = 24; c->vsync = 1;
         /* draw_distance is NOT unlimited here, even though this is the pretty
          * profile. Device data: the GPU idles around 40% while frames take 55ms,
          * i.e. the CPU is the entire limit -- so pixels and shadows are nearly
