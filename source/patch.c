@@ -5055,7 +5055,69 @@ static int hook_is_contributing_shadow(void *self) {
     return SO_CONTINUE(int, g_hook_is_contributing_shadow, self);
 }
 
+/* POST-PROCESS AUDIT (2026-07-29). libGameEngine exports a full post-effect chain
+ * -- FX_Glow with four blur levels, FX_DepthOfField with H/V blur passes, FX_FXAA,
+ * FX_MotionBlur -- plus HDR/RGBM/GBuffer/quarter-res render targets. NOTHING in the
+ * loader touches any of it, so all of it runs at whatever the engine chose at boot.
+ * These are full-screen passes: cheap in draw calls, expensive in pixels, and the
+ * frame is now GPU-bound, so they are the largest unexamined cost left.
+ *
+ * Before disabling anything we need to know what actually runs. This is REPORT-ONLY
+ * on purpose: C++ mangling does not encode return types, so for DrawGlow and
+ * _UpdateMotionBlur we cannot tell void from non-void, and returning the wrong thing
+ * from a skip path would corrupt r0. RenderConfiguration::TestFeature is the one
+ * safe gate -- a Test* predicate is unambiguously boolean -- and it is the single
+ * point the renderer asks "is feature N enabled?", so logging its arguments gives us
+ * the exact RenderFeatureType ids to target, with zero behaviour change now. */
+static unsigned g_fx_glow_calls = 0, g_fx_mblur_calls = 0;
+static unsigned g_fx_feature_seen[64];   /* TestFeature(id) -> times answered true */
+static unsigned g_fx_feature_tot[64];
+
+static so_hook g_hook_fx_drawglow;
+static void hook_fx_drawglow(void *a, void *b, int c) {
+    g_fx_glow_calls++;
+    SO_CONTINUE_VOID(g_hook_fx_drawglow, a, b, c);
+}
+static so_hook g_hook_fx_motionblur;
+static void hook_fx_motionblur(void *scene, void *cam) {
+    g_fx_mblur_calls++;
+    SO_CONTINUE_VOID(g_hook_fx_motionblur, scene, cam);
+}
+static so_hook g_hook_fx_testfeature;
+static int hook_fx_testfeature(void *self, int feature) {
+    int r = SO_CONTINUE(int, g_hook_fx_testfeature, self, feature);
+    if (feature >= 0 && feature < 64) {
+        g_fx_feature_tot[feature]++;
+        if (r) g_fx_feature_seen[feature]++;
+    }
+    return r;
+}
+
+void mcsm_postfx_report(void) {
+    l_info("POSTFX: DrawGlow=%u _UpdateMotionBlur=%u", g_fx_glow_calls, g_fx_mblur_calls);
+    for (int i = 0; i < 64; i++) {
+        if (g_fx_feature_tot[i]) {
+            l_info("POSTFX: RenderFeature[%d] enabled %u/%u times%s", i,
+                   g_fx_feature_seen[i], g_fx_feature_tot[i],
+                   g_fx_feature_seen[i] ? "  <-- ACTIVE, candidate to disable" : "  (already off)");
+        }
+    }
+}
+
 static void patch_boot_diag_hooks(void) {
+    /* Report-only post-effect probes; see the comment above. */
+    (void)hook_symbol_checked(&so_mod_gameengine,
+        "_ZN16T3PostEffectUtil8DrawGlowER15RenderSceneViewR21T3RenderTargetContextb",
+        "T3PostEffectUtil::DrawGlow",
+        (uintptr_t)&hook_fx_drawglow, &g_hook_fx_drawglow);
+    (void)hook_symbol_checked(&so_mod_gameengine,
+        "_Z17_UpdateMotionBlurP5SceneP6Camera", "_UpdateMotionBlur",
+        (uintptr_t)&hook_fx_motionblur, &g_hook_fx_motionblur);
+    (void)hook_symbol_checked(&so_mod_gameengine,
+        "_ZN19RenderConfiguration11TestFeatureE17RenderFeatureType",
+        "RenderConfiguration::TestFeature",
+        (uintptr_t)&hook_fx_testfeature, &g_hook_fx_testfeature);
+
     if (shadows_disabled()) {
         (void)hook_symbol_checked(&so_mod_gameengine, "_ZN13LightInstance13IsShadowLightEv",
                                   "LightInstance::IsShadowLight",

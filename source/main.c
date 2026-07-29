@@ -245,6 +245,14 @@ static void *watchdog_thread(void *arg) {
             telemetry_log("WATCH", "%s", snap);
             telemetry_log("WATCH", "%s", memstats);
             last_log_ms = uptime_ms;
+            /* Post-effect audit: which of the engine's full-screen passes actually
+             * run, and which RenderFeatures it reports enabled. Report-only; every
+             * 30s is enough to characterise a session without flooding the log. */
+            {
+                extern void mcsm_postfx_report(void);
+                static uint64_t last_fx_ms = 0;
+                if (uptime_ms - last_fx_ms >= 30000) { mcsm_postfx_report(); last_fx_ms = uptime_ms; }
+            }
         }
 
         // Early boot should not take this long unless blocked in loader setup.
