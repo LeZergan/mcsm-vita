@@ -54,7 +54,7 @@ static void apply_profile(McsmCfg *c, int prof) {
          * 50ms budget -- half the frames missed 20fps before drawing anything. */
         c->outlines = 1;   c->shadows = 1;    c->draw_distance = 6000; c->skinning_full = 1;
         c->anim_rate = 1;   c->detail = 1000; c->render_quality = -1; c->gpu_tier = 1;
-        c->shader_opt = 0; c->clock_adaptive = 0; c->clock_mhz = 444; break;
+        c->shader_opt = 2; c->clock_adaptive = 0; c->clock_mhz = 444; break;
 
     case PROF_BALANCED:    /* "default" -- good visuals AND good performance */
         /* Middle GPU identity so the engine trims its heaviest effects but keeps the
@@ -63,7 +63,7 @@ static void apply_profile(McsmCfg *c, int prof) {
         c->render_w = 720; c->render_h = 408; c->fps_cap = 30; c->vsync = 1;
         c->outlines = 1;   c->shadows = 0;    c->draw_distance = 5000; c->skinning_full = 1;
         c->anim_rate = 1;   c->detail = 1000; c->render_quality = -1; c->gpu_tier = 1;
-        c->shader_opt = 0; c->clock_adaptive = 0; c->clock_mhz = 444; break;
+        c->shader_opt = 2; c->clock_adaptive = 0; c->clock_mhz = 444; break;
 
     case PROF_PERFORMANCE:
         /* Frames over everything. This is the exact configuration measured at
@@ -77,7 +77,7 @@ static void apply_profile(McsmCfg *c, int prof) {
         c->render_w = 576; c->render_h = 326; c->fps_cap = 0; c->vsync = 1;
         c->outlines = 0;   c->shadows = 0;    c->draw_distance = 4000; c->skinning_full = 1;
         c->anim_rate = 1;   c->detail = 1000; c->render_quality = -1; c->gpu_tier = 0;
-        c->shader_opt = 0; c->clock_adaptive = 0; c->clock_mhz = 444; break;
+        c->shader_opt = 2; c->clock_adaptive = 0; c->clock_mhz = 444; break;
 
     case PROF_BATTERY:
         /* Longest play time. Power on this console tracks CPU clock and pixels, so:
@@ -88,7 +88,7 @@ static void apply_profile(McsmCfg *c, int prof) {
         c->render_w = 480; c->render_h = 272; c->fps_cap = 20; c->vsync = 1;
         c->outlines = 0;   c->shadows = 0;    c->draw_distance = 3000; c->skinning_full = 0;
         c->anim_rate = 2;   c->detail = 700;  c->render_quality = -1; c->gpu_tier = 0;
-        c->shader_opt = 0; c->clock_adaptive = 1; c->clock_mhz = 444; break;
+        c->shader_opt = 2; c->clock_adaptive = 1; c->clock_mhz = 444; break;
 
     case PROF_AUTO:
         /* Engine-managed: every knob the ENGINE decides is left at its pass-through
@@ -100,13 +100,13 @@ static void apply_profile(McsmCfg *c, int prof) {
         c->render_w = 720; c->render_h = 408; c->fps_cap = 30; c->vsync = 1;
         c->outlines = 1;   c->shadows = 1;    c->draw_distance = 0; c->skinning_full = 1;
         c->anim_rate = 1;   c->detail = 1000; c->render_quality = -1; c->gpu_tier = -1;
-        c->shader_opt = 0; c->clock_adaptive = 0; c->clock_mhz = 444; break;
+        c->shader_opt = 2; c->clock_adaptive = 0; c->clock_mhz = 444; break;
 
     default:               /* custom -- starts from "default" then applies your lines */
         c->render_w = 800; c->render_h = 452; c->fps_cap = 30; c->vsync = 1;
         c->outlines = 1;   c->shadows = 0;    c->draw_distance = 6000; c->skinning_full = 1;
         c->anim_rate = 1;   c->detail = 1000; c->render_quality = -1; c->gpu_tier = 1;
-        c->shader_opt = 0; c->clock_adaptive = 0; c->clock_mhz = 444; break;
+        c->shader_opt = 2; c->clock_adaptive = 0; c->clock_mhz = 444; break;
     }
 }
 
