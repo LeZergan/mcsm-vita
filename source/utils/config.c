@@ -23,45 +23,79 @@ static int     g_cfg_loaded = 0;
  * work (draw_distance, detail, skinning, anim_rate). Keep that ordering in mind
  * when tuning a profile -- dropping resolution alone mostly just softens the
  * image. */
-enum { PROF_QUALITY = 0, PROF_BALANCED, PROF_PERFORMANCE, PROF_BATTERY, PROF_CUSTOM };
+enum { PROF_QUALITY = 0, PROF_BALANCED, PROF_PERFORMANCE, PROF_BATTERY, PROF_AUTO, PROF_CUSTOM };
 
 static void apply_profile(McsmCfg *c, int prof) {
+    /* FRAME PACING NOTE, because it constrains every profile below: the present
+     * lock quantises to WHOLE vblanks (k = round(period / 16667us)), and the panel
+     * is 60Hz. So the only rates that can actually hold rock-steady are 60, 30, 20,
+     * 15. 24 is not one of them -- it needs 2.5 vblanks, so it would alternate 2 and
+     * 3 and judder permanently; asking for 24 quantises to 30 anyway. That is why
+     * "quality" locks 20 rather than 24: at 50ms per frame the engine (~30-45ms sim)
+     * genuinely makes the deadline every frame, which is what "does not move" means.
+     *
+     * gpu_tier is the strongest lever we have and it is what mainly separates these
+     * profiles. It changes the GL_RENDERER string we report, and the engine picks
+     * its own quality from that -- measured on device, dropping to SGX 540 took
+     * 22.2 -> 26.2 fps on its own. Our manual knobs are secondary by comparison. */
     switch (prof) {
-    case PROF_QUALITY:     /* best looks, ~20-24fps in heavy scenes */
-        c->render_w = 960; c->render_h = 544; c->fps_cap = 30; c->vsync = 1;
+    case PROF_QUALITY:
+        /* Best picture the hardware can hold WITHOUT the framerate ever moving.
+         * Native res, every effect on, real GPU reported so the engine configures
+         * itself at full quality -- then locked to 20 (3 vblanks), which it can
+         * actually sustain. Steady 20 reads far better than a 25-30 that lurches. */
+        c->render_w = 960; c->render_h = 544; c->fps_cap = 20; c->vsync = 1;
+        c->outlines = 1;   c->shadows = 1;    c->draw_distance = 0; c->skinning_full = 1;
+        c->anim_rate = 1;   c->detail = 1000; c->render_quality = -1; c->gpu_tier = 3;
+        c->clock_adaptive = 0; c->clock_mhz = 444; break;
+
+    case PROF_BALANCED:    /* "default" -- good visuals AND good performance */
+        /* Middle GPU identity so the engine trims its heaviest effects but keeps the
+         * look, outlines kept (they carry the art style), shadows off (biggest cheap
+         * win), 800x452 stays sharp for text. Targets 30. */
+        c->render_w = 800; c->render_h = 452; c->fps_cap = 30; c->vsync = 1;
+        c->outlines = 1;   c->shadows = 0;    c->draw_distance = 6000; c->skinning_full = 1;
+        c->anim_rate = 1;   c->detail = 1000; c->render_quality = -1; c->gpu_tier = 1;
+        c->clock_adaptive = 0; c->clock_mhz = 444; break;
+
+    case PROF_PERFORMANCE:
+        /* Frames over everything. This is the exact configuration measured at
+         * 30.8 fps across a 20-minute session, so it is left alone rather than
+         * decorated with untested levers: weakest GPU identity, outlines and shadows
+         * off, shorter draw distance, 720x408. skinning stays full because reduced
+         * is a visual DEFECT (attached parts trail the body), not a quality tier. */
+        c->render_w = 720; c->render_h = 408; c->fps_cap = 30; c->vsync = 1;
+        c->outlines = 0;   c->shadows = 0;    c->draw_distance = 4000; c->skinning_full = 1;
+        c->anim_rate = 1;   c->detail = 1000; c->render_quality = -1; c->gpu_tier = 0;
+        c->clock_adaptive = 0; c->clock_mhz = 444; break;
+
+    case PROF_BATTERY:
+        /* Longest play time. Power on this console tracks CPU clock and pixels, so:
+         * downclock when idle, half native resolution (480x272 is an exact 1/2 of
+         * 960x544, so it upscales cleanly instead of resampling), weakest GPU
+         * identity, coarser geometry, half-rate animation, and 20fps -- a lower
+         * locked rate is less work per second AND a clean 3-vblank lock. */
+        c->render_w = 480; c->render_h = 272; c->fps_cap = 20; c->vsync = 1;
+        c->outlines = 0;   c->shadows = 0;    c->draw_distance = 3000; c->skinning_full = 0;
+        c->anim_rate = 2;   c->detail = 700;  c->render_quality = -1; c->gpu_tier = 0;
+        c->clock_adaptive = 1; c->clock_mhz = 444; break;
+
+    case PROF_AUTO:
+        /* Engine-managed: every knob the ENGINE decides is left at its pass-through
+         * value so the loader overrides nothing, and the game runs whatever it chose
+         * for the GPU we reported. Resolution/fps_cap/vsync/clock stay ours (the
+         * engine has no concept of the Vita render scale or power), and skinning
+         * stays full because reduced is a correctness defect. Use it to A/B the
+         * engine own judgement against the tuned profiles. */
+        c->render_w = 720; c->render_h = 408; c->fps_cap = 30; c->vsync = 1;
         c->outlines = 1;   c->shadows = 1;    c->draw_distance = 0; c->skinning_full = 1;
         c->anim_rate = 1;   c->detail = 1000; c->render_quality = -1; c->gpu_tier = -1;
         c->clock_adaptive = 0; c->clock_mhz = 444; break;
-    case PROF_PERFORMANCE: /* steady 30, effects trimmed to hold it in heavy scenes */
-        /* skinning stays FULL (2026-07-25): "reduced" turns off the engine's
-         * recursive per-bone contribution, which is what propagates a parent
-         * bone's transform to attached geometry in the SAME frame. Without it,
-         * attached parts visibly TRAIL the body they are attached to (Reuben's
-         * costume lagging as he moves, chest lids lagging as they open). That
-         * reads as a bug, not a quality setting, so it is no longer part of the
-         * performance preset -- only "battery" still trades it away. Anyone who
-         * wants the CPU back can still set `skinning = reduced` explicitly, which
-         * now overrides on top of any profile. */
-        c->render_w = 720; c->render_h = 408; c->fps_cap = 30; c->vsync = 1;
-        c->outlines = 0;   c->shadows = 0;    c->draw_distance = 4000; c->skinning_full = 1;
-        c->anim_rate = 1;   c->detail = 1000; c->render_quality = -1; c->gpu_tier = -1;
-        c->clock_adaptive = 0; c->clock_mhz = 444; break;
-    case PROF_BATTERY:     /* lowest power: the only profile that trades quality away */
-        /* Was 640x360 + the same effect set as "performance", so the two profiles
-         * were visually near-identical and battery looked no cheaper than it is.
-         * 480x272 is exactly HALF of native 960x544, which both halves the fill
-         * cost again and upscales cleanly (integer ratio) instead of resampling.
-         * Shorter draw distance culls more geometry -- the engine is sim/vertex
-         * bound, so that is where the real power saving is. */
-        c->render_w = 480; c->render_h = 272; c->fps_cap = 30; c->vsync = 1;
-        c->outlines = 0;   c->shadows = 0;    c->draw_distance = 3000; c->skinning_full = 0;
-        c->anim_rate = 2;   c->detail = 700;  c->render_quality = -1; c->gpu_tier = -1;
-        c->clock_adaptive = 1; c->clock_mhz = 444; break;
-    case PROF_BALANCED:    /* default */
-    default:
+
+    default:               /* custom -- starts from "default" then applies your lines */
         c->render_w = 800; c->render_h = 452; c->fps_cap = 30; c->vsync = 1;
         c->outlines = 1;   c->shadows = 0;    c->draw_distance = 6000; c->skinning_full = 1;
-        c->anim_rate = 1;   c->detail = 1000; c->render_quality = -1; c->gpu_tier = -1;
+        c->anim_rate = 1;   c->detail = 1000; c->render_quality = -1; c->gpu_tier = 1;
         c->clock_adaptive = 0; c->clock_mhz = 444; break;
     }
 }
@@ -120,6 +154,9 @@ static void load_cfg(void) {
     if      (!strcmp(prof, "quality"))     p = PROF_QUALITY;
     else if (!strcmp(prof, "performance")) p = PROF_PERFORMANCE;
     else if (!strcmp(prof, "battery"))     p = PROF_BATTERY;
+    else if (!strcmp(prof, "default"))     p = PROF_BALANCED;
+    else if (!strcmp(prof, "balanced"))    p = PROF_BALANCED;
+    else if (!strcmp(prof, "auto"))        p = PROF_AUTO;
     else if (!strcmp(prof, "custom"))      p = PROF_CUSTOM;
 
     /* Start from the chosen profile (custom == balanced baseline), THEN let any

@@ -583,7 +583,7 @@ void soloader_init_all() {
     /* BUILD STAMP — first line of every log so old vs new eboot is unmistakable.
      * If this line is ABSENT, an OLD eboot is running (VitaShell kept it on a
      * same-Title-ID install → delete the bubble and reinstall). */
-    telemetry_log("BOOT", "BUILD=2026-07-29-r27 (texture reclaim DISABLED - it broke chapter-selector art; gpu_tier GL_RENDERER spoof kept, thats the +18pct fps win)");
+    telemetry_log("BOOT", "BUILD=2026-07-29-r29 (profiles rebuilt around gpu_tier: quality/default/performance/battery/auto/custom; 20fps locks are 3-vblank exact)");
     telemetry_log("BOOT", "soloader_init_all start");
 
 	// Launch `app0:configurator.bin` on `-config` init param
