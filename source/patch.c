@@ -146,6 +146,8 @@ typedef int (*fmod_system_get_output_fn)(void *system, int *output);
 static fmod_studio_get_low_level_system_fn g_fmod_studio_get_low_level_system = NULL;
 static fmod_system_set_output_fn g_fmod_system_set_output = NULL;
 static fmod_system_get_output_fn g_fmod_system_get_output = NULL;
+typedef int (*fmod_system_get_version_fn)(void *system, unsigned int *version);
+static fmod_system_get_version_fn g_fmod_system_get_version = NULL;
 
 static const char *fmod_output_name(int output) {
     switch (output) {
@@ -209,6 +211,10 @@ static void resolve_fmod_audio_symbols(void) {
         g_fmod_system_set_output =
             (fmod_system_set_output_fn)so_symbol(&so_mod_fmod, "FMOD_System_SetOutput");
     }
+    if (!g_fmod_system_get_version) {
+        g_fmod_system_get_version =
+            (fmod_system_get_version_fn)so_symbol(&so_mod_fmod, "FMOD_System_GetVersion");
+    }
     if (!g_fmod_system_get_output) {
         g_fmod_system_get_output =
             (fmod_system_get_output_fn)so_symbol(&so_mod_fmod, "FMOD_System_GetOutput");
@@ -267,6 +273,31 @@ static int hook_fmod_studio_initialize(void *studio_system,
             }
             if (g_fmod_system_get_output) {
                 (void)g_fmod_system_get_output(low_level, &output_after);
+            }
+            /* FMOD VERSION PROBE (2026-07-29). We currently force FMOD to its OPENSL
+             * backend and then impersonate Android's OpenSL ES in ~900 lines of
+             * opensl_audio.c -- including a feed thread that spins without sleeping
+             * whenever the mixer accepts data. The correct design is an FMOD output
+             * plugin driving sceAudioOut directly (FMOD_System_RegisterOutput +
+             * SetOutputByPlugin, both exported here), which removes the impersonation
+             * and the thread outright.
+             *
+             * The blocker is ABI: FMOD_OUTPUT_DESCRIPTION's layout and callback set
+             * changed across the 1.x line, and this binary carries no version string.
+             * Fingerprinting narrows it to FMOD Studio 1.x (FMOD_Thread_SetAttributes
+             * absent = pre-2.01; Studio::System::create takes a headerversion) but not
+             * to a specific release, and guessing the struct crashes at boot. Ask the
+             * library instead -- one call, logged unconditionally so a single run
+             * settles it. FMOD encodes the version as 0x000AABBCC = AA.BB.CC. */
+            if (g_fmod_system_get_version && low_level) {
+                unsigned int fmod_ver = 0;
+                int vr = g_fmod_system_get_version(low_level, &fmod_ver);
+                l_info("FMODVER: GetVersion rc=%d raw=0x%08X -> FMOD %u.%02u.%02u",
+                       vr, fmod_ver, (fmod_ver >> 16) & 0xFFFFu,
+                       (fmod_ver >> 8) & 0xFFu, fmod_ver & 0xFFu);
+            } else {
+                l_warn("FMODVER: cannot probe (getVersion=%p low_level=%p)",
+                       (void *)g_fmod_system_get_version, low_level);
             }
         }
     }

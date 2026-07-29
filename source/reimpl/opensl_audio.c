@@ -181,9 +181,24 @@ static void *opensl_audio_thread(void *arg) {
             p->in_callback++;
             opensl_call_queue_callback(p);
             p->in_callback--;
-            if (p->enqueue_serial == before) {
-                sceKernelDelayThread(1000);
-            }
+            /* PACING (2026-07-29). This used to sleep 1ms ONLY when the callback
+             * enqueued nothing, so during normal playback -- the callback accepting
+             * data, which is most of the time -- it never slept at all and spun
+             * calling into the mixer as fast as the CPU allowed. On a console with
+             * three usable cores, next to a sim thread that is the frame bottleneck,
+             * that is an expensive thread to leave unthrottled.
+             *
+             * The port runs 1024-frame buffers at 48kHz = 21.3ms of audio each, so
+             * the feed only has to keep ahead of ~47 buffers/sec. Sleeping a quarter
+             * of a buffer between iterations keeps 4x headroom against underrun
+             * while cutting wakeups by 5-20x versus the old behaviour. Derived from
+             * the real sample rate rather than hardcoded so it stays correct if the
+             * port is reopened at another rate. */
+            int rate = p->sample_rate > 0 ? p->sample_rate : 48000;
+            SceUInt feed_delay = (SceUInt)((1024ULL * 1000000ULL) / (unsigned)rate / 4ULL);
+            if (feed_delay < 1000)  feed_delay = 1000;   /* never busier than 1kHz */
+            if (feed_delay > 10000) feed_delay = 10000;  /* never lazier than 100Hz */
+            sceKernelDelayThread(feed_delay);
         } else {
             sceKernelDelayThread(5000);
         }

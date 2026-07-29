@@ -583,7 +583,7 @@ void soloader_init_all() {
     /* BUILD STAMP — first line of every log so old vs new eboot is unmistakable.
      * If this line is ABSENT, an OLD eboot is running (VitaShell kept it on a
      * same-Title-ID install → delete the bubble and reinstall). */
-    telemetry_log("BOOT", "BUILD=2026-07-29-r39 (POSTFX AUDIT: engine has an unhooked glow/DOF/FXAA/motionblur chain - report-only probes on DrawGlow, _UpdateMotionBlur, RenderConfiguration::TestFeature)");
+    telemetry_log("BOOT", "BUILD=2026-07-29-r40 (audio feed thread was spinning w/o sleep during playback - now paced to buffer duration; FMOD version probe for a real output plugin; POSTFX audit)");
     telemetry_log("BOOT", "soloader_init_all start");
 
 	// Launch `app0:configurator.bin` on `-config` init param
