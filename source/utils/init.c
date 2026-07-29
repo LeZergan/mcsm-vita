@@ -583,7 +583,7 @@ void soloader_init_all() {
     /* BUILD STAMP — first line of every log so old vs new eboot is unmistakable.
      * If this line is ABSENT, an OLD eboot is running (VitaShell kept it on a
      * same-Title-ID install → delete the bubble and reinstall). */
-    telemetry_log("BOOT", "BUILD=2026-07-29-r35 (shader_opt back to O0 = existing cache reused verbatim, 0 recompiles; MCP5 strays accepted; TEXDIAG lighting probe; quality gpu_tier 1)");
+    telemetry_log("BOOT", "BUILD=2026-07-29-r36 (removed self-inflicted GL_INVALID_ENUM: vitaGL glPixelStorei only supports UNPACK_ROW_LENGTH, so the alignment push/pop was pure error spam + 2 GL calls/upload; shader_opt=0 keeps existing cache)");
     telemetry_log("BOOT", "soloader_init_all start");
 
 	// Launch `app0:configurator.bin` on `-config` init param

@@ -2233,18 +2233,52 @@ void glPixelStorei_soloader(GLenum pname, GLint param) {
     glPixelStorei(pname, param);
 }
 
+/* 2026-07-29: these no longer touch GL at all. vitaGL's glPixelStorei (textures.c)
+ * implements exactly ONE pname -- GL_UNPACK_ROW_LENGTH -- and sends everything
+ * else, GL_UNPACK_ALIGNMENT included, to `default: SET_GL_ERROR(GL_INVALID_ENUM)`.
+ * So the old push/pop pair could never change unpack behaviour; all it did was
+ * raise GL_INVALID_ENUM twice per upload.
+ *
+ * That was not harmless. glGetError returns and CLEARS the first error since the
+ * last call, so the flag set by push() was the one the upload's own glGetError
+ * read back -- device logs showed err=0x500 on 1733 glTexImage2D and 1684
+ * glTexSubImage2D calls, and pre=0x500 on 1599 more where pop()'s error had
+ * leaked into the next upload. Every one of those was our own, and they MASKED
+ * the real upload status: a genuine failure would have looked identical. A
+ * TEXDIAG probe sampling the error state between push() and the upload confirmed
+ * it -- 24 of 24 already set before glTexImage2D ran.
+ *
+ * Keep the mirror (g_unpack_alignment) so the value is still tracked for the
+ * repack decision below, but stop making the calls. Two fewer GL calls and two
+ * fewer error-flag round-trips per upload, ~2900 uploads per scene load.
+ *
+ * NOTE the real consequence: vitaGL ignores unpack alignment entirely and always
+ * reads tightly-packed rows. That is invisible for GL_RGBA (4 bytes/pixel is
+ * always 4-byte aligned) which is 1685 of the 1734 uncompressed uploads here, but
+ * NOT for the 36 GL_RGB and 13 GL_ALPHA ones, where a row whose byte count is not
+ * a multiple of the alignment would shear. See mcsm_unpack_needs_repack. */
 static GLint push_unpack_alignment_one(void) {
-    GLint old_align = g_unpack_alignment;
-    if (old_align != 1) {
-        glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-    }
-    return old_align;
+    return g_unpack_alignment;
 }
 
 static void pop_unpack_alignment(GLint old_align) {
-    if (old_align > 0 && old_align != 1) {
-        glPixelStorei(GL_UNPACK_ALIGNMENT, old_align);
+    (void)old_align;
+}
+
+/* True when the engine's declared unpack alignment would pad a row and vitaGL,
+ * which honours no alignment at all, would therefore misread the data. Only
+ * possible for formats whose row byte count is not inherently aligned. */
+static int mcsm_unpack_needs_repack(GLenum fmt, GLenum type, GLsizei w, GLint align) {
+    if (align <= 1 || w <= 0) return 0;
+    if (type != GL_UNSIGNED_BYTE) return 0;   /* packed 16-bit types are 2-byte units */
+    int bpp;
+    switch (fmt) {
+        case GL_ALPHA: case GL_LUMINANCE:      bpp = 1; break;
+        case GL_LUMINANCE_ALPHA:               bpp = 2; break;
+        case GL_RGB:                           bpp = 3; break;
+        default:                               return 0;  /* GL_RGBA: always aligned */
     }
+    return (((GLsizei)bpp * w) % align) != 0;
 }
 
 static uint8_t *convert_bgra_to_rgba(const uint8_t *src, GLsizei width, GLsizei height) {
@@ -2973,24 +3007,17 @@ void glTexImage2D_soloader(GLenum target, GLint level, GLint internalformat,
     GLint tlru_bound = (level == 0) ? (GLint)s_texlru_bound : 0;
     GLsizei tlru_bytes = (GLsizei)((long)width * (long)height * 4L); /* RGBA8888 (post-downsample) */
     GLint old_unpack_align = push_unpack_alignment_one();
-    /* TEXTURE-ERROR ISOLATION (2026-07-29). Device logs show err=0x500
-     * (GL_INVALID_ENUM) on 100% of UNCOMPRESSED uploads (2120/2120 allocs and
-     * 2061/2061 subimages) while 100% of compressed PVRTC uploads are clean --
-     * and uncompressed is exactly where lightmaps, gradients and effect art live,
-     * which matches "lighting is wrong in places until the area is reloaded".
-     * pre_err is drained well ABOVE this point, and push_unpack_alignment_one()
-     * runs in between, so the existing log cannot tell whether the error comes
-     * from the alignment helper or from glTexImage2D itself. Sample the error
-     * state right here, after the helper and immediately before the upload, so
-     * one device run separates the two. Gated to the first uploads so it costs
-     * nothing in steady state. */
-    GLenum align_err = GL_NO_ERROR;
-    if (s_count <= 24U) {
-        align_err = glGetError();
-        if (align_err != GL_NO_ERROR) {
-            l_warn("TEXDIAG: error 0x%X was ALREADY set by push_unpack_alignment_one "
-                   "(before glTexImage2D) upload #%u", (unsigned)align_err, s_count);
-        }
+    /* Report-only. vitaGL always reads tightly-packed rows, so if the engine's
+     * declared alignment would pad this row the two disagree and the texture
+     * shears. Whether that actually happens depends on how the engine laid the
+     * data out, which cannot be read off from here -- so log it rather than
+     * "fix" it by repacking, which would corrupt the opposite case. Rare by
+     * construction (GL_RGBA can never trip it), so an unconditional warn is fine
+     * and its absence is the useful result. */
+    if (mcsm_unpack_needs_repack(upload_format, upload_type, width, old_unpack_align)) {
+        l_warn("UNPACK: fmt=0x%X type=0x%X size=%dx%d align=%d — row is padded but vitaGL "
+               "reads tight; this texture may shear", (unsigned)upload_format,
+               (unsigned)upload_type, (int)width, (int)height, (int)old_unpack_align);
     }
     texlru_before_upload(tlru_bound, tlru_bytes);
     /* WHITE-SURFACE FIX (2026-07-20): a GL_RGBA source with GL_HALF_FLOAT_OES type but
