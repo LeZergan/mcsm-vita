@@ -187,11 +187,37 @@ void launch_state_mark_gl_phase(int phase) {
 }
 
 void launch_state_mark_draw(unsigned mode, int count, unsigned type, int program) {
+#ifdef DEBUG_SOLOADER
+    /* ☠ DESCRIPTIVE FIELDS ONLY EXIST WHERE THEY CAN BE READ. These four are stored on
+     * EVERY draw -- ~890 a frame, ~53,000 a second -- and their only consumer is the
+     * `lastdraw[...]` field of launch_state_snapshot(), which the watchdog emits once
+     * every 5 seconds through telemetry_log(). In a production build telemetry_log()
+     * compiles to nothing, so the stores were feeding a string that could never be
+     * printed: ~3,600 pointless stores per frame.
+     *
+     * The wedge detection that actually matters does NOT depend on them -- it needs
+     * g_draw_serial (is the render thread advancing?) and g_gl_phase (where is it?),
+     * both kept below. What is lost in a production build is only the description of
+     * the last draw in a post-mortem, and a production build has no post-mortem to
+     * put it in. */
     atomic_store_explicit(&g_draw_mode, mode, memory_order_relaxed);
     atomic_store_explicit(&g_draw_count, count, memory_order_relaxed);
     atomic_store_explicit(&g_draw_type, type, memory_order_relaxed);
     atomic_store_explicit(&g_draw_prog, program, memory_order_relaxed);
-    atomic_fetch_add_explicit(&g_draw_serial, 1, memory_order_relaxed);
+#else
+    (void)mode; (void)count; (void)type; (void)program;
+#endif
+    /* Plain load+store, NOT atomic_fetch_add. On Cortex-A9 a relaxed fetch_add still
+     * compiles to an LDREX/STREX retry loop that takes the exclusive monitor, and this
+     * runs on EVERY draw -- ~890 times a frame at the measured heavy-scene load. The
+     * relaxed stores around it are already plain stores, so the fetch_add was the only
+     * expensive operation here. Only the render thread writes this counter (draws are
+     * single-threaded), so read-modify-write atomicity buys nothing; the watchdog just
+     * reads it from another thread to tell "advancing" from "wedged", and a torn or
+     * stale read of a monotonically increasing counter cannot change that verdict. */
+    atomic_store_explicit(&g_draw_serial,
+                          atomic_load_explicit(&g_draw_serial, memory_order_relaxed) + 1,
+                          memory_order_relaxed);
     atomic_store_explicit(&g_gl_phase, 3, memory_order_relaxed); /* in draw */
     /* No per-draw timer/tid syscalls (2026-07-17): launch_state_mark_gl_phase()
      * (called each present in gl_swap) already refreshes g_gl_phase_ms + tid. The

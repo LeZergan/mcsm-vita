@@ -1,9 +1,6 @@
 #include "reimpl/asset_manager.h"
 #include "reimpl/io.h"
 #include "utils/logger.h"
-#ifdef USE_PVR_PSP2
-#include "utils/loading_screen.h"
-#endif
 
 #include <pthread.h>
 #include <malloc.h>
@@ -106,9 +103,6 @@ AAssetManager * AAssetManager_fromJava(void *env, void *assetManager) {
 }
 
 AAsset* AAssetManager_open(AAssetManager* mgr, const char* filename, int mode) {
-#ifdef USE_PVR_PSP2
-    if (filename && *filename) { loading_screen_set_asset(filename); loading_screen_tick(); }
-#endif
     std::string realp = std::string(DATA_PATH) + std::string("assets/") + std::string(filename);
 
     auto * a = new aAsset;

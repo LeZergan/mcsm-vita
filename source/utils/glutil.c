@@ -15,7 +15,6 @@
 #include "utils/dialog.h"
 #include "utils/logger.h"
 #include "utils/launch_state.h"
-#include "utils/loading_screen.h"
 #include "java_runtime.h"
 #ifdef USE_PVR_PSP2
 #include <GLES2/gl2ext.h>
@@ -68,6 +67,15 @@ static const char k_gl_vendor[] = "Imagination Technologies";
  * RenderSetCurQualityLevel / RenderGetQualityLevels). The renderer string is
  * consulted; those functions are not. */
 static const char *mcsm_gl_renderer(void) {
+    /* gpu_name wins when set. The engine's GPU table is a RANK table, not a
+     * quality gradient -- it maps each device string to a number (SGX 544MP=16,
+     * 543MP=15, 544=13, 543=12, 542=8, 541=7, 540=6, Mali-400=5, Adreno 305=4,
+     * Tegra 3=2, GC1000=1) and then reduces that rank to a binary LOW/HIGH
+     * RenderQualityType. gpu_tier only reaches four PowerVR entries; naming the
+     * device directly reaches every rank, including ranks below anything PowerVR
+     * offers, which is the only way to test where the LOW/HIGH threshold sits. */
+    const char *n = mcsm_cfg()->gpu_name;
+    if (n && n[0]) return n;
     switch (mcsm_cfg()->gpu_tier) {
         case 0:  return "PowerVR SGX 540";
         case 1:  return "PowerVR SGX 541";
@@ -140,6 +148,19 @@ static GLuint g_uniform_current_program = 0;
 #ifndef MCSM_FAST_FINAL_RUNTIME
 #define MCSM_FAST_FINAL_RUNTIME 1
 #endif
+
+/* ☠ DEFINED OUTSIDE THE GUARD ABOVE, ON PURPOSE. This used to sit INSIDE the
+ * `#ifndef MCSM_FAST_FINAL_RUNTIME` block, so building the documented diagnostic
+ * configuration -- `-DMCSM_FAST_FINAL_RUNTIME=0`, which is exactly what the SIMSPLIT
+ * log line tells you to do -- skipped the block, left the macro undefined, and made
+ * all seven `MCSM_DIAG_HELPER static ...` declarations fail to parse. The one build
+ * this marker exists to serve was the one build it broke.
+ *
+ * Two separate reasons a helper carries it, which the old comment collapsed into one:
+ *   - some are used only by the diagnostic (#else) branches, compiled out at =1;
+ *   - some (texlru_is_live, the 565/4444/zero-fill converters) are reachable only on
+ *     the PVR backend, i.e. gated on USE_PVR_PSP2, not on this flag at all. */
+#define MCSM_DIAG_HELPER __attribute__((unused))
 
 #ifndef GL_ALREADY_SIGNALED
 #define GL_ALREADY_SIGNALED 0x911A
@@ -994,29 +1015,9 @@ static int resolve_tex_storage_format(GLenum internalformat, GLenum *format_out,
     return 1;
 }
 
-/* Loading-screen-during-scene-loads state (set by patch.c SceneOpen hook). */
-int g_scene_loading = 0;
-static int g_loadscreen_ready = 0;
-
 /* Per-frame draw stats for dip profiling; reset each gl_swap (see DIP-RENDER). */
 unsigned int g_frame_draw_calls = 0;
 unsigned long g_frame_draw_verts = 0;
-
-/* LOADING SCREEN DURING SCENE LOADS (2026-06-29): the engine loads a scene's
- * textures synchronously on the GL-context thread, so drive an animated loading
- * screen from the upload path instead of letting the display freeze. */
-void mcsm_scene_load_tick(void) {
-    if (!g_scene_loading || !(g_loadscreen_ready || loading_screen_is_ready())) {
-        return;
-    }
-    static uint64_t last_us = 0;
-    uint64_t now = sceKernelGetSystemTimeWide();
-    if (last_us && (now - last_us) < 110000ULL) { /* ~9 fps overlay */
-        return;
-    }
-    last_us = now;
-    loading_screen_render();
-}
 
 #ifndef USE_PVR_PSP2
 void gl_preload() {
@@ -1058,14 +1059,18 @@ void gl_preload() {
 static GLboolean g_rs_active = GL_FALSE;
 static GLuint g_rs_fbo = 0, g_rs_color = 0, g_rs_depth = 0;
 static int g_rs_w = 0, g_rs_h = 0;
+static GLint g_rs_blit_filter = GL_LINEAR;   /* graphics.txt `upscale` */
 
 
 static void rs_init(int w, int h) {
     glGenTextures(1, &g_rs_color);
     glBindTexture(GL_TEXTURE_2D, g_rs_color);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    /* graphics.txt `upscale`. Applied to the FBO texture AND the blit below so both
+     * sampling points agree. NEAREST keeps glyph edges hard; LINEAR smears them. */
+    g_rs_blit_filter = mcsm_cfg()->upscale_nearest ? GL_NEAREST : GL_LINEAR;
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, g_rs_blit_filter);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, g_rs_blit_filter);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 
@@ -1154,7 +1159,7 @@ void gl_init() {
      * through scenes so leaving the engine ~64MB of newlib headroom is safe. */
     int ram_reserve_mb = 48;   /* pool = free_user(~96MB) - reserve; LOWER reserve = BIGGER RAM texture fallback pool. 48 -> ~48MB pool so heavy-scene VRAM OOM lands in RAM (not the black 1x1 placeholder) while leaving the engine ~48MB newlib mmap headroom. Tunable via vram_reserve.txt. */
     {
-        FILE *rf = fopen("ux0:data/mcsm/vram_reserve.txt", "r");
+        FILE *rf = mcsm_open_setting("vram_reserve.txt", "r");
         if (rf) {
             int v = 0;
             if (fscanf(rf, "%d", &v) == 1 && v >= 32 && v <= 208) {
@@ -1178,7 +1183,7 @@ void gl_init() {
      * those CPU<->GPU ring waits = steadier fps in busy scenes. Must precede
      * vglInit. Default ON (very low risk — just larger buffers); opt-out via
      * no_gxm_tune.txt. */
-    { FILE *nt = fopen("ux0:data/mcsm/no_gxm_tune.txt", "r");
+    { FILE *nt = mcsm_open_setting("no_gxm_tune.txt", "r");
       if (nt) { fclose(nt); l_info("gl_init: GXM ring-buffer tuning DISABLED (no_gxm_tune.txt)"); }
       else {
           vglSetVDMBufferSize(512 * 1024);          /* 128KB -> 512KB */
@@ -1203,6 +1208,42 @@ void gl_init() {
     vglSetupGarbageCollector(160, gc_mask);
     l_info("gl_init: cached-mem + GC affinity=0x%05X (%s)", (unsigned)gc_mask,
            (gc_mask & 0x00080000) ? "core3 via capUnlocker" : "user cores (no capUnlocker)");
+    /* ★ SCRATCH / CIRCULAR VERTEX POOL (megapass 2026-07-30) — the single biggest
+     * per-draw win found in this pass, and it needed a vitaGL REBUILD to exist.
+     *
+     * EVIDENCE. Disassembling _glDrawElements_CustomShadersIMPL in the libvitaGL.a
+     * that was installed showed, per draw:
+     *     2 x gpu_alloc_mapped_aligned   + 2 x sceClibMemcpy
+     * i.e. TWO general GPU allocations on every draw call. Device logs put heavy
+     * scenes at ~890 draws/frame, so that is ~1780 allocator round-trips per frame,
+     * on top of the 263 GL_STREAM_DRAW buffer respecifies SKINPROBE measured. It is
+     * also the mechanism behind free VRAM collapsing 80912KB -> 75KB, since every
+     * one of those allocations pushes its predecessor onto a deferred-free list.
+     *
+     * vitaGL already ships the cure -- a circular vertex pool with scratch memory,
+     * where those become bump-pointer reservations. It was NOT compiled in:
+     * vglSetupScratchMemory in the installed lib was literally `bx lr`, an empty
+     * stub, because the build lacked CIRCULAR_VERTEX_POOL / USE_SCRATCH_MEMORY.
+     * (Symbol presence is not proof a feature exists -- the stub had a symbol.)
+     *
+     * Rebuilt with CIRCULAR_VERTEX_POOL=2 (the FAILSAFE variant, so pool exhaustion
+     * degrades instead of corrupting) + USE_SCRATCH_MEMORY=1, keeping every previous
+     * flag. Verified after the rebuild:
+     *     per draw: 2 x vgl_reserve_data_pool + 2 x vgl_guarded_memcpy
+     *     symbols: 683 -> 686, only setup_combiner_pass (NO_TEX_COMBINER, dead code
+     *     for a shader-only game) and gpu_alloc_mapped_aligned itself were dropped.
+     *
+     * scratch_for_stream is the one that matters here: the loader creates every
+     * skinned-mesh vertex buffer with GL_STREAM_DRAW, which is exactly the usage
+     * class this routes into the pool. dynamic is enabled too since the engine also
+     * uses GL_DYNAMIC_* for UI/particle geometry and the same argument applies.
+     * MUST precede vglInit*. Pool size is left at vitaGL's documented 32MB default
+     * deliberately: it is the most-tested value, and a too-small circular pool can
+     * wrap while the GPU is still reading it. */
+    vglSetupScratchMemory(GL_TRUE /* dynamic */, GL_TRUE /* stream */);
+    l_info("gl_init: scratch memory ON for STREAM+DYNAMIC vertex buffers "
+           "(per-draw gpu_alloc -> circular-pool reservation)");
+
     vglInitExtended(0, RS_NATIVE_W, RS_NATIVE_H, ram_reserve_mb * 1024 * 1024, SCE_GXM_MULTISAMPLE_NONE);
     /* vsync ON (helps a little) + a steady 30fps pacing cap in the game loop
      * (see hook_gameengine_loop / mcsm_pace_frame) is the real judder fix. Plain
@@ -1281,25 +1322,6 @@ void gl_init() {
         rs_init(render_w, render_h);
     }
 
-    /* Loading-screen overlay: OFF BY DEFAULT (2026-07-03, user request — the
-     * game's own transitions look cleaner without our extra overlay after the
-     * Android logo). Opt IN by creating ux0:data/mcsm/loadscreen.txt. The old
-     * noloadscreen.txt still force-disables (harmless now that off is default). */
-    {
-        FILE *on = fopen("ux0:data/mcsm/loadscreen.txt", "r");
-        FILE *off = fopen("ux0:data/mcsm/noloadscreen.txt", "r");
-        if (on && !off) {
-            fclose(on);
-            loading_screen_init(RS_NATIVE_W, RS_NATIVE_H);
-            g_loadscreen_ready = loading_screen_is_ready();
-            l_info("LS: loading-screen overlay ENABLED by loadscreen.txt ready=%d", g_loadscreen_ready);
-        } else {
-            if (on) fclose(on);
-            if (off) fclose(off);
-            l_info("LS: loading-screen overlay off by default");
-        }
-    }
-
     /* Present-side frame lock period from fps_cap.txt (read once, here, where
      * file I/O is safe — NOT in gl_swap). */
     {
@@ -1354,6 +1376,33 @@ void gl_init() {
                g_present_period_rem, g_present_period_den ? g_present_period_den : 1,
                (g_present_period_den && g_present_period_rem) ? "fractional vblank cadence e.g. 3:2 pulldown" : "whole vblanks");
     }
+
+    /* TROPHIES — must be here, and only here. sceNpTrophy's one-time setup dialog is
+     * a Vita common dialog: it only advances while frames are being presented, so it
+     * has to run on the thread that owns the GL context and after vglInit. gl_init is
+     * the last point that is both. It fails soft (no NoTrpDrm / no TROPHY.TRP just
+     * logs and disables unlocks), so boot is never at risk.
+     *
+     * ☠ THE FRAMEBUFFER MUST BE SAVED AND RESTORED AROUND IT. rs_init() deliberately
+     * leaves g_rs_fbo bound so the game's first frame renders straight into the
+     * render-scale FBO (see the comment there). The trophy setup dialog presents
+     * frames itself, and the system composites the dialog over the DISPLAY buffer, so
+     * it needs FB0 bound -- and leaving FB0 bound afterwards would send the engine's
+     * first frame to the display instead of the FBO, breaking the whole render-scale
+     * path on the one boot where the dialog appears. */
+    {
+        GLint saved_fbo = 0;
+        glGetIntegerv(GL_FRAMEBUFFER_BINDING, &saved_fbo);
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
+        extern int mcsm_trophies_init(void);
+        const int trc = mcsm_trophies_init();
+        if (trc < 0) l_info("gl_init: trophies unavailable (rc=%d) — game continues normally", trc);
+
+        glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)saved_fbo);
+        if (g_rs_active && saved_fbo != (GLint)g_rs_fbo)
+            l_warn("gl_init: render-scale FBO was not bound before trophy init (was %d)", saved_fbo);
+    }
 }
 
 void gl_swap() {
@@ -1374,13 +1423,29 @@ void gl_swap() {
     if (g_rs_active) {
         /* Bilinear-upscale the low-res render into the native display, THEN present.
          * draw FB is left at 0 so vglSwapBuffers presents the upscaled image.
-         * Y is FLIPPED (dstY0/dstY1 swapped): vitaGL flips for the display when
-         * presenting FB 0 directly, but an FBO->FB0 blit does not, so without this
-         * the upscaled image comes out upside-down. */
+         *
+         * Y ORIENTATION IS vitaGL-VERSION DEPENDENT, so it is a runtime toggle.
+         * On the long-shipped lib (aa75c61) an FBO->FB0 blit did NOT flip while
+         * presenting FB0 directly DID, so this blit had to swap dstY0/dstY1 to come
+         * out upright. Upstream 96c41a1 changed the FBO-bind path in gxm.c from
+         * `glScissor(region...)` to `glViewport(gl_viewport...)`, and vitaGL applies
+         * the FBO Y-flip THROUGH the viewport transform (which is exactly what the
+         * adjacent `#ifndef HAVE_UNFLIPPED_FBOS change_cull_mode()` compensates for)
+         * -- so the content now arrives already flipped and our swap double-flips it,
+         * presenting the whole game upside-down.
+         *
+         * Rather than hardcode a guess that costs a full build+deploy round trip to
+         * correct, read it from graphics.txt: `blit_flip = 0` (no swap, correct for
+         * the new lib) or `1` (swap, correct for the old one). Default follows
+         * whichever lib this build links. */
         glBindFramebuffer(GL_READ_FRAMEBUFFER, g_rs_fbo);
         glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
-        glBlitFramebuffer(0, 0, g_rs_w, g_rs_h, 0, RS_NATIVE_H, RS_NATIVE_W, 0,
-                          GL_COLOR_BUFFER_BIT, GL_LINEAR);
+        if (mcsm_cfg()->blit_flip)
+            glBlitFramebuffer(0, 0, g_rs_w, g_rs_h, 0, RS_NATIVE_H, RS_NATIVE_W, 0,
+                              GL_COLOR_BUFFER_BIT, g_rs_blit_filter);
+        else
+            glBlitFramebuffer(0, 0, g_rs_w, g_rs_h, 0, 0, RS_NATIVE_W, RS_NATIVE_H,
+                              GL_COLOR_BUFFER_BIT, g_rs_blit_filter);
     }
     /* PRESENT-SIDE FRAME LOCK (anti-stutter 2026-06-30): the render thread
      * presents independently of the sim, so on a heavy 3D scene frames land at
@@ -1487,13 +1552,35 @@ void gl_swap() {
                 s_vram_warn_level = level;
                 l_warn("VRAM LOW: %uKB free (texture memory only grows on this port; "
                        "uploads may start failing). frame=%u", free_kb, s_swap_counter);
-            } else if (level == 0u) {
-                s_vram_warn_level = 0;           /* recovered -> re-arm */
+            } else if (level < s_vram_warn_level) {
+                /* Re-arm on ANY improvement, not just a full recovery to level 0.
+                 * The old test was `level == 0`, so a 2 -> 1 recovery left the latch
+                 * stuck at 2 and a later re-entry into the <4MB band logged NOTHING:
+                 * `level > s_vram_warn_level` was 2 > 2 = false. That silently
+                 * discarded every warning after the first, which matters because this
+                 * is the only signal for the failure mode that froze the r85 session
+                 * (VRAM 206KB, RAM 142KB, renderer stalled). Latching down to the
+                 * current level keeps one-warning-per-crossing while ensuring each
+                 * fresh descent is reported. */
+                s_vram_warn_level = level;
             }
         }
     }
 }
 #endif /* !USE_PVR_PSP2 */
+
+/* The ONLY reason this wrapper exists: drop the loader's cached byte-size for each
+ * name before GL is free to hand it to a different buffer. Without it a recycled name
+ * whose new size coincidentally matches the old one takes the no-allocation
+ * glBufferSubData path on its first upload and writes into storage that was never
+ * allocated for it. Everything else is a straight pass-through. */
+void glDeleteBuffers_soloader(GLsizei n, const GLuint *buffers) {
+    extern void mcsm_vb_forget_gl_buffer(unsigned int name);
+    if (buffers) {
+        for (GLsizei i = 0; i < n; i++) mcsm_vb_forget_gl_buffer((unsigned int)buffers[i]);
+    }
+    glDeleteBuffers(n, buffers);
+}
 
 void glBindVertexArrayOES_soloader(GLuint array) {
 #ifdef USE_PVR_PSP2
@@ -1572,7 +1659,7 @@ static GLenum drain_gl_errors_limited(void) {
     return first;
 }
 
-static int gl_draw_diag_should_log(unsigned int count, GLenum pre_err, GLenum query_err, GLenum err) {
+MCSM_DIAG_HELPER static int gl_draw_diag_should_log(unsigned int count, GLenum pre_err, GLenum query_err, GLenum err) {
 #if MCSM_FAST_FINAL_RUNTIME
     (void)count;
     return pre_err != GL_NO_ERROR ||
@@ -1587,7 +1674,7 @@ static int gl_draw_diag_should_log(unsigned int count, GLenum pre_err, GLenum qu
 #endif
 }
 
-static GLint gl_get_int_for_diag(GLenum pname, GLenum *query_err) {
+MCSM_DIAG_HELPER static GLint gl_get_int_for_diag(GLenum pname, GLenum *query_err) {
     GLint value = 0;
     glGetIntegerv(pname, &value);
     GLenum err = drain_gl_errors_limited();
@@ -1601,6 +1688,20 @@ static GLint gl_get_int_for_diag(GLenum pname, GLenum *query_err) {
 
 static GLenum g_diag_active_texture = GL_TEXTURE0;
 static GLuint g_diag_bound_texture_2d[GL_DIAG_TEX_UNIT_CAP];
+
+/* ★ ALL THREE REDUNDANT-CALL DEDUPS ARE NOW GONE, EACH RETIRED BY MEASUREMENT.
+ * The skip counters added on 2026-07-30 existed to answer "does this ever fire", and
+ * across three device sessions the answer came back the same every time:
+ *     glBindTexture   0 / 6,061,254   and   0 / 213,324
+ *     glUseProgram    797 / 1,105,607 and 713 / 69,725      (~0.1%)
+ *     depth/cull      cap_skips = 0    (2026-07-31, 7,400 frames to the menu)
+ * The engine simply does not re-assert redundant GL state. The first two went on
+ * 2026-07-30; the last went on 2026-07-31 together with the shared
+ * no_state_dedup.txt kill-switch and the shadow-invalidation contract.
+ * ☠ The lesson is the counters, not the dedups: an optimisation with no way to tell
+ * whether it fires is how all three of these survived, and how a buffer fix ran zero
+ * times on device while still reporting a clean build. Never ship the next one
+ * without its measurement attached. */
 
 /* POT-awareness for the wrap fix. The blanket REPEAT->CLAMP clamp (see
  * clamp_repeat_wrap) keeps NPOT textures complete on GXM, but it also kills
@@ -1642,7 +1743,7 @@ static int gl_texture_unit_index(GLenum texture) {
     return (int)idx;
 }
 
-static int gl_sampler_diag_should_log(unsigned int count, GLenum pre_err, GLenum err) {
+MCSM_DIAG_HELPER static int gl_sampler_diag_should_log(unsigned int count, GLenum pre_err, GLenum err) {
 #if MCSM_FAST_FINAL_RUNTIME
     (void)count;
     return pre_err != GL_NO_ERROR ||
@@ -1836,7 +1937,7 @@ static texlru_ent *texlru_lookup(GLuint id, int insert) {
     if (insert && tomb) { tomb->id = id; tomb->use = 0; return tomb; }
     return NULL;
 }
-static int texlru_is_live(GLuint id) {
+MCSM_DIAG_HELPER static int texlru_is_live(GLuint id) {
     if (!id) return 1;
     for (int u = 0; u < GL_DIAG_TEX_UNIT_CAP; u++)
         if (g_diag_bound_texture_2d[u] == id) return 1;
@@ -2026,6 +2127,16 @@ void glBindTexture_soloader(GLenum target, GLuint texture) {
 
     const int active_idx = gl_texture_unit_index(g_diag_active_texture);
 #if MCSM_FAST_FINAL_RUNTIME
+    /* ☠ REDUNDANT-BIND DEDUP REMOVED (2026-07-30) -- MEASURED DEAD, TWICE.
+     * The idea was that a Telltale frame rebinds the same atlas across consecutive
+     * batches, so the per-unit shadow g_diag_bound_texture_2d[] could skip the call.
+     * Two device sessions say it never happens: 0 skips of 6,061,254 binds, then
+     * GLDEDUP `tex=0/213324` and `prog=713/69725` (1%) for the program variant. The
+     * engine simply does not issue redundant binds, so the compare could never pay
+     * off while its counters cost 2-3 read-modify-writes per draw at ~890 draws a
+     * frame. Removed rather than left "measure only": the question it existed to ask
+     * has a definitive answer. g_diag_bound_texture_2d[] is still maintained below --
+     * it predates this and other diagnostics read it. */
     glBindTexture(target, texture);
     if (target == GL_TEXTURE_2D) {
         s_texlru_bound = texture;
@@ -2067,6 +2178,16 @@ void glUseProgram_soloader(GLuint program) {
     s_count++;
 
 #if MCSM_FAST_FINAL_RUNTIME
+    /* ☠ NO PROGRAM DEDUP HERE, AND THAT IS THE MEASURED ANSWER (2026-07-30).
+     * vitaGL's glUseProgram is not a cheap assignment -- it re-resolves the
+     * shader-patcher programs and rebinds the uniform buffers -- so skipping a
+     * redundant one looked worthwhile at ~890 draws a frame. Two device sessions say
+     * the engine does not issue them: 797 of 1,105,607 calls, then 713 of 69,725,
+     * about 0.1%. The dedup and its counters are both gone; the counters alone cost a
+     * read-modify-write per draw, and keeping a "measure only" counter forever is how
+     * the earlier dead optimisations stayed invisible.
+     * g_uniform_current_program is still maintained -- the uniform wrappers read it
+     * as their split-memo key -- it is simply no longer used to skip anything. */
     glUseProgram(program);
     g_uniform_current_program = program;
     (void)s_count;
@@ -2208,40 +2329,30 @@ void glDrawElements_soloader(GLenum mode, GLsizei count, GLenum type, const void
 #endif
 }
 
-/* Redundant-state dedup (deep-dive 2026-07-20): vitaGL's glEnable/glDisable are NOT
- * deferred — each call immediately issues GXM state and has NO redundancy guard
- * except GL_BLEND. glEnable(GL_DEPTH_TEST) runs change_depth_func (2x sceGxmSet*
- * DepthFunc + depth-write); glEnable(GL_CULL_FACE) runs sceGxmSetCullMode. A
- * Telltale engine that re-asserts depth/cull per batch pays that for every no-op
- * across ~900 draws/frame. Shadow-track ONLY these two caps (pure GXM state, no
- * FFP/texture/shader side effects) and skip no-op transitions; every other cap
- * forwards unchanged. Single-threaded, like the rest of GL state and the uniform
- * split memo. The dependent setters (glDepthFunc/glDepthMask/glCullFace/glFrontFace)
- * self-apply while enabled, so a skipped no-op enable/disable is a true no-op. */
-static signed char g_cap_depth_test = -1;  /* -1 unknown, 0 disabled, 1 enabled */
-static signed char g_cap_cull_face  = -1;
-/* Safety valve (untestable on-device this pass): if the dedup ever desyncs the
- * shadow from GXM depth/cull state (visible as missing/inverted geometry), drop a
- * file ux0:data/mcsm/no_state_dedup.txt to forward every call unconditionally —
- * no rebuild needed. Read once, cached. Default ON. */
-static int state_dedup_enabled(void) {
-    static int v = -1;
-    if (v < 0) { FILE *f = mcsm_open_setting("no_state_dedup.txt", "r");
-                 if (f) { fclose(f); v = 0; l_info("state-dedup DISABLED (no_state_dedup.txt)"); } else v = 1; }
-    return v;
-}
+/* ☠ THE DEPTH/CULL DEDUP IS GONE (2026-07-31), AND IT WAS MEASURED, NOT GUESSED.
+ *
+ * It shadowed GL_DEPTH_TEST / GL_CULL_FACE and skipped no-op enable/disable
+ * transitions, on the theory that a material-sorted Telltale renderer re-asserts them
+ * per batch across ~900 draws/frame. Device log 2026-07-31, a full session that
+ * reached the menu and rendered 7 400+ frames with hundreds of thousands of draws:
+ *
+ *     GLDEDUP: cap_skips=0
+ *
+ * Zero. Not "low" -- the engine never once issued a redundant depth or cull enable,
+ * so every call paid a cached-file check plus two compares to skip nothing. That is
+ * the same verdict, from the same probe, that already deleted the glUseProgram (~1%)
+ * and glBindTexture (0%) dedups on 2026-07-30; this was the last of the three and the
+ * only one still carrying a correctness hazard, because a stale shadow would have
+ * skipped a call that WAS needed and shown up as missing or inverted geometry.
+ *
+ * Removing a skip that never happens cannot change behaviour. It also retires the
+ * no_state_dedup.txt escape hatch and the shadow-invalidation contract with it.
+ * If this is ever reinstated, put the counter back at the same time -- an unmeasured
+ * dedup is how all three of these survived this long. */
 void glEnable_soloader(GLenum cap) {
-    if (state_dedup_enabled()) {
-        if (cap == 0x0B71 /*GL_DEPTH_TEST*/) { if (g_cap_depth_test == 1) return; g_cap_depth_test = 1; }
-        else if (cap == 0x0B44 /*GL_CULL_FACE*/) { if (g_cap_cull_face == 1) return; g_cap_cull_face = 1; }
-    }
     glEnable(cap);
 }
 void glDisable_soloader(GLenum cap) {
-    if (state_dedup_enabled()) {
-        if (cap == 0x0B71 /*GL_DEPTH_TEST*/) { if (g_cap_depth_test == 0) return; g_cap_depth_test = 0; }
-        else if (cap == 0x0B44 /*GL_CULL_FACE*/) { if (g_cap_cull_face == 0) return; g_cap_cull_face = 0; }
-    }
     glDisable(cap);
 }
 
@@ -2324,6 +2435,10 @@ static int mcsm_unpack_needs_repack(GLenum fmt, GLenum type, GLsizei w, GLint al
     return (((GLsizei)bpp * w) % align) != 0;
 }
 
+/* No MCSM_DIAG_HELPER here, unlike the 565/4444 converters below: those are only
+ * reachable on the PVR backend, but BGRA is converted on BOTH (see glTexImage2D_
+ * soloader), so marking this one "possibly unused" would be a false note on a
+ * function that is on the load path of every BGRA texture. */
 static uint8_t *convert_bgra_to_rgba(const uint8_t *src, GLsizei width, GLsizei height) {
     if (!src || width <= 0 || height <= 0) {
         return NULL;
@@ -2350,7 +2465,7 @@ static uint8_t *convert_bgra_to_rgba(const uint8_t *src, GLsizei width, GLsizei 
     return dst;
 }
 
-static uint8_t *convert_rgba4444_to_rgba8888(const uint16_t *src, GLsizei width, GLsizei height) {
+MCSM_DIAG_HELPER static uint8_t *convert_rgba4444_to_rgba8888(const uint16_t *src, GLsizei width, GLsizei height) {
     if (!src || width <= 0 || height <= 0) {
         return NULL;
     }
@@ -2407,7 +2522,7 @@ static int rgba8888_byte_count(GLsizei width, GLsizei height, size_t *out_bytes)
     return 1;
 }
 
-static uint8_t *alloc_zero_rgba8888(GLsizei width, GLsizei height) {
+MCSM_DIAG_HELPER static uint8_t *alloc_zero_rgba8888(GLsizei width, GLsizei height) {
     size_t byte_count = 0;
     if (!rgba8888_byte_count(width, height, &byte_count)) {
         return NULL;
@@ -2422,7 +2537,7 @@ static uint8_t *alloc_zero_rgba8888(GLsizei width, GLsizei height) {
     return dst;
 }
 
-static uint8_t *convert_rgb565_to_rgba8888(const uint16_t *src, GLsizei width, GLsizei height) {
+MCSM_DIAG_HELPER static uint8_t *convert_rgb565_to_rgba8888(const uint16_t *src, GLsizei width, GLsizei height) {
     if (!src || width <= 0 || height <= 0) {
         return NULL;
     }
@@ -2634,7 +2749,6 @@ void glCompressedTexImage2D_soloader(GLenum target, GLint level, GLenum internal
      * (~2900/scene load) — matches glTexImage2D_soloader's path. 2026-07-17. */
     GLint bound_texture = (GLint)s_texlru_bound;
     gl_tex_mark_pot((GLuint)bound_texture, width, height);
-    mcsm_scene_load_tick(); /* keep the loading screen alive during scene loads */
     uint8_t *zero_compressed = NULL;
     const void *upload_data = data;
     int zero_upload = 0;
@@ -2859,7 +2973,7 @@ static int g_mipmap_min = -1;
 static int mipmap_min_dim(void) {
     if (g_mipmap_min < 0) {
         g_mipmap_min = 1024;   /* VRAM was EXHAUSTED (free_cdram=0) — only mip the biggest textures (mips add 33% VRAM). */
-        FILE *f = fopen("ux0:data/mcsm/mipmap_min.txt", "r");
+        FILE *f = mcsm_open_setting("mipmap_min.txt", "r");
         if (f) { int v = 0; if (fscanf(f, "%d", &v) == 1 && v >= 1 && v <= 4096) g_mipmap_min = v; fclose(f); }
     }
     return g_mipmap_min;
@@ -2896,7 +3010,6 @@ void glTexImage2D_soloader(GLenum target, GLint level, GLint internalformat,
     if (level == 0) {
         gl_tex_mark_pot((GLuint)s_texlru_bound, width, height);
     }
-    mcsm_scene_load_tick(); /* keep the loading screen alive during scene loads */
 
     const GLenum orig_internalformat = (GLenum)internalformat;
     const GLenum orig_format = format;
@@ -2909,6 +3022,26 @@ void glTexImage2D_soloader(GLenum target, GLint level, GLint internalformat,
 
     /* PVR rejects some 16-bit Android texture storage/upload combinations.
      * Promote them to RGBA8888 before they reach the driver. */
+
+    /* BGRA -> RGBA, on BOTH backends.
+     *
+     * ☠ DO NOT "OPTIMISE" THIS AWAY AGAIN. Passing BGRA straight to vitaGL was tried
+     * on 2026-07-30 and corrupted textures on device (magenta/black blocks, broken UI
+     * alpha). It had been justified from vitaGL's own source -- GL_BGRA == 0x80E1, a
+     * `fast_store = GL_TRUE` direct-store branch, and a U8U8U8U8_ARGB mapping that is
+     * the consistent reversal of GL_RGBA -> _ABGR -- and called certain by
+     * construction. It was not; something in that chain does not hold for this
+     * engine's data. The two backends were left as separate #ifdef branches doing the
+     * identical thing afterwards, which is why they are merged here.
+     *
+     * ☠ The conversion ALLOCATES, and this port runs under real memory pressure. When
+     * it fails there is no good outcome: the format fields are already committed to
+     * GL_RGBA, so the original pointer uploads with R and B swapped, and restoring
+     * GL_BGRA_EXT instead would take the known-corrupting path above. What is NOT
+     * acceptable is doing it silently -- the vitaGL branch had no diagnostic at all,
+     * so an out-of-memory texture would have surfaced as "some textures look wrong",
+     * with nothing in the log to connect it to an allocation. Report it loudly and
+     * take the deterministic-but-swapped result. */
     if (format == GL_BGRA_EXT && type == GL_UNSIGNED_BYTE) {
         upload_internalformat = GL_RGBA;
         upload_format = GL_RGBA;
@@ -2917,7 +3050,9 @@ void glTexImage2D_soloader(GLenum target, GLint level, GLint internalformat,
             if (converted) {
                 upload_pixels = converted;
             } else {
-                l_warn("glTexImage2D BGRA conversion failed size=%dx%d; uploading as GL_RGBA with original pointer.", width, height);
+                l_error("glTexImage2D: BGRA->RGBA conversion could not allocate for "
+                        "%dx%d — uploading the original pointer as GL_RGBA, so THIS "
+                        "TEXTURE WILL HAVE RED AND BLUE SWAPPED", width, height);
             }
         }
     }
@@ -3008,7 +3143,7 @@ void glTexImage2D_soloader(GLenum target, GLint level, GLint internalformat,
         * downsample_min.txt (512/1024=lower res, 4096=nothing halved). */
     if (dsamp_min_dim < 0) {
         dsamp_min_dim = 2048;
-        FILE *df = fopen("ux0:data/mcsm/downsample_min.txt", "r");
+        FILE *df = mcsm_open_setting("downsample_min.txt", "r");
         if (df) {
             int v = 0;
             if (fscanf(df, "%d", &v) == 1 && (v == 512 || v == 1024 || v == 2048 || v == 4096)) {
@@ -3162,13 +3297,20 @@ void glTexSubImage2D_soloader(GLenum target, GLint level, GLint xoffset,
     const void *upload_pixels = pixels;
     uint8_t *converted = NULL;
 
+    /* Same conversion, same reasoning, and the same "do not remove it again" note as
+     * glTexImage2D_soloader above -- including why the failure path shouts. This is
+     * the STREAMING path (video frames, dynamic UI), so it recurs during play rather
+     * than only at load, which makes a silent wrong-channel upload here even harder
+     * to trace back to an allocation failure. */
     if (format == GL_BGRA_EXT && type == GL_UNSIGNED_BYTE) {
         upload_format = GL_RGBA;
         converted = convert_bgra_to_rgba((const uint8_t *)pixels, width, height);
         if (converted) {
             upload_pixels = converted;
         } else if (pixels) {
-            l_warn("glTexSubImage2D BGRA conversion failed size=%dx%d; uploading as GL_RGBA with original pointer.", width, height);
+            l_error("glTexSubImage2D: BGRA->RGBA conversion could not allocate for "
+                    "%dx%d — uploading the original pointer as GL_RGBA, so THIS "
+                    "TEXTURE WILL HAVE RED AND BLUE SWAPPED", width, height);
         }
     }
 #ifdef USE_PVR_PSP2
@@ -3410,9 +3552,12 @@ void glUniform4f_soloader(GLint location, GLfloat v0, GLfloat v1, GLfloat v2, GL
 static int mcsm_anim_pose_diag_enabled(void) {
     static int s_enabled = -1;
     if (s_enabled < 0) {
-        SceUID fd = sceIoOpen("ux0:data/mcsm/animdiag.txt", SCE_O_RDONLY, 0);
-        if (fd >= 0) {
-            sceIoClose(fd);
+        /* mcsm_open_setting(), like every other tunable: the raw sceIoOpen this
+         * replaced looked only at the data root, so animdiag.txt in settings/ --
+         * where the device actually keeps its config -- was silently ignored. */
+        FILE *fd = mcsm_open_setting("animdiag.txt", "r");
+        if (fd) {
+            fclose(fd);
             s_enabled = 1;
             l_info("ANIM-POSE diagnostics enabled by animdiag.txt");
         } else {

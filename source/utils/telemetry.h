@@ -13,6 +13,16 @@ extern "C" {
 #endif
 
 void telemetry_reset(void);
+
+/* Write ONE line to loader.log regardless of ENABLE_TELEMETRY_LOGGING.
+ *
+ * This exists for exactly one thing: the build stamp. telemetry_log() compiles to
+ * nothing in a production build, which also silently removed the only line that says
+ * WHICH eboot is running -- on a project whose most repeated failure is a tester
+ * measuring a stale build. Build identity is not diagnostic chatter, so it is not
+ * gated with the diagnostics. Do not use this for anything else. */
+void telemetry_stamp(const char *line);
+
 void telemetry_log(const char *tag, const char *fmt, ...)
                    __attribute__((format(printf, 2, 3)));
 int telemetry_success_count(void);

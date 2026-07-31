@@ -15,6 +15,7 @@
 #include "utils/launch_state.h"
 #include "utils/logger.h"
 #include "utils/utils.h"
+#include "utils/audio_gain.h"
 #include "utils/config.h"
 #include "reimpl/controls.h"
 
@@ -216,16 +217,18 @@ static int clamp_audio_frames(int frames) {
 
 #define AUDIO_GAIN_Q8_DEFAULT 320 /* 1.25x. Vita hardware volume is already 0 dB. */
 
-static int audio_gain_q8(void) {
+/* Non-static: the FMOD output plugin applies the same master gain, so the
+ * audio_gain.txt lever keeps working now that the OpenSL path is gone.
+ * Declared in utils/audio_gain.h, alongside the per-sample helper. */
+int audio_gain_q8(void) {
     static int s_gain_q8 = -1;
     if (s_gain_q8 < 0) {
         int percent = 125;
-        char path[256];
-        snprintf(path, sizeof(path), DATA_PATH "audio_gain.txt");
-        FILE *fp = fopen(path, "r");
-        if (!fp) {
-            fp = fopen("ux0:data/mcsm/audio_gain.txt", "r");
-        }
+        /* mcsm_open_setting() checks settings/ then the data root, which is what every
+         * other tunable does. This hand-rolled version tried DATA_PATH and then the
+         * same literal path a second time -- two attempts at one location, and none at
+         * settings/, so a gain file placed alongside graphics.txt was silently ignored. */
+        FILE *fp = mcsm_open_setting("audio_gain.txt", "r");
         if (fp) {
             char buf[32];
             if (fgets(buf, sizeof(buf), fp)) {
@@ -242,15 +245,6 @@ static int audio_gain_q8(void) {
     return s_gain_q8;
 }
 
-static int16_t audio_apply_gain_i16(int16_t sample, int gain_q8) {
-    int value = ((int)sample * gain_q8) / 256;
-    if (value > 32767) {
-        value = 32767;
-    } else if (value < -32768) {
-        value = -32768;
-    }
-    return (int16_t)value;
-}
 
 static void audio_write_sleep_us(int byte_count) {
     if (byte_count <= 0) return;
@@ -606,7 +600,12 @@ static jobject GetLocale(jmethodID id, va_list args) {
     static char loc[16] = "";
     static int logged = 0;
     if (!loc[0]) {
-        strncpy(loc, mcsm_game()->language, sizeof(loc) - 1);
+        /* Explicit terminate: loc is static (so zero-filled) and strncpy of
+         * sizeof-1 cannot overflow, but GCC cannot prove the NUL survives. */
+        const char *lang_src = mcsm_game()->language;
+        size_t li = 0;
+        while (li + 1 < sizeof(loc) && lang_src[li]) { loc[li] = lang_src[li]; li++; }
+        loc[li] = 0;
         if (!loc[0]) { strcpy(loc, "en_US"); }
     }
     if (!logged) { logged = 1; l_info("LANG: getLocale -> \"%s\"", loc); }

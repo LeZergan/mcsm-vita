@@ -33,6 +33,12 @@ libmain.so
 libSDL2.so
 # reference art copied from the Android build
 *_android.png
+# LiveArea art + trophy pack built from the retail game's own images. The repo
+# keeps PLACEHOLDER livearea PNGs (committed, so a fresh clone still builds a
+# working VPK); a local build may overwrite them with the real thing, and that
+# must never be pushed. Same for TROPHY.TRP, whose icons are game art.
+extras/livearea_placeholder_bak/
+extras/trophy/
 # proprietary PowerVR driver (Imagination Technologies — "Strictly Confidential",
 # NOT redistributable). The shipping build is vitaGL; these are never used or published.
 lib/pvr/
@@ -59,7 +65,13 @@ __pycache__/
 lib/libc_bridge/out/
 
 # --- Session scratch / internal notes (personal paths + LAN IPs; not published) ---
+# These are working notes written during development. They routinely quote local
+# build paths (C:\Users\<name>\...), so they must never be committed to a public
+# repo. Keep them on disk, out of git.
 scratchpad_*.md
+CHANGES_*.md
+MEGAPASS_*.md
+PERF_FINDINGS_*.md
 tools/vita-parse-core/
 docs/AI_PORTING_GUIDE.md
 CODEX_HANDOFF.md

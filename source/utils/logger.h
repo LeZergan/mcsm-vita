@@ -25,6 +25,28 @@ extern "C" {
 #define LT_SUCCESS 5
 #define LT_WAIT    6
 
+/* ★ A COMPILED-OUT LOG LINE STILL HAS TO BE A STATEMENT THAT USES ITS ARGUMENTS.
+ *
+ * These macros used to expand to NOTHING when logging was compiled out, which broke
+ * the build in two ways that only showed up in the configuration nobody watches:
+ *
+ *   `if (rc < 0) l_warn("...");`  became  `if (rc < 0) ;`      -> -Wempty-body
+ *   every variable read only by a log line became unused       -> -Wunused-variable
+ *
+ * so ENABLE_TELEMETRY_LOGGING=OFF -- the PRODUCTION build -- emitted 25+ warnings
+ * while the logging build was clean, and "0 warnings" was quietly only ever true for
+ * half of what ships.
+ *
+ * Worse than the noise: with the arguments gone, so was the printf format checking.
+ * A wrong conversion or a missing argument (the kind that faults inside vsnprintf --
+ * this project has already shipped one, in an out-of-memory report) was diagnosed
+ * ONLY in the logging build.
+ *
+ * `if (0) _log_print(...)` fixes both: it is a real statement, the compiler type- and
+ * format-checks the arguments, and it is unreachable so nothing is emitted. Argument
+ * side effects are not evaluated -- exactly as before, when the whole call vanished. */
+#define MCSM_LOG_DISCARD(...) do { if (0) _log_print(LT_DEBUG, __VA_ARGS__); } while (0)
+
 #ifdef DEBUG_SOLOADER
 /* PRODUCTION (2026-07-02): DEBUG-level lines are per-syscall spam (every
  * stat/open/fstat/readdir/AAsset op formats a line -- thousands during
@@ -34,18 +56,18 @@ extern "C" {
 #ifdef MCSM_VERBOSE_DEBUG
 #define l_debug(...)   _log_print(LT_DEBUG,   __VA_ARGS__)
 #else
-#define l_debug(...)
+#define l_debug(...)   MCSM_LOG_DISCARD(__VA_ARGS__)
 #endif
 #define l_info(...)    _log_print(LT_INFO,    __VA_ARGS__)
 #define l_warn(...)    _log_print(LT_WARN,    __VA_ARGS__)
 #define l_success(...) _log_print(LT_SUCCESS, __VA_ARGS__)
 #define l_wait(...)    _log_print(LT_WAIT,    __VA_ARGS__)
 #else
-#define l_debug(...)
-#define l_info(...)
-#define l_warn(...)
-#define l_success(...)
-#define l_wait(...)
+#define l_debug(...)   MCSM_LOG_DISCARD(__VA_ARGS__)
+#define l_info(...)    MCSM_LOG_DISCARD(__VA_ARGS__)
+#define l_warn(...)    MCSM_LOG_DISCARD(__VA_ARGS__)
+#define l_success(...) MCSM_LOG_DISCARD(__VA_ARGS__)
+#define l_wait(...)    MCSM_LOG_DISCARD(__VA_ARGS__)
 #endif
 
 #define l_error(...)   _log_print(LT_ERROR,   __VA_ARGS__)

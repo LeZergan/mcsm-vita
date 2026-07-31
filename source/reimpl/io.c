@@ -155,24 +155,10 @@ static void savedata_untrack_fd(int fd) {
     }
 }
 
-static int is_opensl_library_path(const char *path) {
-    if (!path) {
-        return 0;
-    }
-    const char *base = strrchr(path, '/');
-    base = base ? base + 1 : path;
-    return strcmp(base, "libOpenSLES.so") == 0;
-}
-
-static int stat_virtual_opensl_library(stat64_bionic *buf) {
-    if (buf) {
-        memset(buf, 0, sizeof(*buf));
-        buf->st_mode = S_IFREG | 0444;
-        buf->st_nlink = 1;
-        buf->st_size = 1;
-    }
-    return 0;
-}
+/* is_opensl_library_path() and stat_virtual_opensl_library() lived here to make
+ * access()/stat() claim libOpenSLES.so existed. Both call sites went away with the
+ * OpenSL removal on 2026-07-29 and the functions were left behind as dead code;
+ * -Wall found them once warnings were finally switched on. */
 
 static int write_text_file_if_missing(const char *path, const char *content) {
     FILE *fp = fopen(path, "rb");
@@ -310,7 +296,7 @@ static const char *ensure_android_virtual_file(const char *path) {
 typedef struct AssetVfd {
     int used;
     /* 512 (was PATH_MAX=4096) x ASSET_VFD_MAX slots. Real asset paths
-     * (ux0:data/mcsm/Android/obb/.../*.ttarch2:<res>) are ~150 chars; 512 keeps a
+     * (ux0:data/mcsm/Android/obb/<pkg>/NNN.ttarch2:<res>) are ~150 chars; 512 keeps a
      * 3x margin. All writes here use sizeof(path), so shrinking cannot overflow —
      * this reclaims ~1.8MB of BSS that was reserved for paths that never occur. */
     char path[512];
@@ -1037,13 +1023,10 @@ int rmdir_soloader(const char *path) {
 }
 
 int access_soloader(const char *path, int amode) {
-    if (is_opensl_library_path(path)) {
-        static unsigned s_logged = 0;
-        if (s_logged++ < 4U) {
-            l_info("access(%s, %d): OpenSL bridge available", path ? path : "(null)", amode);
-        }
-        return 0;
-    }
+    /* OpenSL removed 2026-07-29: dlopen("libOpenSLES.so") now returns NULL, so
+     * access()/stat() must agree. Reporting the file as present here and then
+     * failing the dlopen is worse than either answer alone -- it lets a probe
+     * select a backend that cannot then be loaded. */
     const char *virtual_file = ensure_android_virtual_file(path);
     if (virtual_file) {
         return access(virtual_file, amode);
@@ -1194,13 +1177,6 @@ int fstat_soloader(int fd, stat64_bionic * buf) {
 }
 
 int stat_soloader(const char * path, stat64_bionic * buf) {
-    if (is_opensl_library_path(path)) {
-        static unsigned s_logged = 0;
-        if (s_logged++ < 4U) {
-            l_info("stat(%s): OpenSL bridge available", path ? path : "(null)");
-        }
-        return stat_virtual_opensl_library(buf);
-    }
 
     path = remap_android_path(path);
 

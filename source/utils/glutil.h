@@ -32,10 +32,19 @@ void gl_preload();
 
 void gl_swap();
 
+/* (mcsm_gl_state_invalidate() was declared here for the redundant-call dedups. All
+ * three were retired on 2026-07-30/31 after their counters measured them dead on
+ * device, so there are no shadows left to invalidate and the definition went with
+ * them -- leaving a declaration for a function that no longer exists would be a trap
+ * for the next caller. See the note above the glEnable/glDisable wrappers.) */
+
 const GLubyte *glGetString_soloader(GLenum name);
 
 void glActiveTexture_soloader(GLenum texture);
 void glBindTexture_soloader(GLenum target, GLuint texture);
+/* Wraps glDeleteBuffers ONLY to invalidate the loader's per-buffer size cache before
+ * the name is recycled by GL. See mcsm_vb_forget_gl_buffer() in patch.c. */
+void glDeleteBuffers_soloader(GLsizei n, const GLuint *buffers);
 void glCompileShader_soloader(GLuint shader);
 void glLinkProgram_soloader(GLuint program);
 

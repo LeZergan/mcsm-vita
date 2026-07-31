@@ -57,6 +57,19 @@ bool file_copy(const char * path, const char * destination);
 bool file_exists(const char * path);
 
 /**
+ * Size of a file in bytes.
+ *
+ * Distinguishes "missing" from "present but empty", which file_exists() cannot:
+ * a zero-byte placeholder passes an existence check while carrying no data, and
+ * that difference decides whether a seeded file is usable.
+ *
+ * @param path Full path of the file to measure.
+ *
+ * @return byte count, or -1 if the file does not exist.
+ */
+long long file_size(const char * path);
+
+/**
  * Open a user tunable, preferring the tidy ux0:data/mcsm/settings/ subfolder
  * and falling back to the data root for backward compatibility.
  *
@@ -68,23 +81,27 @@ bool file_exists(const char * path);
 FILE * mcsm_open_setting(const char * basename, const char * mode);
 
 /*
- * Consolidated clock + governor configuration, all from ONE tunable:
- * ux0:data/mcsm/settings/clock.txt (or the data root). Lines are order-free and
- * forgiving; recognised tokens:
- *   off            -> disable the adaptive governor (pin ARM to `arm_max`)
- *   min <MHz>      -> governor floor      (default 444 = pinned; lower it, e.g.
- *                     "min 266", to enable adaptive battery scaling)
- *   max <MHz>      -> governor ceiling + boot ARM clock (default 444, 222..500)
- *   gpu <MHz>      -> GPU clock           (default 222, clamped 111..266)
- * An absent file (or absent line) yields the defaults below. This ONE doc is
- * read by BOTH the boot clock (init.c) and the in-game governor (patch.c), so
- * there is a single place to configure clocks with a built-in opt-out.
+ * Clock + governor bounds, DERIVED FROM graphics.txt. Not a file of its own.
+ *
+ * ☠ THIS BLOCK USED TO DOCUMENT A `clock.txt` WITH off/min/max/gpu TOKENS AND CALL
+ * ITSELF "the ONE doc read by BOTH the boot clock and the governor". No such file is
+ * ever opened: mcsm_read_clock_cfg() reads mcsm_cfg() (graphics.txt) and nothing in
+ * the tree parses clock.txt -- a grep finds only comments. A user who created it to
+ * pin their clock or raise the GPU got no effect and no warning. Corrected rather
+ * than implemented, because graphics.txt is already the consolidated settings file
+ * and a second one would recreate the split this project deliberately removed.
+ *
+ * The real knobs, both in graphics.txt:
+ *   clock = adaptive|battery  -> governor ON, floor 266, ceiling clock_mhz
+ *   clock = <MHz>             -> governor OFF, ARM pinned to that value (111..600;
+ *                                above 444 needs a CPU overclock plugin, otherwise
+ *                                the kernel clamps and the CLOCK log line shows it)
  */
 typedef struct {
-    int governor_off;   /* 1 = governor disabled (ARM pinned to arm_max) */
-    int arm_min;        /* governor floor, MHz */
+    int arm_min;        /* governor floor, MHz   (== arm_max when pinned) */
     int arm_max;        /* governor ceiling AND boot ARM clock, MHz */
-    int gpu;            /* GPU clock, MHz */
+    int gpu;            /* GPU clock, MHz. Always 222 -- there is no config knob for
+                         * it; kept so callers have one place to change if one lands */
 } McsmClockCfg;
 
 void mcsm_read_clock_cfg(McsmClockCfg * cfg);

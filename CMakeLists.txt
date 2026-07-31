@@ -32,6 +32,24 @@ set(VITA_VPKNAME "mcsm_diag")
 set(VITA_VERSION "01.02")
 set(VITA_MKSFOEX_FLAGS "-d ATTRIBUTE2=12")
 
+# ☠ THE NP COMMUNICATION ID HAS EXACTLY ONE DEFINITION, AND THIS IS IT.
+# It is NOT the title id. Three places have to agree or there are simply no trophies:
+#   1. the folder the pack is packaged into (sce_sys/trophy/<id>_00/TROPHY.TRP)
+#   2. the id the loader passes to sceNpTrophyCreateContext  (source/utils/trophies.c)
+#   3. the <npcommid> inside the pack itself                 (tools/trophies.def)
+# They drifted apart once already -- packaged as MCSM00002_00, requested as MCSM00001,
+# declared as MCSM00001_00 -- which silently disabled trophies on every fresh install
+# and was invisible until a device log showed the context failing to open. (1) and (2)
+# are now both derived from this variable; (3) is a data file, so tools/trophies.def
+# still states it and must be kept in step by hand when rebuilding the pack.
+#
+# MCSM00002, not MCSM00001: the original id's registration was poisoned on the test
+# console (the set stayed registered after its conf/data folders were deleted, which
+# is unrepairable in place because TRPUSER.DAT is PFS-sealed). Registering under an id
+# the system had never seen was the fix. Do not go back to MCSM00001 -- any console
+# that ever saw the old build still holds the poisoned state for it.
+set(MCSM_NP_COMM_ID "MCSM00002")
+
 # Optional: used for "send" and "dump" targets
 set(PSVITAIP "192.168.0.198" CACHE STRING "PSVita IP (for FTP access)")
 set(PARSECOREPATH "$ENV{PARSECOREPATH}" CACHE STRING "vita-parse-core main.py")
@@ -59,6 +77,9 @@ add_definitions(
   -DLIB_SDL2_SO_PATH="${LIB_SDL2_SO_PATH}"
   -DLIB_FMOD_SO_PATH="${LIB_FMOD_SO_PATH}"
   -DLIB_FMODSTUDIO_SO_PATH="${LIB_FMODSTUDIO_SO_PATH}"
+  # Same value that names the sce_sys/trophy/<id>_00/ folder below, so the loader
+  # cannot ask for an id the package does not contain. See MCSM_NP_COMM_ID above.
+  -DMCSM_NP_COMM_ID="${MCSM_NP_COMM_ID}"
 )
 
 option(USE_SCELIBC_IO "Use SceLibcBridge for IO and some other std functions" OFF)
@@ -109,7 +130,26 @@ add_definitions(-D_GNU_SOURCE -D__POSIX_VISIBLE=999999)
 # per-load loops (box-filter downsample, 565/4444/BGRA converters, memcpy). The
 # float ABI stays softfp so the boundary with VitaSDK stubs is unchanged (no new
 # mismatch beyond the ones -Wl,--no-warn-mismatch already covers).
-set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wl,-q -mfloat-abi=softfp -mcpu=cortex-a9 -mtune=cortex-a9 -mfpu=neon -std=gnu11 -Wno-deprecated -fno-unwind-tables -fno-asynchronous-unwind-tables")
+# WARNINGS ARE ON (2026-07-30). This project pokes engine structs at raw byte
+# offsets, hand-builds ARM trampolines and passes floats through function pointers
+# whose prototypes it has to get exactly right -- compiler diagnostics are the
+# cheapest safety net available here, and there were none at all: no -Wall, no
+# -Wextra, so the standing "zero warnings" claim was vacuous. Turning them on
+# surfaced 7 real items on the first build, including a dead throttle variable that
+# had silently disabled a 30s log throttle.
+# Suppressions are per-reason, never blanket, so the remaining ~40 checks stay
+# meaningful (-Wformat alone caught a real crash in file_load's OOM path):
+#   -Wno-unused-parameter    the reimpl/ layer implements fixed POSIX/Android/FMOD
+#                            signatures; unimplemented parameters are the point.
+#   -Wno-sign-compare        all 9 instances are inside vendored
+#                            lib/falso_jni/FalsoJNI_ImplBridge.h, not our code.
+#   -Wno-unknown-pragmas     vendored FalsoJNI_Logger.h carries clang/IDE pragmas.
+# (-Wno-format-truncation used to be here as well, for ONE snprintf in
+# reimpl/time64.c. Suppressing it for the whole build to silence a single known-safe
+# call is exactly the blanket suppression the miniz note below argues against, and it
+# would hide a genuine truncation anywhere in the ~30 other files that format into
+# fixed buffers -- several of which build device-log paths. Scoped to that file.)
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wl,-q -mfloat-abi=softfp -mcpu=cortex-a9 -mtune=cortex-a9 -mfpu=neon -std=gnu11 -Wall -Wextra -Wno-unused-parameter -Wno-sign-compare -Wno-unknown-pragmas -Wno-deprecated -fno-unwind-tables -fno-asynchronous-unwind-tables")
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wl,-q -mfloat-abi=softfp -mcpu=cortex-a9 -mtune=cortex-a9 -mfpu=neon -std=gnu++20 -Wno-write-strings -Wno-psabi -fno-exceptions -fno-rtti -fno-unwind-tables -fno-asynchronous-unwind-tables")
 
 if (CMAKE_BUILD_TYPE STREQUAL "Debug")
@@ -132,7 +172,6 @@ add_executable(${CMAKE_PROJECT_NAME}
                source/reimpl/bits/_ctype.c
                source/reimpl/controls.c
                source/reimpl/controls.h
-                source/reimpl/opensl_audio.c
                     source/reimpl/fmod_native_probe.c
                     source/reimpl/fmod_output_vita.c
                 source/reimpl/errno.c
@@ -145,6 +184,7 @@ add_executable(${CMAKE_PROJECT_NAME}
                source/reimpl/time64.c
                source/reimpl/asset_manager.cpp
                source/utils/config.c
+               source/utils/trophies.c
                source/utils/dialog.c
                source/utils/glutil.c
                source/utils/init.c
@@ -161,8 +201,20 @@ add_executable(${CMAKE_PROJECT_NAME}
                lib/so_util/so_util.c)
 
 target_sources(${CMAKE_PROJECT_NAME} PRIVATE
-               source/reimpl/egl.c
-               source/utils/loading_screen.c)   # loading screen during scene loads
+               source/reimpl/egl.c)
+
+# miniz_zlib.c #includes the vendored third_party/miniz sources, whose narrow-type
+# comparisons trip -Wtype-limits. Scoped to THIS translation unit rather than added
+# to CMAKE_C_FLAGS, so -Wtype-limits keeps working on code we actually own -- the
+# whole point of turning warnings on is that a clean build makes new ones visible.
+set_source_files_properties(source/reimpl/miniz_zlib.c
+                            PROPERTIES COMPILE_OPTIONS "-Wno-type-limits")
+
+# time64.c's asctime_r writes into the 26-byte buffer the POSIX contract mandates,
+# so GCC's truncation warning is advisory there and nowhere else. Same reasoning as
+# miniz above: scope it, do not disable the check for the whole build.
+set_source_files_properties(source/reimpl/time64.c
+                            PROPERTIES COMPILE_OPTIONS "-Wno-format-truncation")
 
 set(LIBC_BRIDGE_STUB "")
 if (USE_SCELIBC_IO)
@@ -214,6 +266,9 @@ target_link_libraries(${CMAKE_PROJECT_NAME}
                       SceSblSsMgr_stub
                       SceVshBridge_stub
                       SceCommonDialog_stub
+                      # Vita trophies. VitaSDK ships this stub but NO header, so the
+                      # API is declared by hand in source/utils/trophies.c.
+                      SceNpTrophy_stub
                       SceFios2_stub
                       taihen_stub
                       ${LIBC_BRIDGE_STUB}
@@ -223,6 +278,12 @@ target_link_libraries(${CMAKE_PROJECT_NAME}
 # SceShaccCg compiler stubs. SceShaccCgExt hooks to load the runtime compiler module,
 # so it needs taihen AFTER it in link order (single-pass linker). mathneon resolves
 # vitaGL's NEON math.
+# ☠ DO NOT ADD ScePerf_stub BACK. A previous pass linked it to read the Cortex-A9
+# hardware performance counters and left a comment here calling it "the profiler we
+# can actually use". It is not: scePerfArmPmon* are kernelgroup{ScePerf} in
+# psp2/perf.h, so the stub LINKS but the user-mode call is invalid and crashed before
+# the first frame. Reading the PMU needs a taihen kernel plugin. The full write-up is
+# above g_chore_us in source/patch.c; wall-clock phase timing is what we have.
 target_link_libraries(${CMAKE_PROJECT_NAME} vitashark SceShaccCg_stub SceShaccCgExt taihen_stub mathneon)
 
 if (EXISTS "${CMAKE_SOURCE_DIR}/extras/livearea")
@@ -231,10 +292,30 @@ endif()
 
 vita_create_self(eboot.bin ${CMAKE_PROJECT_NAME} UNSAFE)
 
+# Trophy pack. The system resolves it by NP communication id, not by title id.
+# Both this path and trophies.c come from MCSM_NP_COMM_ID at the top of this
+# file -- see the note there for why that matters. Requires the NoTrpDrm plugin
+# on the device to be readable.
+#
+# OPTIONAL, because the pack's icons are the retail game's own art and are not
+# published with the source. Without it the loader builds and runs exactly as
+# before; UnlockAchievement simply has no pack to unlock against. Build one with
+# tools/make_trophy_pack.py. Checked at configure time, so re-run cmake after
+# adding it.
+set(MCSM_TROPHY_FILE "")
+if (EXISTS "${CMAKE_SOURCE_DIR}/extras/trophy/TROPHY.TRP")
+  set(MCSM_TROPHY_FILE FILE ${CMAKE_SOURCE_DIR}/extras/trophy/TROPHY.TRP
+                            sce_sys/trophy/${MCSM_NP_COMM_ID}_00/TROPHY.TRP)
+else()
+  message(STATUS "No extras/trophy/TROPHY.TRP -- building without trophy support. "
+                 "See tools/make_trophy_pack.py.")
+endif()
+
 vita_create_vpk(${VITA_VPKNAME}.vpk ${VITA_TITLEID} eboot.bin
                 VERSION ${VITA_VERSION}
                 NAME ${VITA_APP_NAME}
                 FILE ${CMAKE_SOURCE_DIR}/extras/livearea/icon0.png sce_sys/icon0.png
+                ${MCSM_TROPHY_FILE}
                 FILE ${CMAKE_SOURCE_DIR}/extras/livearea/pic0.png sce_sys/pic0.png
                 FILE ${CMAKE_SOURCE_DIR}/extras/livearea/bg0.png sce_sys/livearea/contents/bg0.png
                 FILE ${CMAKE_SOURCE_DIR}/extras/livearea/startup.png sce_sys/livearea/contents/startup.png

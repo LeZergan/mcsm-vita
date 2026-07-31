@@ -6,6 +6,7 @@
  */
 
 #include "reimpl/controls.h"
+#include "utils/logger.h"
 
 #include <math.h>
 #include <pthread.h>
@@ -93,6 +94,14 @@ void poll_stick(ControlsStickId which, float raw_x, float raw_y, float * reading
 
 void controls_poll() {
     pthread_mutex_lock(&g_controls_mutex);
+    /* Same reasoning as the sampling-mode re-assert in poll_pad(): touch sampling is
+     * process-global state that controls_init() enabled exactly once, and a common
+     * dialog / PS-button overlay / resume can hand it back disabled. This game is
+     * driven almost entirely by touch, so losing it is worse than losing the sticks;
+     * enabling an already-enabled port is a no-op, and a dialog reading touch for
+     * itself is unaffected by us keeping OUR sampling on. Two syscalls per poll. */
+    sceTouchSetSamplingState(SCE_TOUCH_PORT_FRONT, 1);
+    sceTouchSetSamplingState(SCE_TOUCH_PORT_BACK, 1);
     poll_touch();
     poll_touch_back();
     poll_pad();
@@ -241,7 +250,62 @@ float analog_ry[3] = { 0 };
 
 void poll_pad() {
     SceCtrlData pad;
-    sceCtrlPeekBufferPositiveExt2(0, &pad, 1);
+
+    /* ★ RE-ASSERT THE ANALOG SAMPLING MODE EVERY POLL. This is the fix for "the
+     * sticks work, then stop working".
+     *
+     * sceCtrlSetSamplingModeExt() is PROCESS-GLOBAL state, and controls_init() set it
+     * exactly once at boot. Anything that takes the controller away and hands it back
+     * restores the SYSTEM default (digital), not ours -- and this port opens two
+     * common dialogs that do precisely that: the trophy setup dialog on first
+     * registration (utils/trophies.c) and the save-rename IME on SELECT
+     * (utils/dialog.c). The PS-button overlay and a suspend/resume cycle are the same
+     * story. Once the mode is lost, sceCtrlPeekBufferPositiveExt2 reports every axis
+     * at dead centre (128) forever, so the sticks are silently, permanently dead while
+     * the buttons -- which do not need the extended mode -- keep working. That is
+     * exactly the reported symptom, and it is why it seemed intermittent: it depended
+     * on whether you had opened a dialog yet.
+     *
+     * Re-asserting is idempotent and costs one syscall per poll on a dedicated 60Hz
+     * input thread -- ~60/second, against the ~47,000/second this pass just removed
+     * from the buffer path. Cheap enough that "make it impossible to lose" beats any
+     * cleverer detection.
+     *
+     * The call returns the PREVIOUS mode, so it also tells us when something really
+     * did steal it. Logged once, because if this hypothesis is wrong the log will say
+     * so instead of silently claiming a fix. */
+    {
+        const int rc = sceCtrlSetSamplingModeExt(SCE_CTRL_MODE_ANALOG_WIDE);
+        /* Report the raw return ONCE, without interpreting it. sceCtrlSetSamplingMode
+         * is widely said to return the PREVIOUS mode, but psp2/ctrl.h documents no
+         * return value at all -- so a log line claiming "the mode had been reset to N"
+         * would be asserting a contract this header does not state. One factual line
+         * settles it from a real device instead: if it is the previous mode, a healthy
+         * first poll reads 2 (ANALOG_WIDE, set by controls_init) and anything else
+         * means something took the pad. The re-assert above does not depend on any of
+         * this -- it is unconditional and idempotent. */
+        static int s_reported = 0;
+        if (!s_reported) {
+            s_reported = 1;
+            l_info("INPUT: ctrl sampling mode re-asserted every poll; first call "
+                   "returned %d (expected 2 = ANALOG_WIDE if this returns the "
+                   "previous mode)", rc);
+        }
+    }
+
+    /* ☠ CHECK THE PEEK. `pad` is an uninitialised stack struct, and this call's
+     * return value was being discarded -- so any failed peek fed STACK GARBAGE
+     * straight into the input system: pad.buttons became a random bitmask (spurious
+     * presses AND releases, since the code diffs against the previous frame) and
+     * pad.lx/ly/rx/ry became random stick deflections. That is "the controls act
+     * weird sometimes" exactly.
+     *
+     * poll_touch() twenty lines below already got this right, and its comment states
+     * the rule this path was missing: skipping a poll is harmless, inventing input is
+     * not. Same rule, same fix. */
+    if (sceCtrlPeekBufferPositiveExt2(0, &pad, 1) < 0) {
+        return;
+    }
 
     // Gamepad buttons
     old_buttons = current_buttons;

@@ -7,6 +7,7 @@
  * of the MIT license. See the LICENSE file for details.
  */
 
+#include <signal.h>
 #include "reimpl/sys.h"
 
 #include <sys/errno.h>
@@ -100,7 +101,7 @@ int clock_gettime_soloader(clockid_t clock_id, struct timespec * tp) {
             break;
         }
         default:
-            l_error("clock_gettime / unexpected clock id %i", clock_id);
+            l_error("clock_gettime / unexpected clock id %lu", (unsigned long)clock_id);
     }
     return 0;
 }
@@ -113,6 +114,29 @@ int clock_getres_soloader(clockid_t clock_id, struct timespec * res) {
 clock_t clock_soloader(void) { return sceKernelGetProcessTimeLow(); }
 
 int sigaction(int signum, const struct sigaction * act, struct sigaction * oldact) {
+    /* This returned 0 -- success -- while installing nothing, so the engine
+     * believed its handler was in place when it was not. The engine only ever
+     * asks for signal 13 (SIGPIPE), which it installs before socket work, since
+     * on POSIX a write to a closed socket raises SIGPIPE and the DEFAULT action
+     * terminates the process instantly: no core dump, no unwinding, nothing in
+     * the log. We force PlatformIsConnectedToInternet true, so the menu really
+     * does try to reach services.telltalegames.com, which we then force offline.
+     *
+     * Actually honouring the request is not possible here, but ignoring SIGPIPE
+     * is what every networked program does and removes the failure mode entirely.
+     * Reported once per signal so it stays visible without flooding.
+     *
+     * NOTE: unproven as the cause of the menu death. Vita sockets are sceNet and
+     * may never raise POSIX signals, in which case this changes nothing and the
+     * real cause is still open. It is fixed because it is wrong either way. */
+    if (signum == 13 /* SIGPIPE */) {
+        signal(SIGPIPE, SIG_IGN);
+        l_info("sigaction(SIGPIPE): ignoring the signal (was silently a no-op that "
+               "left the default 'terminate process' action in place)");
+        if (oldact) memset(oldact, 0, sizeof(*oldact));
+        (void)act;
+        return 0;
+    }
     l_warn("sigaction(%i, ...): not implemented", signum);
     return 0;
 }

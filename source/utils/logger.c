@@ -30,8 +30,15 @@ static char buffer_b[2048];
 static int _log_enabled = -1; /* -1 unchecked, 1 enabled, 0 disabled */
 static int log_enabled_locked(void) {
     if (_log_enabled < 0) {
-        SceUID f = sceIoOpen(DATA_PATH "nolog.txt", SCE_O_RDONLY, 0);
-        if (f < 0) f = sceIoOpen("ux0:data/mcsm/nolog.txt", SCE_O_RDONLY, 0);
+        /* settings/ first, then the data root -- the same order
+         * mcsm_open_setting() uses. (The previous second attempt retried
+         * "ux0:data/mcsm/nolog.txt", which is what DATA_PATH already expands to,
+         * so settings/ was never consulted at all.)
+         * Kept as raw sceIoOpen rather than mcsm_open_setting: this runs
+         * under the log mutex, and that helper lives in utils.c, which logs
+         * on failure -- re-entering the logger while it holds its own lock. */
+        SceUID f = sceIoOpen(DATA_PATH "settings/nolog.txt", SCE_O_RDONLY, 0);
+        if (f < 0) f = sceIoOpen(DATA_PATH "nolog.txt", SCE_O_RDONLY, 0);
         if (f >= 0) { sceIoClose(f); _log_enabled = 0; }
         else _log_enabled = 1;
     }
@@ -46,8 +53,15 @@ static int log_enabled_locked(void) {
 static int _log_sync = -1; /* -1 unchecked, 1 sync-every-line, 0 batched */
 static int log_sync_locked(void) {
     if (_log_sync < 0) {
-        SceUID f = sceIoOpen(DATA_PATH "logsync.txt", SCE_O_RDONLY, 0);
-        if (f < 0) f = sceIoOpen("ux0:data/mcsm/logsync.txt", SCE_O_RDONLY, 0);
+        /* settings/ first, then the data root -- the same order
+         * mcsm_open_setting() uses. (The previous second attempt retried
+         * "ux0:data/mcsm/logsync.txt", which is what DATA_PATH already expands to,
+         * so settings/ was never consulted at all.)
+         * Kept as raw sceIoOpen rather than mcsm_open_setting: this runs
+         * under the log mutex, and that helper lives in utils.c, which logs
+         * on failure -- re-entering the logger while it holds its own lock. */
+        SceUID f = sceIoOpen(DATA_PATH "settings/logsync.txt", SCE_O_RDONLY, 0);
+        if (f < 0) f = sceIoOpen(DATA_PATH "logsync.txt", SCE_O_RDONLY, 0);
         if (f >= 0) { sceIoClose(f); _log_sync = 1; }
         else _log_sync = 0;
     }

@@ -50,8 +50,6 @@
 #include <libc_bridge/libc_bridge.h>
 #endif
 
-#include <SLES/OpenSLES.h>
-#include <SLES/OpenSLES_Android.h>
 
 #include "reimpl/errno.h"
 #include "reimpl/io.h"
@@ -241,9 +239,6 @@ static void *gzopen_soloader(const char *path, const char *mode) {
     return NULL;
 }
 
-extern SLresult slCreateEngine_soloader_opensl(SLObjectItf *pEngine, SLuint32 numOptions,
-        const SLEngineOption *pEngineOptions, SLuint32 numInterfaces,
-        const SLInterfaceID *pInterfaceIds, const SLboolean *pInterfaceRequired);
 
 #ifndef USE_PVR_PSP2
 /* vitaGL is a GLES2 SUBSET and does not implement these functions, but the
@@ -727,7 +722,7 @@ so_default_dynlib default_dynlib[] = {
         { "glCreateShader", (uintptr_t)&glCreateShader },
         { "glCullFace", (uintptr_t)&glCullFace },
         { "glCurrentPaletteMatrixOES", (uintptr_t)&ret0 },
-        { "glDeleteBuffers", (uintptr_t)&glDeleteBuffers },
+        { "glDeleteBuffers", (uintptr_t)&glDeleteBuffers_soloader },
         { "glDeleteFramebuffers", (uintptr_t)&glDeleteFramebuffers },
         { "glDeleteFramebuffersOES", (uintptr_t)&glDeleteFramebuffers },
         { "glDeleteProgram", (uintptr_t)&glDeleteProgram },
@@ -961,14 +956,6 @@ so_default_dynlib default_dynlib[] = {
 
         // OpenSL ES. FMOD can resolve these through direct imports, an
         // explicit libOpenSLES.so handle, or the global dlopen handle.
-        { "slCreateEngine", (uintptr_t)&slCreateEngine_soloader_opensl },
-        { "SL_IID_ENGINE", (uintptr_t)&SL_IID_ENGINE },
-        { "SL_IID_OUTPUTMIX", (uintptr_t)&SL_IID_OUTPUTMIX },
-        { "SL_IID_PLAY", (uintptr_t)&SL_IID_PLAY },
-        { "SL_IID_VOLUME", (uintptr_t)&SL_IID_VOLUME },
-        { "SL_IID_BUFFERQUEUE", (uintptr_t)&SL_IID_BUFFERQUEUE },
-        { "SL_IID_ANDROIDSIMPLEBUFFERQUEUE", (uintptr_t)&SL_IID_ANDROIDSIMPLEBUFFERQUEUE },
-        { "SL_IID_ANDROIDCONFIGURATION", (uintptr_t)&SL_IID_ANDROIDCONFIGURATION },
 
 
         // Pthread
@@ -1337,7 +1324,6 @@ void *lookup_symbol_soloader_quiet(const char *symbol) {
     return lookup_symbol_soloader_internal(symbol, 0);
 }
 
-#define MCSM_DLOPEN_OPENSL_HANDLE ((void *)0x4F534C31u)
 
 static int is_opensl_library_name(const char *filename) {
     if (!filename) {
@@ -1351,11 +1337,19 @@ static int is_opensl_library_name(const char *filename) {
 void *dlopen_soloader(const char *filename, int flags) {
     (void)flags;
     if (is_opensl_library_name(filename)) {
+        /* OPENSL REMOVED (2026-07-29). We used to return a fake handle here and
+         * synthesise the whole OpenSL ES object model so FMOD's ANDROID backend
+         * would hand us PCM. Audio now goes through a real FMOD output plugin
+         * (fmod_output_vita.c) straight to sceAudioOut, so this library genuinely
+         * does not exist any more. Report it as missing -- which is the truth --
+         * rather than pretending, so nothing can silently route down a path that
+         * is no longer implemented. */
         static unsigned s_logged = 0;
-        if (s_logged++ < 8U) {
-            l_info("dlopen: %s -> OpenSL SceAudioOut bridge", filename ? filename : "(null)");
+        if (s_logged++ < 4U) {
+            l_info("dlopen: %s -> NOT AVAILABLE (OpenSL removed; audio is the FMOD output plugin)",
+                   filename ? filename : "(null)");
         }
-        return MCSM_DLOPEN_OPENSL_HANDLE;
+        return NULL;
     }
 
     static unsigned s_logged = 0;
@@ -1365,42 +1359,12 @@ void *dlopen_soloader(const char *filename, int flags) {
     return (void *)1;
 }
 
-static void *opensl_bridge_dlsym(const char *symbol) {
-    if (!symbol) return NULL;
-    if (strcmp(symbol, "slCreateEngine") == 0)                   return (void *)&slCreateEngine_soloader_opensl;
-    if (strcmp(symbol, "SL_IID_ENGINE") == 0)                    return (void *)&SL_IID_ENGINE;
-    if (strcmp(symbol, "SL_IID_OUTPUTMIX") == 0)                 return (void *)&SL_IID_OUTPUTMIX;
-    if (strcmp(symbol, "SL_IID_PLAY") == 0)                      return (void *)&SL_IID_PLAY;
-    if (strcmp(symbol, "SL_IID_VOLUME") == 0)                    return (void *)&SL_IID_VOLUME;
-    if (strcmp(symbol, "SL_IID_BUFFERQUEUE") == 0)               return (void *)&SL_IID_BUFFERQUEUE;
-    if (strcmp(symbol, "SL_IID_ANDROIDSIMPLEBUFFERQUEUE") == 0)  return (void *)&SL_IID_ANDROIDSIMPLEBUFFERQUEUE;
-    if (strcmp(symbol, "SL_IID_ANDROIDCONFIGURATION") == 0)      return (void *)&SL_IID_ANDROIDCONFIGURATION;
-    if (strcmp(symbol, "SL_IID_RECORD") == 0)                    return (void *)&SL_IID_RECORD;
-    return NULL;
-}
 
 void *dlsym_soloader(void * handle, const char * symbol) {
-    if (handle == MCSM_DLOPEN_OPENSL_HANDLE) {
-        void *sl = opensl_bridge_dlsym(symbol);
-        if (sl) {
-            static int s_logged = 0;
-            if (s_logged < 16) { l_info("dlsym: OpenSL '%s' -> SceAudioOut bridge", symbol); s_logged++; }
-            return sl;
-        }
-        l_error("dlsym: OpenSL bridge missing symbol \"%s\".", symbol ? symbol : "(null)");
-        return NULL;
-    }
-    {
-        void *sl = opensl_bridge_dlsym(symbol);
-        if (sl) {
-            static int s_logged_global = 0;
-            if (s_logged_global < 16) {
-                l_info("dlsym: global OpenSL '%s' -> SceAudioOut bridge", symbol);
-                s_logged_global++;
-            }
-            return sl;
-        }
-    }
+    /* The OpenSL bridge that used to be consulted here is gone (see dlopen_soloader):
+     * audio is a real FMOD output plugin now, so every symbol goes to the normal
+     * loader lookup. */
+    (void)handle;
     return lookup_symbol_soloader_internal(symbol, 1);
 }
 

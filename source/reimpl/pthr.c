@@ -205,7 +205,7 @@ static int g_core3_mask = -1; /* -1=unresolved, else the mask to apply */
 static int mcsm_resolve_core_mask(void) {
     if (g_core3_mask >= 0) return g_core3_mask;
     int want4 = 1;
-    FILE *f = fopen("ux0:data/mcsm/no_core3.txt", "r");
+    FILE *f = mcsm_open_setting("no_core3.txt", "r");
     if (f) { want4 = 0; fclose(f); }
     g_core3_mask = want4 ? 0x000F0000 : 0x00070000;
     return g_core3_mask;

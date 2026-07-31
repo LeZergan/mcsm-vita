@@ -91,6 +91,7 @@ bool file_copy(const char * path, const char * destination) {
     if (!file_save(destination, buffer, size)) {
         l_error("file_copy: Failed to write data to the specified "
                 "destination path \"%s\".", destination);
+        free(buffer);   /* the failure path leaked the whole source file */
         return false;
     }
 
@@ -101,6 +102,14 @@ bool file_copy(const char * path, const char * destination) {
 bool file_exists(const char * path) {
     SceIoStat stat;
     return sceIoGetstat(path, &stat) >= 0;
+}
+
+long long file_size(const char * path) {
+    SceIoStat stat;
+    if (sceIoGetstat(path, &stat) < 0) {
+        return -1;
+    }
+    return (long long)stat.st_size;
 }
 
 FILE * mcsm_open_setting(const char * basename, const char * mode) {
@@ -119,8 +128,7 @@ void mcsm_read_clock_cfg(McsmClockCfg * cfg) {
     /* Pinned 444 by default (arm_min == arm_max -> governor idle -> steadiest
      * fps). The battery profile sets clock=adaptive, dropping the floor to 266 so
      * the governor can downclock light frames to save power. */
-    cfg->governor_off = 0;
-    cfg->gpu = 222;
+    cfg->gpu = 222;   /* no config knob exists for the GPU clock; see utils.h */
     /* OVERCLOCK SUPPORT (2026-07-25). This used to hard-code 444 (stock max), so a
      * console running a CPU-overclock plugin gained nothing: the game simply never
      * asked for more. That mattered because the workload is ~70% SIM-bound, where
@@ -183,8 +191,14 @@ bool file_load(const char * path, uint8_t ** buffer, size_t * size) {
     *buffer = malloc(*size);
 
     if (!*buffer) {
-        l_error("file_load: Unable to allocate %d bytes of memory to load "
-                "the specified source file \"%s\".", path);
+        /* The size argument was MISSING here: two conversions, one argument, so
+         * %d printed `path` as an integer and %s then dereferenced whatever was in
+         * the next vararg slot. That faults in the one situation this line exists
+         * to describe -- malloc failure -- so the loader's OOM report was itself
+         * liable to crash and destroy the evidence. `*size` is size_t, hence %u
+         * with an explicit cast rather than %d. */
+        l_error("file_load: Unable to allocate %u bytes of memory to load "
+                "the specified source file \"%s\".", (unsigned)*size, path);
     #ifdef USE_SCELIBC_IO
         sceLibcBridge_fclose(f);
     #else

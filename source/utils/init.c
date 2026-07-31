@@ -13,7 +13,6 @@
 #include "utils/glutil.h"
 #ifdef USE_PVR_PSP2
 #include "utils/pvr_init.h"
-#include "utils/loading_screen.h"
 #endif
 #include "utils/logger.h"
 #include "utils/utils.h"
@@ -405,16 +404,22 @@ static void seed_empty_prefs_files(void) {
         DATA_PATH "Temp/prefs.prop",
         DATA_PATH "Temp/user.prop",
         DATA_PATH "Temp/game_prefs.prop",
-        /* End-of-chapter player choices (ChoiceStats_SaveSeen serializes them to
-         * "choicestats.prop") save via the SAME write-over-existing-file-only path
-         * as SavePrefs, so without a pre-existing file the save early-outs and the
-         * choices never persist. Seed it like the prefs files. */
+        /* choicestats.prop -- the "which choice screens has this player seen" list.
+         * Kept for the case where the engine resolves the bare name directly.
+         * ☠ NOTE, from reading the shipped choicestats.lua constant table: the real
+         * copy lives INSIDE the save bundle, not as a loose file --
+         *     read:  BundleGetResource(SaveLoad_GetSlot(), "choicestats.prop")
+         *     write: BundleCreateResource(...) + PropertyCreate("Seen", ...) + Save(bundle)
+         * so these two files are a harmless belt-and-braces seed, NOT the thing the
+         * game actually reads. The save-bundle redirects are what make that path work. */
         DATA_PATH "choicestats.prop",
         DATA_PATH "Temp/choicestats.prop",
         /* Cross-chapter choice carryover ("next chapter" presenter): the game
          * saves the choice_tracker document to logical:<User>/choice.prop via
          * SaveDownloadedDocumentAsPropertySet. Same write-over-existing rule ->
-         * seed it too, or the carryover is inconsistent/empty. */
+         * seed it too, or the carryover is inconsistent/empty.
+         * ☠ choice.prop is handled by mirror_crowd_choice_data() FIRST -- see there;
+         * an empty seed here is the last resort, not the normal case. */
         DATA_PATH "choice.prop",
         DATA_PATH "Temp/choice.prop",
     };
@@ -430,6 +435,61 @@ static void seed_empty_prefs_files(void) {
         } else {
             l_warn("SAVESEED: could not create %s errno=%d", k_paths[i], errno);
         }
+    }
+}
+
+/* ★ CROWD-CHOICE DATA IS READ FROM <Temp>, BUT SHIPS AT THE DATA ROOT.
+ *
+ * The "how your choices compare" screen reads a pre-baked ~114KB choice.prop. All of
+ * its readers are redirected to logical:<Temp>/, so the file the game actually opens
+ * is DATA_PATH "Temp/choice.prop" -- while the copy that ships with the data drop
+ * naturally lands at DATA_PATH "choice.prop".
+ *
+ * If only the root copy is present, seed_empty_prefs_files() would then create an
+ * EMPTY Temp/choice.prop, and that is the worst of both worlds: ResourceExists says
+ * yes (so the game offers the stats screen and never says "offline") while
+ * PropertyGet finds nothing (so the screen is blank), and the empty file blocks any
+ * later repair because it now "exists". Nothing in the log would say why.
+ *
+ * So mirror the real file into place first, in whichever direction has the content.
+ * Runs BEFORE the empty-seed pass; a non-empty file is never overwritten. */
+static void mirror_crowd_choice_data(void) {
+    static const char *const kRoot = DATA_PATH "choice.prop";
+    static const char *const kTemp = DATA_PATH "Temp/choice.prop";
+
+    const long long root_sz = file_size(kRoot);
+    const long long temp_sz = file_size(kTemp);
+
+    const char *src = NULL, *dst = NULL;
+    if (root_sz > 0 && temp_sz <= 0) { src = kRoot; dst = kTemp; }
+    else if (temp_sz > 0 && root_sz <= 0) { src = kTemp; dst = kRoot; }
+    if (!src) {
+        if (root_sz <= 0 && temp_sz <= 0) {
+            l_warn("CHOICEDATA: no crowd choice.prop with content at %s or %s — the "
+                   "end-of-episode \"%% of players\" screen will have nothing to show",
+                   kRoot, kTemp);
+        } else {
+            /* ☠ SAY THE HEALTHY CASE OUT LOUD. Both copies present meant this
+             * function returned in silence, so the ONLY subsystem whose failure mode
+             * is a silently blank screen left no trace either way -- device log
+             * 2026-07-31 contained not one CHOICEDATA line, which is indistinguishable
+             * from the code never having run. One line, once per boot. */
+            l_info("CHOICEDATA: crowd choice.prop present at both %s (%lld bytes) and "
+                   "%s (%lld bytes) — nothing to mirror", kRoot, root_sz, kTemp, temp_sz);
+        }
+        return;
+    }
+
+    /* An existing zero-byte file at the destination has to go, or file_copy would be
+     * writing into the very placeholder that caused the problem. */
+    if (file_exists(dst)) {
+        remove(dst);
+    }
+    if (file_copy(src, dst)) {
+        l_info("CHOICEDATA: mirrored crowd choice.prop %s -> %s (%lld bytes)",
+               src, dst, src == kRoot ? root_sz : temp_sz);
+    } else {
+        l_warn("CHOICEDATA: could not mirror %s -> %s", src, dst);
     }
 }
 
@@ -579,11 +639,53 @@ static void initialize_all_modules(void) {
 }
 
 void soloader_init_all() {
-    log_reset_file();
+    /* ☠ log_reset_file() USED TO BE HERE, AND IT DESTROYED EVIDENCE.
+     * telemetry_reset() at the top of main() already truncates DATA_PATH
+     * "loader.log"; main() then logs `main entered`, the telemetry path, the compile
+     * date/time, the heap size, and -- since r100 -- whether the boot picture came
+     * up. Truncating the SAME file again here threw all of that away, so the log a
+     * tester sends back could never contain the one line that says whether pic0 was
+     * shown. Reset moved to the first statement of main(), ahead of every writer. */
     /* BUILD STAMP — first line of every log so old vs new eboot is unmistakable.
      * If this line is ABSENT, an OLD eboot is running (VitaShell kept it on a
      * same-Title-ID install → delete the bubble and reinstall). */
-    telemetry_log("BOOT", "BUILD=2026-07-29-r43 (REAL FMOD OUTPUT PLUGIN for sceAudioOut, FMOD 1.06.08 ABI, polling mode - opt-in via fmod_output.txt=plugin; replaces the OpenSL ES impersonation + feed thread)");
+    /* telemetry_stamp, NOT telemetry_log: the stamp has to survive
+     * ENABLE_TELEMETRY_LOGGING=OFF, or a production/test build is unidentifiable
+     * from its own log -- which is precisely how a stale eboot gets measured. */
+    telemetry_stamp("[BOOT] BUILD=2026-07-31-r109-RELEASE");
+    /* What changed, in the order it matters:
+     * 1. NO BOOT PICTURE, AND NO OVERLAY. r100 held pic0 until the engine drew its
+     *    first frame; on device that made the (legitimately multi-minute) asset load
+     *    look like a frozen picture rather than a black screen, which reads as a
+     *    hang, so it was removed in r101 along with splash.c/.h and splash.raw. The
+     *    procedural loading-screen overlay (loading_screen.c, loadscreen.txt /
+     *    noloadscreen.txt) is gone too. The boot is blank until the engine presents.
+     *    ☠ THE LOAD LENGTH IS UNCHANGED by any of this -- the picture only ever
+     *    altered what was on screen while it happened.
+     * 0. STICK/PAD INPUT (r105). Two independent causes of "the controls work, then
+     *    stop": (a) sceCtrlSetSamplingModeExt was set ONCE at boot, and any common
+     *    dialog / PS-button overlay / resume hands the pad back in the SYSTEM default
+     *    mode, after which every axis reads dead-centre forever while buttons keep
+     *    working; (b) sceCtrlPeekBufferPositiveExt2's return value was discarded, so a
+     *    failed peek fed uninitialised stack memory in as buttons and stick positions.
+     *    Both fixed in reimpl/controls.c; touch sampling got the same re-assert.
+     * 1b. IDLE TIMER TICKED DURING THE LOAD (r102). sceKernelPowerTick only ran from
+     *    gl_swap, which does not run until the engine's first present -- so for the
+     *    whole multi-minute asset load NOTHING kept the console awake. Now ticked
+     *    once a second from the watchdog thread as well. See the note in main.c.
+     * 2. CHOICES SAVE. menu_stats.lua writes the choice_tracker document to
+     *    "logical://<User>/choice.prop" -- TWO slashes -- and the redirect only
+     *    matched one, so that write went to a location that does not bind on this
+     *    port and was dropped. Both spellings are accepted now. Nothing about this
+     *    needed the game to be online.
+     * 3. CROWD DATA. The pre-baked choice.prop is mirrored between the data root
+     *    and Temp/ so the "% of players chose" screen is never fed a zero-byte
+     *    placeholder that the loader created itself.
+     * 4. TROPHIES. The set is registered ONCE, not on every launch: the setup
+     *    dialog only runs when the system does not already know the set. The comm
+     *    id also agreed with nothing before -- packaged as MCSM00002_00, requested
+     *    as MCSM00001, declared as MCSM00001_00 inside the pack -- which meant no
+     *    trophies at all on a fresh install. All three are MCSM00002 now. */
     telemetry_log("BOOT", "soloader_init_all start");
 
 	// Launch `app0:configurator.bin` on `-config` init param
@@ -649,10 +751,6 @@ void soloader_init_all() {
         const int fb_h = mcsm_get_framebuffer_height();
         l_info("PVR: initializing EGL early before Android module init...");
         pvr_init_gl(fb_w, fb_h);
-        loading_screen_init(fb_w, fb_h);
-        loading_screen_set_status("Native libraries loading...");
-        loading_screen_set_progress(0.15f);
-        loading_screen_render();
         pvr_release_current();
     }
 #endif
@@ -664,6 +762,7 @@ void soloader_init_all() {
     ensure_minecraft102_descriptor();
     ensure_all_chapter_descriptors();   /* CH3-CH8: auto-detect any chapter whose archives are present */
     migrate_stranded_saves();
+    mirror_crowd_choice_data();   /* MUST precede the empty seed — see there */
     seed_empty_prefs_files();
     seed_shader_cache();
 

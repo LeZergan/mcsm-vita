@@ -1,0 +1,69 @@
+# MCSM Vita trophy definitions -> TROPHY.TRP (see make_trophy_pack.py)
+#
+# All 51 names/descriptions/grades are the OFFICIAL retail list, taken from a saved
+# PSNProfiles page. Grade totals check out: 1 platinum, 8 gold, 19 silver, 23 bronze.
+#
+# ID MAPPING IS EVIDENCED, NOT ASSUMED: trophy id = (PSNProfiles number - 1), so
+# PSN #1 (the platinum) is id 000. That was cross-checked against a completely
+# independent grouping derived from WHICH .ttarch2 archive fires each
+# AchievementManager_Unlock -- every episode boundary agrees:
+#     Ep1 1..7  Ep2 8..13  Ep3 14..19  Ep4 21..26
+#     Ep5 27..32 Ep6 33..38 Ep7 39..44  Ep8 45..50
+# The ids that archive scan did not see (7,13,20,26,32,44) are the Chapter 6
+# finales plus the Reuben special -- fired from end-of-episode scripts, not the
+# chapter scenes, which is exactly why they were absent.
+npcommid = MCSM00002_00
+title    = Minecraft: Story Mode
+detail   = A Telltale Games Series
+# id  | grade | name | detail
+000 | P | Chip Off the Old Block | Earned all Trophies
+001 | B | New Kid on the Block | Completed Chapter 1 of Episode 1
+002 | G | Leveraging Resources | Attempt to craft a lever at the crafting table
+003 | B | Some Assembly Required | Completed Chapter 2 of Episode 1
+004 | B | To Catch a Thief | Completed Chapter 3 of Episode 1
+005 | S | Out of the Frying Pan… | Completed Chapter 4 of Episode 1
+006 | S | Safety First | Completed Chapter 5 of Episode 1
+007 | S | The Calm Before the Storm | Completed Chapter 6 of Episode 1
+008 | B | Nether Say Die | Completed Chapter 1 of Episode 2
+009 | B | Griefer Madness | Acquired the Griefer
+010 | B | Occam's Razor | Acquired the Engineer
+011 | S | No Time to Lose | Completed Chapter 4 of Episode 2
+012 | S | In the Shadow of Giants | Completed Chapter 5 of Episode 2
+013 | G | Left Behind | Completed Chapter 6 of Episode 2
+014 | B | Back to the Grind | Completed Chapter 1 of Episode 3
+015 | B | A World of Pure Imagination | Completed Chapter 2 of Episode 3
+016 | B | Pretender Man | Completed Chapter 3 of Episode 3
+017 | S | When a Plan Comes Together | Completed Chapter 4 of Episode 3
+018 | S | Blockbuster | Completed Chapter 5 of Episode 3
+019 | S | Out With A Bang | Completed Chapter 6 of Episode 3
+020 | G | That's Some Pig | Exhaust your conversation with Reuben
+021 | B | Dramatic Timing | Completed Chapter 1 of Episode 4
+022 | B | In a Land Far Away | Completed Chapter 2 of Episode 4
+023 | S | It Came From Outer Space | Completed Chapter 3 of Episode 4
+024 | S | The End of the Line | Completed Chapter 4 of Episode 4
+025 | S | From the Jaws of Defeat | Completed Chapter 5 of Episode 4
+026 | G | A New World Order | Completed Chapter 6 of Episode 4
+027 | B | Finders Keepers | Completed Chapter 1 of Episode 5
+028 | B | Losers Weepers | Completed Chapter 2 of Episode 5
+029 | B | Friends in High Places | Completed Chapter 3 of Episode 5
+030 | S | Castles in the Sky | Completed Chapter 4 of Episode 5
+031 | S | Out of the Blue | Completed Chapter 5 of Episode 5
+032 | G | To Boldly Go… | Completed Chapter 6 of Episode 5
+033 | B | Invitation to Die For | Completed Chapter 1 of Episode 6
+034 | B | Mr. Sandman | Completed Chapter 2 of Episode 6
+035 | B | Killer Instincts | Completed Chapter 3 of Episode 6
+036 | S | The Science of Deduction | Completed Chapter 4 of Episode 6
+037 | S | From the Ashes | Completed Chapter 5 of Episode 6
+038 | G | Elementary, My Dear Jesse. | Completed Chapter 6 of Episode 6
+039 | B | Fighting Words | Completed Chapter 1 of Episode 7
+040 | B | Mining for Trouble | Completed Chapter 2 of Episode 7
+041 | B | Trust Falling | Completed Chapter 3 of Episode 7
+042 | S | Ghost in the Machine | Completed Chapter 4 of Episode 7
+043 | S | Breaking and Entering | Completed Chapter 5 of Episode 7
+044 | G | Offline Mode | Completed Chapter 6 of Episode 7
+045 | B | Let the Games Begin | Completed Chapter 1 of Episode 8
+046 | B | Playing for Keeps | Completed Chapter 2 of Episode 8
+047 | B | Challenge: Accepted | Completed Chapter 3 of Episode 8
+048 | S | The Most Dangerous Game | Completed Chapter 4 of Episode 8
+049 | S | Gaming the System | Completed Chapter 5 of Episode 8
+050 | G | To the Victor Go the Spoils | Completed Chapter 6 of Episode 8

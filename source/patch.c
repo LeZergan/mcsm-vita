@@ -31,24 +31,6 @@
 #include "utils/utils.h"
 #include "utils/config.h"
 
-/* Live loading-screen hooks: track the current asset + a boot/load timer.
- * In PVR mode, redraws are opportunistic: loading_screen_tick() renders only
- * when the single EGL context is already current here or is not owned by the
- * engine render thread. */
-#include "utils/loading_screen.h"
-#ifdef USE_PVR_PSP2
-#define LS_SET_ASSET(n) loading_screen_set_asset(n)
-#define LS_TICK()       loading_screen_tick()
-#define LS_DONE()       loading_screen_mark_loaded()
-#else
-#define LS_SET_ASSET(n) ((void)0)
-#define LS_TICK()       ((void)0)
-#define LS_DONE()       ((void)0)
-/* Set while a scene is loading so glutil's texture-upload path animates the
- * loading screen instead of letting the sim freeze appear "stuck". Defined in
- * glutil.c (vitaGL build). */
-extern int g_scene_loading;
-#endif
 
 extern so_module so_mod_gameengine;
 extern so_module so_mod_fmod;
@@ -106,7 +88,6 @@ static so_hook g_hook_gamewindow_mouse_up;
 static so_hook g_hook_touch_set_legacy_pointer;
 static so_hook g_hook_fmod_studio_initialize;
 
-static int mcsm_mega_diag_enabled(void);
 
 static uintptr_t g_renderframe_push_view_addr = 0;
 static size_t g_renderframe_push_view_size = 0;
@@ -122,12 +103,105 @@ static int g_animation_flag_symbols_resolved = 0;
  * threads doing async resource loading aren't starved by the render thread
  * spinning at ~490fps (it presents but vsync is off, so it never blocks). */
 static volatile int g_boot_scene_active = 0;
-/* 1 while the current opened scene is a MENU (ui_boot / ui_menuMain / episode
- * select). Set in hook_lua_sceneopen. Used to report "online" (internet +
- * license server) ONLY during gameplay: the crowd-choice stats need online at
- * end-of-episode, but reporting online at the MENU makes it show the "sign up
- * for full access" upsell banner. Default 1 (we start at the boot menu). */
-static volatile int g_at_menu = 1;
+/* PER-CHARACTER UPLOAD PROBE (2026-07-30) -----------------------------------
+ * These count what the T3VertexBuffer / T3IndexBuffer hooks actually do each
+ * frame. They exist because the existing logs CANNOT answer it: the lock log is
+ * capped at 16 lines/run and the AllocateGLBuffer log at 32, so both go quiet
+ * long before gameplay, and every conclusion about per-frame upload cost so far
+ * has been inference rather than measurement.
+ *
+ * Why this is the number that matters: T3VertexBuffer::PlatformLock/Unlock are
+ * reached from RenderObject_Mesh::DoSoftwareSkinning <- _RenderMeshInstance, so
+ * they run once per SKINNED MESH per FRAME -- they scale with character count,
+ * which is exactly the reported failure shape. Plain counters, no syscalls and
+ * no formatting on the hot path; mcsm_skin_report turns them into per-frame
+ * averages.
+ *
+ * CUMULATIVE, not per-frame, deliberately: the writer is the render thread and
+ * the reader is the watchdog thread, so a per-frame reset would race the read.
+ * Deltas over the report window give the same answer with no shared reset. Bytes
+ * accumulate in KILOBYTES so a u32 cannot wrap in a session (a skinned vertex
+ * buffer is always far more than 1KB, so the truncation is noise). */
+/* ☠ NOT volatile. These are updated 5-7 times per buffer lock/upload, ~790 times a
+ * frame, and `volatile` forces every one to a memory round trip and blocks the
+ * compiler from keeping or coalescing them in registers across the hottest non-GL
+ * loader code. One thread writes them; the watchdog reads them once per 10s and only
+ * needs a monotonically-increasing approximation -- exactly the reasoning
+ * launch_state.c already applies to g_draw_serial. */
+static uint32_t g_vb_locks = 0;     /* T3VertexBuffer::PlatformLock calls   */
+static uint32_t g_vb_respec = 0;    /* full glBufferData respecifies        */
+static uint32_t g_vb_kb = 0;        /* KB pushed through those respecifies  */
+static uint32_t g_vb_mallocs = 0;   /* CPU staging buffers malloc'd + freed */
+/* Size distribution: the per-frame COST is bytes, not call count, and the sizes
+ * span three orders of magnitude (the boot log alone shows 32 B up to 262140 B),
+ * so an average alone would be misleading. Largest respecify seen tells us
+ * whether the traffic is a few big shared pools or many per-character buffers. */
+static uint32_t g_vb_max_bytes = 0;
+/* Which thread pays. This decides whether the cost lands inside the measured
+ * sim budget (hook_gameengine_loop's sim_us) or on the render/present side, and
+ * therefore whether removing it moves the number we actually care about.
+ * Sampled 1-in-256 so the syscall is not on the per-mesh path. */
+static uint32_t g_vb_tid = 0;
+/* Effectiveness counters for the two overhead fixes: how many uploads took the
+ * no-allocation glBufferSubData path, and how many locks reused a staging buffer
+ * instead of allocating. Both should dominate their totals once warm. */
+static uint32_t g_vb_subdata = 0;
+static uint32_t g_vb_reuse = 0;
+static uint32_t g_vb_evict = 0;   /* table evictions -- if this tracks locks/f, the keys are transient */
+/* SIM BREAKDOWN (2026-07-30). DIP-SIM says the engine sim is a sustained 25-27ms
+ * against a 16.7ms budget, and frames land at 41ms -- so ~26ms sim + ~15ms other.
+ * Knowing WHICH of the two once-per-frame animation entry points owns that 26ms is
+ * the difference between cutting it and guessing at it. Both functions are already
+ * hooked and both are called exactly once per frame from one thread, so timing them
+ * costs 4 syscalls/frame and adds no new hook risk. Accumulated in us; the reporter
+ * divides by frames. */
+/* ★ THE SIM IS NOT PURE SIMULATION. GameEngine::Loop calls GameEngine::Render at
+ * +0x1ec (0xcb304c), so the DIP-SIM "work=26-40ms" figure this project has been
+ * optimising against for weeks INCLUDES render submission -- the ~890 draw calls.
+ * Both functions were already hooked; timing the inner one splits the number.
+ * Scene::UpdateScenes and ScriptManager::Update are the two largest remaining
+ * phases by inspection of Loop's call order, and both are once-per-frame and
+ * single-threaded, so SO_CONTINUE on them is safe (~15us each). */
+static volatile uint32_t g_render_us = 0, g_render_n = 0;
+static volatile uint32_t g_scene_us = 0, g_scene_n = 0;
+static volatile uint32_t g_script_us = 0, g_script_n = 0;
+
+/* ★ PHASE TIMERS ARE NOW GATED (2026-07-30), like the per-draw diagnostics already
+ * were. Each instrumented phase brackets its target with TWO
+ * sceKernelGetSystemTimeWide() calls; across render/chore/playback/scenes/script
+ * that is at least ten syscalls a frame, and more wherever a phase runs more than
+ * once. They exist to answer "where does the frame go", which the r82 device run
+ * answered: render ~75%, animation ~11%, scenes+script ~0. Unlike the glDrawElements
+ * diagnostics these were NOT behind MCSM_FAST_FINAL_RUNTIME, so they shipped.
+ * Build with -DMCSM_FAST_FINAL_RUNTIME=0 to measure again; SIMSPLIT then reports as
+ * before and reads 0.000ms everywhere in a normal build, which is the intended tell
+ * that instrumentation is off rather than that the phases are free. */
+#ifndef MCSM_FAST_FINAL_RUNTIME
+#define MCSM_FAST_FINAL_RUNTIME 1
+#endif
+#if MCSM_FAST_FINAL_RUNTIME
+#define MCSM_PHASE_T0()             (0ULL)
+#define MCSM_PHASE_ADD(acc, n, t0)  ((void)(t0))
+#else
+#define MCSM_PHASE_T0()             sceKernelGetSystemTimeWide()
+#define MCSM_PHASE_ADD(acc, n, t0)  \
+    do { (acc) += (uint32_t)(sceKernelGetSystemTimeWide() - (t0)); (n)++; } while (0)
+#endif
+/* [X] ARM PMU COUNTERS: ATTEMPTED AND REMOVED (2026-07-30).
+ * scePerfArmPmon* crashed before the first frame. Cause, from the VitaSDK headers:
+ *     psp2/power.h :  usergroup{ScePower}    <- user mode, works
+ *     psp2/perf.h  :  kernelgroup{ScePerf}   <- KERNEL ONLY
+ * They are kernel functions. ScePerf_stub links them, which is why the build was
+ * clean, but a user-mode call is not valid. Reading the ARM PMU needs a taihen
+ * kernel plugin (.skprx) -- a separate project, not a loader change.
+ * Razor is out too: librazorcapture_es4.suprx is not on retail firmware (searched
+ * vs0:/sys/external and every other partition). Wall-clock phase timing is the
+ * profiling we actually have. */
+static volatile uint32_t g_chore_us = 0;      /* ChoreInst::UpdateChoreInstances   */
+static volatile uint32_t g_pbc_us = 0;       /* PlaybackController::Update...      */
+static volatile uint32_t g_chore_n = 0, g_pbc_n = 0;
+static const uint32_t *g_render_caps_ptr = NULL;
+void mcsm_skin_report(void);                 /* defined next to mcsm_anim_report     */
 static volatile uintptr_t g_overlay_render_frame = 0;
 
 enum {
@@ -148,58 +222,6 @@ static fmod_system_set_output_fn g_fmod_system_set_output = NULL;
 static fmod_system_get_output_fn g_fmod_system_get_output = NULL;
 typedef int (*fmod_system_get_version_fn)(void *system, unsigned int *version);
 static fmod_system_get_version_fn g_fmod_system_get_version = NULL;
-
-static const char *fmod_output_name(int output) {
-    switch (output) {
-        case FMOD_OUTPUTTYPE_AUTODETECT: return "AUTODETECT";
-        case FMOD_OUTPUTTYPE_UNKNOWN: return "UNKNOWN";
-        case FMOD_OUTPUTTYPE_NOSOUND: return "NOSOUND";
-        case FMOD_OUTPUTTYPE_AUDIOTRACK: return "AUDIOTRACK";
-        case FMOD_OUTPUTTYPE_OPENSL: return "OPENSL";
-        case FMOD_OUTPUTTYPE_AUDIOOUT: return "AUDIOOUT";
-        default: return "UNRECOGNIZED";
-    }
-}
-
-static const char *fmod_result_name(int result) {
-    switch (result) {
-        case 0: return "FMOD_OK";
-        case 41: return "FMOD_ERR_OUTPUT_INIT";
-        case 54: return "FMOD_ERR_INVALID_PARAM";
-        case 70: return "FMOD_ERR_UNSUPPORTED";
-        default: return "FMOD_RESULT_UNKNOWN";
-    }
-}
-
-static int fmod_choose_forced_output(void) {
-    char path[256];
-    snprintf(path, sizeof(path), DATA_PATH "fmod_output.txt");
-    FILE *fp = fopen(path, "r");
-    if (!fp) {
-        fp = fopen("ux0:data/mcsm/fmod_output.txt", "r");
-    }
-    if (!fp) {
-        return FMOD_OUTPUTTYPE_OPENSL;
-    }
-
-    char buf[64];
-    char *line = fgets(buf, sizeof(buf), fp);
-    fclose(fp);
-    if (!line) {
-        return FMOD_OUTPUTTYPE_OPENSL;
-    }
-    if (strstr(line, "audiotrack") || strstr(line, "AUDIOTRACK") ||
-        strstr(line, "AudioTrack")) {
-        return FMOD_OUTPUTTYPE_AUDIOTRACK;
-    }
-    if (strstr(line, "autodetect") || strstr(line, "AUTODETECT")) {
-        return FMOD_OUTPUTTYPE_AUTODETECT;
-    }
-    if (strstr(line, "nosound") || strstr(line, "NOSOUND")) {
-        return FMOD_OUTPUTTYPE_NOSOUND;
-    }
-    return FMOD_OUTPUTTYPE_OPENSL;
-}
 
 static void resolve_fmod_audio_symbols(void) {
     if (!g_fmod_studio_get_low_level_system) {
@@ -257,8 +279,17 @@ static int hook_fmod_studio_initialize(void *studio_system,
     int output_before = -1;
     int output_after = -1;
     int get_low_result = -1;
-    int set_output_result = -1;
-    const int requested_output = fmod_choose_forced_output();
+    /* OPENSL REMOVED (2026-07-29). The loader no longer impersonates Android
+     * OpenSL ES: FMOD is driven by our own registered output plugin
+     * (fmod_output_vita.c) writing straight to sceAudioOut, which the device
+     * proved works -- 4142 mixer pulls, readfail=0, outfail=0.
+     *
+     * Forcing FMOD_OUTPUTTYPE_OPENSL here is therefore not just unnecessary but
+     * harmful: the OpenSL backend would try to dlopen libOpenSLES.so, which no
+     * longer exists, and could fail init before SetOutputByPlugin ever runs.
+     * AUTODETECT leaves FMOD's own choice alone for the brief window before the
+     * plugin takes over. */
+    const int requested_output = FMOD_OUTPUTTYPE_AUTODETECT;
 
     if (g_fmod_studio_get_low_level_system && g_fmod_system_set_output) {
         get_low_result = g_fmod_studio_get_low_level_system(studio_system, &low_level);
@@ -267,21 +298,53 @@ static int hook_fmod_studio_initialize(void *studio_system,
                 (void)g_fmod_system_get_output(low_level, &output_before);
             }
             if (requested_output != FMOD_OUTPUTTYPE_AUTODETECT) {
-                set_output_result = g_fmod_system_set_output(low_level, requested_output);
             } else {
-                set_output_result = 0;
             }
-            /* REAL FMOD OUTPUT PLUGIN. If fmod_output.txt says "plugin", register the
-             * sceAudioOut backend and switch the engine onto it instead of forcing
-             * FMOD's Android OpenSL backend and impersonating OpenSL ES underneath.
-             * Done here because this is the one place the low-level System exists
-             * before init, which is the only point registerOutput is legal. Falls
-             * back silently to the old path on any failure. */
+            /* MIX RATE (2026-07-30). FMOD was initialising its software mixer at
+             * 24000 Hz -- the Android build's mobile setting -- while the game's
+             * own audio is 44100. Decoding the FSB5 headers in
+             * MCSM_android_Minecraft101_voice.ttarch2: 200 of 200 banks are
+             * 44100 Hz MPEG mono. So the port was low-passing every line of
+             * dialogue and every music cue at 12 kHz (Nyquist) for no reason --
+             * the quality is already sitting in the shipped assets.
+             *
+             * Matching the mixer to the source is not merely free, it is likely
+             * cheaper: MP3 decode happens at 44100 regardless, and FMOD is
+             * currently resampling 44100 -> 24000 on every sample it mixes.
+             * Setting the format equal to the source removes that conversion.
+             * sceAudioOut takes 44100 natively (see clamp_audio_rate in java.c).
+             *
+             * Must be called before FMOD's init, which is exactly where we are --
+             * the same window that makes registerOutput legal. Override with
+             * ux0:data/mcsm/audio_rate.txt (e.g. 24000) if it ever misbehaves. */
+            if (low_level) {
+                int want_rate = 44100;
+                FILE *rf = mcsm_open_setting("audio_rate.txt", "r");
+                if (rf) {
+                    char b[16] = {0};
+                    if (fgets(b, sizeof(b), rf)) { int v = atoi(b); if (v >= 8000 && v <= 48000) want_rate = v; }
+                    fclose(rf);
+                }
+                typedef int (*setfmt_fn)(void *, int, int, int);
+                setfmt_fn setfmt = (setfmt_fn)so_symbol(&so_mod_fmod, "FMOD_System_SetSoftwareFormat");
+                if (setfmt) {
+                    int rc = setfmt(low_level, want_rate, 0 /* SPEAKERMODE_DEFAULT */, 0);
+                    l_info("FMODRATE: software mix rate -> %d Hz rc=%d (source assets are 44100; "
+                           "was 24000, which discarded everything above 12kHz)", want_rate, rc);
+                } else {
+                    l_warn("FMODRATE: FMOD_System_SetSoftwareFormat not found — staying at the engine default");
+                }
+            }
+
+            /* REAL FMOD OUTPUT PLUGIN. Registered here because this is the one
+             * place the low-level System exists before init, which is the only
+             * point registerOutput is legal. Unconditional: there is no OpenSL
+             * path to fall back to any more, so a failure here means no audio and
+             * says so in the log. */
             {
-                extern int mcsm_fmod_output_wanted(void);
                 extern int mcsm_fmod_output_install(void *, int (*)(void *, const void *, unsigned int *),
                                                     int (*)(void *, unsigned int));
-                if (low_level && mcsm_fmod_output_wanted()) {
+                if (low_level) {   /* unconditional: the plugin IS the audio path now */
                     typedef int (*reg_fn)(void *, const void *, unsigned int *);
                     typedef int (*setp_fn)(void *, unsigned int);
                     reg_fn  reg  = (reg_fn)so_symbol(&so_mod_fmod,  "FMOD_System_RegisterOutput");
@@ -322,26 +385,6 @@ static int hook_fmod_studio_initialize(void *studio_system,
         }
     }
 
-    if (mcsm_mega_diag_enabled()) {
-        l_info("AUDIODIAG: FMOD Studio::initialize pre studio=%p low=%p getLow=%d(%s) setOutput=%d(%s) "
-               "want=%d(%s) before=%d(%s) after=%d(%s) max=%d studioFlags=0x%08X lowFlags=0x%08X extra=%p",
-               studio_system,
-               low_level,
-               get_low_result,
-               fmod_result_name(get_low_result),
-               set_output_result,
-               fmod_result_name(set_output_result),
-               requested_output,
-               fmod_output_name(requested_output),
-               output_before,
-               fmod_output_name(output_before),
-               output_after,
-               fmod_output_name(output_after),
-               max_channels,
-               studio_flags,
-               low_level_flags,
-               extra_driver_data);
-    }
 
     const int result = SO_CONTINUE(int,
                                    g_hook_fmod_studio_initialize,
@@ -355,24 +398,11 @@ static int hook_fmod_studio_initialize(void *studio_system,
     if (g_fmod_system_get_output && low_level) {
         (void)g_fmod_system_get_output(low_level, &final_output);
     }
-    if (mcsm_mega_diag_enabled()) {
-        l_info("AUDIODIAG: FMOD Studio::initialize result=%d(%s) finalOutput=%d(%s)",
-               result,
-               fmod_result_name(result),
-               final_output,
-               fmod_output_name(final_output));
-    }
     return result;
 }
 
 static void patch_fmod_audio_hooks(void) {
     resolve_fmod_audio_symbols();
-    if (mcsm_mega_diag_enabled()) {
-        l_info("AUDIODIAG: FMOD symbols getLow=%p setOutput=%p getOutput=%p",
-               (void *)g_fmod_studio_get_low_level_system,
-               (void *)g_fmod_system_set_output,
-               (void *)g_fmod_system_get_output);
-    }
     (void)hook_symbol_checked(&so_mod_fmodstudio,
                               "_ZN4FMOD6Studio6System10initializeEijjPv",
                               "FMOD::Studio::System::initialize",
@@ -416,10 +446,6 @@ static int patch_arm32_instruction(const char *label,
     return 1;
 }
 
-static uint64_t now_ms(void) {
-    return sceKernelGetSystemTimeWide() / 1000ULL;
-}
-
 /* FRAME PACING (2026-06-23): the animation judder isn't low fps (avg ~50-60 in
  * menus) -- it's VARIANCE. Plain vsync makes the per-frame delta beat 17ms<->34ms
  * (60<->30) because the GPU keeps missing vblank by a hair, so the engine advances
@@ -429,14 +455,19 @@ static uint64_t now_ms(void) {
  * with no rebuild via ux0:data/mcsm/graphics.txt (fps_cap) (an integer fps; <=0 = uncapped).
  * This must honor the user's configured cap directly; forcing 60 down to 30
  * made character/menu animation visibly regress in heavy scenes. */
+/* The EXACT frame period in us for the configured cap (0 = uncapped). This is the
+ * real per-frame budget and the number the clock governor must scale against; the
+ * sim pace below is this minus a small undershoot. */
+static uint32_t mcsm_frame_period_us(void) {
+    const int fps = mcsm_cfg()->fps_cap;
+    if (fps <= 0 || fps > 120) return 0;
+    return (uint32_t)(1000000 / fps);
+}
+
 static uint32_t mcsm_frame_pace_us(void) {
     static int initialized = 0;
-    /* Default 30 fps, vblank-quantized (2*16667 - 2500 = 30834) — identical to what
-     * the graphics.txt (fps_cap)=30 path below computes. A plain 33333 lands the sleep-release
-     * exactly ON the 2-vblank boundary, so adaptive vsync misses it by a hair and
-     * snaps to the next vblank -> idle frames beat to 20fps. Undershooting by 2500us
-     * makes the frame ready just before vblank so vsync catches the intended one. */
-    static uint32_t pace_us = 30834; /* 30 fps (vblank-quantized) */
+    /* Default 30 fps. */
+    static uint32_t pace_us = 30833;
     static int requested_fps = 30;
     if (!initialized) {
         initialized = 1;
@@ -445,18 +476,40 @@ static uint32_t mcsm_frame_pace_us(void) {
         if (fps <= 0 || fps > 120) {
             pace_us = 0; /* uncapped */
         } else {
-            /* Same vblank-quantized undershoot as the present-lock (glutil.c
-             * gl_init) so the loop pace and present lock share one phase. */
-            const int vb = 16667;
-            int per = 1000000 / fps;
-            int k = (per + vb / 2) / vb;
-            if (k < 1) k = 1;
-            pace_us = (uint32_t)(k * vb - 2500);
+            /* ★ EXACT PERIOD, NOT WHOLE VBLANKS (fixed 2026-07-30).
+             *
+             * This used to quantise to the nearest whole vblank:
+             *     k = round(1e6/fps / 16667);  pace = k*16667 - 2500
+             * which was correct back when the present lock did the same thing. The
+             * present lock moved to an exact fractional timeline on 2026-07-29 (it
+             * carries a rem/den remainder, so 24fps rides a real 3:2:3:2 pulldown),
+             * and this was never updated -- so the two gates on the same frame were
+             * running at DIFFERENT periods, and the comment here still claimed they
+             * "share one phase".
+             *
+             * For fps_cap = 24 the old rule computed k = round(41666/16667) = 2 and
+             * paced the sim at 30834us -- 32.4fps -- while the present lock held
+             * 41666.67us. The sim therefore ran ~28% faster than anything could be
+             * displayed, burning CPU and battery on work that was thrown away, and
+             * the clock governor (which takes its budget from this function) sized
+             * its up/down thresholds against 30834 instead of the real 41666.
+             *
+             * Using the exact period fixes 24 and is a NO-OP for the rates that were
+             * already right, which is what makes it safe:
+             *     30fps: old 2*16667-2500 = 30834   new 33333-2500 = 30833
+             *     60fps: old 1*16667-2500 = 14167   new 16666-2500 = 14166
+             *     24fps: old            30834       new 41666-2500 = 39166  <-- fixed
+             * The 2500us undershoot is kept: it kicks the sim loose slightly before
+             * the present deadline so the present lock, not this, is the gate that
+             * actually decides when a frame goes out. */
+            const uint32_t period = (uint32_t)(1000000 / fps);
+            pace_us = (period > 2500u) ? (period - 2500u) : period;
         }
-        l_info("Frame pace: %u us (%s requested=%d)",
+        l_info("Frame pace: %u us (%s requested=%d, exact period %u us)",
                pace_us,
                pace_us ? "capped" : "uncapped",
-               requested_fps);
+               requested_fps,
+               mcsm_frame_period_us());
     }
     return pace_us;
 }
@@ -500,9 +553,19 @@ static void mcsm_pace_frame(void) {
  * (g_mcsm_present_dt_us from gl_swap) — it never downclocks a scene whose frame
  * is already dropping, and escalates when it is. Biased to the ceiling (safe for
  * the stable-30 goal; a wrong present read only costs battery, never fps).
- * ONE-DOC config + opt-out: settings/clock.txt — "off" pins the boot clock;
- * "min"/"max" set the ARM floor/ceiling (defaults 266/444), "gpu" the GPU clock.
- * Both this governor and the boot clock (init.c) read it via mcsm_read_clock_cfg(). */
+ * Config: graphics.txt `clock`. "adaptive"/"battery" enables this governor with a
+ * 266 floor and a clock_mhz ceiling; a bare <MHz> pins the ARM and disables it.
+ * (An earlier comment here advertised a settings/clock.txt with off/min/max/gpu
+ * tokens. NO SUCH FILE IS EVER PARSED — see the McsmClockCfg note in utils.h.) */
+/* Is the governor actually driving the ARM clock right now? 0 until its first tick
+ * has run and decided, which is the safe answer: before then main.c's re-assert owns
+ * the ARM, so the clock is held up rather than left to drift. main.c MUST use this
+ * instead of inferring ownership from graphics.txt, because the governor can also be
+ * disabled by a non-adaptive graphics.txt clock, or by there being only one usable
+ * clock step. */
+static int g_clock_gov_active = 0;
+int mcsm_clock_governor_active(void) { return g_clock_gov_active; }
+
 static void mcsm_clock_governor_tick(uint32_t sim_us) {
     static int inited = 0;
     static int enabled = 0;
@@ -516,10 +579,27 @@ static void mcsm_clock_governor_tick(uint32_t sim_us) {
     if (!inited) {
         inited = 1;
         McsmClockCfg cfg;
-        mcsm_read_clock_cfg(&cfg);        /* the ONE doc: clock.txt (off / min / max / gpu) */
-        if (cfg.governor_off) {
-            l_info("clock-gov: DISABLED (clock.txt 'off') — ARM pinned to boot clock");
-            return; /* enabled stays 0 */
+        /* ★ graphics.txt decides WHO OWNS the ARM (it is the only clock config).
+         * These were two independent switches in two different files, and one legal
+         * combination left the ARM owned by NOBODY: graphics.txt `clock = adaptive`
+         * made main.c's re-assert stand down ("the governor has it"), while
+         * clock.txt `off` made this function return before ever calling
+         * scePowerSetArmClockFrequency. The power manager then walked the clock down
+         * to 333MHz unopposed and nothing logged it -- a silent 25% CPU underclock,
+         * and the battery profile sets clock_adaptive unconditionally so it was
+         * reachable by config alone. Now a single predicate decides, and
+         * mcsm_clock_governor_active() publishes the ANSWER rather than each side
+         * re-deriving it from its own file. */
+        mcsm_read_clock_cfg(&cfg);        /* derives arm_min/arm_max from graphics.txt */
+        /* The `cfg.governor_off` term that used to be here was DEAD: nothing ever
+         * sets that field to 1 (mcsm_read_clock_cfg assigns 0 unconditionally), so
+         * the branch and its "clock.txt 'off'" message were unreachable -- and a
+         * reader grepping a log for that string would have wrongly concluded the
+         * governor had run. graphics.txt's `clock` setting is the real switch. */
+        if (!mcsm_cfg()->clock_adaptive) {
+            l_info("clock-gov: DISABLED (graphics.txt clock is not adaptive) — "
+                   "ARM pinned; the main.c re-assert owns it");
+            return; /* enabled and g_clock_gov_active both stay 0 */
         }
         int ceiling = cfg.arm_max;
         int floor_mhz = cfg.arm_min;
@@ -532,12 +612,18 @@ static void mcsm_clock_governor_tick(uint32_t sim_us) {
         }
         if (n_levels == 0) levels[n_levels++] = ceiling;
         cur_idx = n_levels - 1;           /* start at the ceiling — init.c already booted there */
-        budget_us = mcsm_frame_pace_us();
+        /* The budget is the EXACT frame period, not the sim pace. The pace is the
+         * period minus a 2500us undershoot, so using it sized every threshold ~6-8%
+         * low; and before 2026-07-30 the pace was whole-vblank quantised, which for
+         * fps_cap=24 reported 30834 against a real 41666 budget -- a 26% error that
+         * made the governor hold a high clock on frames that had ample headroom. */
+        budget_us = mcsm_frame_period_us();
         if (!budget_us) budget_us = 33333; /* uncapped -> target 30fps power budget */
         up_us   = (uint32_t)((uint64_t)budget_us * 80 / 100);
         down_us = (uint32_t)((uint64_t)budget_us * 55 / 100);
         enabled = (n_levels > 1);         /* nothing to govern with a single level */
-        l_info("clock-gov: %s levels=%d [%d..%dMHz] budget=%uus up=%uus down=%uus (clock.txt)",
+        g_clock_gov_active = enabled;     /* published so main.c never re-derives it */
+        l_info("clock-gov: %s levels=%d [%d..%dMHz] budget=%uus up=%uus down=%uus (graphics.txt clock)",
                enabled ? "ON" : "single-level(off)", n_levels,
                levels[0], levels[n_levels - 1], budget_us, up_us, down_us);
     }
@@ -556,8 +642,11 @@ static void mcsm_clock_governor_tick(uint32_t sim_us) {
     int render_slow  = (pdt > budget_us + budget_us / 4);              /* >1.25x budget = clearly dropping */
     int frame_smooth = (pdt != 0) && (pdt <= budget_us + budget_us / 8); /* <=~1.12x budget = holding target */
 
-    /* Diagnostic heartbeat (logging builds only; compiled out in production):
-     * confirms the governor is alive and shows the clock it settled on. ~1/256 frames. */
+    /* Diagnostic heartbeat: confirms the governor is alive and shows the clock it
+     * settled on, once every 256 frames (~10s at the measured 26fps). This SHIPS --
+     * the comment here used to claim it was "compiled out in production", which was
+     * simply false (l_info is compiled in for this build) and would have told the
+     * next reader that a line they were looking at in a device log could not exist. */
     { static uint32_t hb = 0;
       if (((++hb) & 0xFFu) == 0u)
           l_info("clock-gov: heartbeat ARM=%dMHz sim=%uus present=%uus (down<%u up>%u)",
@@ -591,28 +680,6 @@ static void mcsm_clock_governor_tick(uint32_t sim_us) {
     }
 }
 
-static int mcsm_mega_diag_enabled(void) {
-    return 0; /* verbose diagnostics removed — off by default */
-}
-
-static int should_log_diag_count(uint32_t count) {
-    return mcsm_mega_diag_enabled() && (count <= 8 || (count % 256U) == 0U);
-}
-
-static void log_diag_counter(const char *name, uint32_t count, uint64_t first_ms, const char *extra) {
-    if (!mcsm_mega_diag_enabled()) {
-        return;
-    }
-    const uint64_t elapsed = first_ms ? (now_ms() - first_ms) : 0;
-    l_info("Diag: %s count=%u elapsed=%llums tid=0x%X%s%s",
-           name,
-           count,
-           (unsigned long long)elapsed,
-           sceKernelGetThreadId(),
-           extra ? " " : "",
-           extra ? extra : "");
-}
-
 typedef struct MetricsDiagState {
     float *frame_time;
     float *actual_frame_time;
@@ -627,6 +694,26 @@ typedef struct MetricsDiagState {
     uint64_t *frame_stamp;
     uint8_t *reset;
     uint8_t *use_time_get_time;
+    /* Metrics::mSoftwareSkinningTime — the engine's OWN per-frame software-skinning
+     * timer. Every other Metrics:: field was already resolved here; this one never
+     * was, which is why "is the collapse actually skinning?" has only ever been
+     * argued from inference. Read as raw bits and reported both ways (float seconds
+     * and u32) because the type is not provable from the symbol table alone — it is
+     * 4 bytes in .bss like mFrameTime, so float seconds is the likely convention.
+     * READ-ONLY: nothing writes through this pointer. */
+    uint32_t *software_skinning_time_bits;
+    /* Metrics::mShadowFrameTime — a TWO-float ring (8 bytes + its own index),
+     * written by GameRender::RenderFrame. Confirmed live by cross-referencing the
+     * GOT: both GameRender::RenderFrame (the producer) and Metrics::NewFrame (the
+     * per-frame reset) reference it. This is what finally puts a number on the
+     * shadows lever, which profiles currently toggle on feel alone. */
+    uint32_t *shadow_frame_time_bits;   /* [2] ring */
+    uint32_t *shadow_frame_time_index;
+    /* Metrics::mTotalScriptGCTime + mScriptGCNum — Lua GC cost, written by
+     * Metrics::ScriptGarbageCollect. A classic source of periodic hitches that
+     * nothing in this loader has ever looked at. */
+    uint32_t *script_gc_time_bits;
+    uint32_t *script_gc_num;
     int initialized;
 } MetricsDiagState;
 
@@ -763,7 +850,23 @@ static void init_metrics_diag(void) {
         metrics_u8_symbol("_ZN7Metrics7mbResetE");
     g_metrics_diag.use_time_get_time =
         metrics_u8_symbol("_ZN7Metrics16mbUseTimeGetTimeE");
+    g_metrics_diag.software_skinning_time_bits =
+        metrics_u32_symbol("_ZN7Metrics21mSoftwareSkinningTimeE");
+    g_metrics_diag.shadow_frame_time_bits =
+        metrics_u32_symbol("_ZN7Metrics16mShadowFrameTimeE");
+    g_metrics_diag.shadow_frame_time_index =
+        metrics_u32_symbol("_ZN7Metrics21mShadowFrameTimeIndexE");
+    g_metrics_diag.script_gc_time_bits =
+        metrics_u32_symbol("_ZN7Metrics18mTotalScriptGCTimeE");
+    g_metrics_diag.script_gc_num =
+        metrics_u32_symbol("_ZN7Metrics12mScriptGCNumE");
     g_metrics_diag.initialized = 1;
+    l_info("SKINPROBE: engine timers skin=%p shadow=%p shadowIdx=%p gcTime=%p gcNum=%p",
+           (void *)g_metrics_diag.software_skinning_time_bits,
+           (void *)g_metrics_diag.shadow_frame_time_bits,
+           (void *)g_metrics_diag.shadow_frame_time_index,
+           (void *)g_metrics_diag.script_gc_time_bits,
+           (void *)g_metrics_diag.script_gc_num);
 }
 
 static void init_render_gate_diag(void) {
@@ -900,32 +1003,6 @@ static void force_native_render_dimensions(const char *phase) {
     }
 }
 
-static void log_render_gate_diag(uint32_t loop_count, const char *phase) {
-    if (!g_render_gate_diag.initialized) {
-        return;
-    }
-
-    const uint32_t frame_num = g_metrics_diag.frame_num ? *g_metrics_diag.frame_num : 0U;
-    l_info("Diag: RenderGate[%s] loop=%u frame=%u app_wait=%d app_active=%d ge_suspend=%d ge_post=%d ge_browser_shutdown=%d ge_quit=%d ge_skip_platform=%d rd_enable=%d rd_init=%d rd_inframe=%d hwnd=0x%08X dev=%ux%u game=%ux%u",
-           phase,
-           loop_count,
-           frame_num,
-           diag_read_u8(g_render_gate_diag.app_wait_for_messages),
-           diag_read_u8(g_render_gate_diag.app_active),
-           diag_read_u8(g_render_gate_diag.game_suspend_loop),
-           diag_read_u8(g_render_gate_diag.game_post_update_script_call),
-           diag_read_u8(g_render_gate_diag.game_browser_during_shutdown),
-           diag_read_u8(g_render_gate_diag.game_requested_quit),
-           diag_read_u8(g_render_gate_diag.game_skip_platform_controller_screen),
-           diag_read_u8(g_render_gate_diag.render_enable),
-           diag_read_u8(g_render_gate_diag.render_device_initialized),
-           diag_read_u8(g_render_gate_diag.render_in_frame),
-           diag_read_u32(g_render_gate_diag.render_hwnd),
-           diag_read_u32(g_render_gate_diag.device_width),
-           diag_read_u32(g_render_gate_diag.device_height),
-           diag_read_u32(g_render_gate_diag.game_width),
-           diag_read_u32(g_render_gate_diag.game_height));
-}
 
 static void force_application_active(const char *phase) {
     static uint32_t log_count = 0;
@@ -1239,37 +1316,6 @@ static int return_address_in_symbol(void *retaddr, uintptr_t symbol_addr, size_t
            addr < symbol_addr + symbol_size;
 }
 
-static void describe_return_address(void *retaddr, char *dst, size_t dst_size) {
-    const uintptr_t addr = (uintptr_t)retaddr;
-
-    if (!dst || dst_size == 0) {
-        return;
-    }
-
-    if (return_address_in_symbol(retaddr,
-                                 g_renderoverlay_update_render_thread_addr,
-                                 g_renderoverlay_update_render_thread_size)) {
-        snprintf(dst,
-                 dst_size,
-                 "%p(RenderOverlay::UpdateRenderThread+0x%X)",
-                 retaddr,
-                 (unsigned)(addr - g_renderoverlay_update_render_thread_addr));
-        return;
-    }
-
-    if (return_address_in_symbol(retaddr,
-                                 g_renderframe_push_view_addr,
-                                 g_renderframe_push_view_size)) {
-        snprintf(dst,
-                 dst_size,
-                 "%p(RenderFrame::PushView+0x%X)",
-                 retaddr,
-                 (unsigned)(addr - g_renderframe_push_view_addr));
-        return;
-    }
-
-    snprintf(dst, dst_size, "%p", retaddr);
-}
 
 static void stream_pump_preload(void);  /* forward decl; defined after boot hooks */
 
@@ -1332,8 +1378,29 @@ static void force_animation_runtime_flags(const char *phase) {
     const int recursive_needs_write =
         refresh || last_recursive_full != recursive_full || recursive_value != recursive_full;
 
+    /* This was forced to 1 unconditionally with no config and no measurement.
+     * Including non-skeleton chores means MORE chores walked per frame, and the
+     * chore tick is a nested linked-list walk (UpdateChoreInstances -> per-chore
+     * -> per-agent) that scales directly with how many characters are on screen
+     * -- which is exactly the reported symptom: fine with one or two characters,
+     * collapses with more. Make it settable so its real cost can be measured
+     * rather than assumed: anim_nonskel.txt = 0 disables it. */
     if (g_set_chore_filter_includes_non_skeleton && refresh) {
-        g_set_chore_filter_includes_non_skeleton(1);
+        static int s_nonskel = -1;
+        if (s_nonskel < 0) {
+            FILE *f = mcsm_open_setting("anim_nonskel.txt", "r");
+            /* Default now follows the profile rather than being hardcoded on.
+             * Including non-skeleton chores means MORE entries in a walk that is
+             * already O(chores x agents) on one thread, and it was forced to 1
+             * with no measurement behind it. The max-fps profile turns it off
+             * along with the other per-character costs; quality/default keep it,
+             * since it is the engine's corrected behaviour. */
+            s_nonskel = mcsm_cfg()->skinning_full ? 1 : 0;
+            if (f) { char b[8]={0}; if (fgets(b,sizeof(b),f)) s_nonskel = (b[0]!='0'); fclose(f); }
+            l_info("ANIM: chore filter includes non-skeleton = %d%s", s_nonskel,
+                   s_nonskel ? " (default; set anim_nonskel.txt=0 to test without)" : " (anim_nonskel.txt)");
+        }
+        g_set_chore_filter_includes_non_skeleton(s_nonskel);
     }
     if (g_set_fix_recursive_animation_contribution && recursive_needs_write) {
         g_set_fix_recursive_animation_contribution(recursive_full);
@@ -1353,6 +1420,464 @@ static void force_animation_runtime_flags(const char *phase) {
     }
 }
 
+/* CHARACTER-SCALING PROBE (2026-07-30). Reported symptom: one or two characters
+ * hold 60fps, more and the frame collapses, with a single CPU core pinned at 99%
+ * while the others idle -- the signature of a serial per-character walk.
+ *
+ * The chore tick is exactly that shape, verified by disassembly:
+ *     ChoreInst::UpdateChoreInstances()   linked-list loop over every chore
+ *       -> ChoreInst::Update(bool)        linked-list loop over every agent
+ *          -> ChoreAgentInst::Update      -> SetCurrentTime -> PlaybackController
+ * so its cost is O(chores x agents) on one thread, per frame.
+ *
+ * Counting the top-level walk tells us whether the collapse tracks character
+ * count or something else. ChoreInst::UpdateChoreInstances is called ONCE per
+ * frame -- not per chore -- so hooking it is cheap and, unlike the render-path
+ * hooks that crashed, it is not called concurrently from multiple threads. */
+static so_hook g_hook_chore_update_all;
+static volatile unsigned g_chore_ticks = 0;
+/* ---- ENGINE TUNABLE GLOBALS (2026-07-31) ----------------------------------
+ * The engine exposes several plain globals that configure the render and audio
+ * systems. They are ordinary exported data symbols, so they can be read and written
+ * directly -- no hooking, no instruction patching, no SO_CONTINUE.
+ *
+ * Values as SHIPPED, read out of the .so (vaddr translated through the ELF program
+ * headers -- reading at raw vaddr gives garbage, which is how a first attempt got
+ * "mbEnableRendering = 249"; the 1.3333 aspect ratio is what confirms the mapping):
+ *     gMultithreadRenderEnable          = 1        (already on)
+ *     RenderDevice::mDepthSize          = 24
+ *     Scene::sMinRenderedScenePriority  = -10000
+ *     Scene::sMaxRenderedScenePriority  = +10000
+ *     AudioThread::snMaxFmodChannels    = 128
+ *     RenderDevice::sfGameContentAspectRatio = 1.3333 (4:3)
+ *
+ * ENGTUNE logs the LIVE values at boot. That matters more than the overrides: a
+ * shipped default read from the binary is not proof of what the engine settles on
+ * after init, and this port has repeatedly been burned by assuming otherwise.
+ * Overrides all default to "leave alone". */
+static void mcsm_engine_tunables(void) {
+    struct { const char *sym; const char *name; int is_byte; } items[] = {
+        { "gMultithreadRenderEnable",                 "multithread_render", 1 },
+        { "_ZN12RenderDevice10mDepthSizeE",           "depth_size",         0 },
+        { "_ZN5Scene25sMinRenderedScenePriorityE",    "scene_prio_min",     0 },
+        { "_ZN5Scene25sMaxRenderedScenePriorityE",    "scene_prio_max",     0 },
+        { "_ZN19SoundSystemInternal11AudioThread7Context17snMaxFmodChannelsE",
+                                                      "fmod_max_channels",  0 },
+    };
+    for (unsigned i = 0; i < sizeof(items) / sizeof(items[0]); i++) {
+        uintptr_t a = so_symbol(&so_mod_gameengine, items[i].sym);
+        if (!a) { l_info("ENGTUNE: %-18s <symbol not found>", items[i].name); continue; }
+        if (items[i].is_byte)
+            l_info("ENGTUNE: %-18s = %d", items[i].name, (int)*(volatile uint8_t *)a);
+        else
+            l_info("ENGTUNE: %-18s = %d", items[i].name, (int)*(volatile int32_t *)a);
+    }
+
+    /* Optional overrides. Each is a straight store into an engine global.
+     * fmod_max_channels is the one with a real CPU story: our FMOD output plugin
+     * pulls the mixer INLINE on the drain thread, so the channel cap bounds how much
+     * mixing that thread can be asked to do. It is a CAP though, not a count --
+     * lowering it only helps if the game actually opens many channels, which is
+     * exactly what the ENGTUNE line above lets us find out before guessing. */
+    const McsmCfg *cfg = mcsm_cfg();
+    if (cfg->fmod_channels > 0) {
+        uintptr_t a = so_symbol(&so_mod_gameengine,
+            "_ZN19SoundSystemInternal11AudioThread7Context17snMaxFmodChannelsE");
+        if (a) {
+            *(volatile int32_t *)a = cfg->fmod_channels;
+            l_info("ENGTUNE: fmod_max_channels -> %d (graphics.txt)", cfg->fmod_channels);
+        }
+    }
+    if (cfg->scene_prio_min || cfg->scene_prio_max) {
+        uintptr_t lo = so_symbol(&so_mod_gameengine, "_ZN5Scene25sMinRenderedScenePriorityE");
+        uintptr_t hi = so_symbol(&so_mod_gameengine, "_ZN5Scene25sMaxRenderedScenePriorityE");
+        /* ☠ This narrows the range of scene priorities the engine will RENDER, so it
+         * is a direct draw-count lever -- and equally a direct way to make the UI or
+         * the world vanish. Both ends must be given together or not at all. */
+        if (lo && hi && cfg->scene_prio_min < cfg->scene_prio_max) {
+            *(volatile int32_t *)lo = cfg->scene_prio_min;
+            *(volatile int32_t *)hi = cfg->scene_prio_max;
+            l_warn("ENGTUNE: scene priority range -> [%d..%d] — if content disappears, "
+                   "this is why", cfg->scene_prio_min, cfg->scene_prio_max);
+        } else {
+            l_warn("ENGTUNE: scene priority override IGNORED (need min < max, got %d..%d)",
+                   cfg->scene_prio_min, cfg->scene_prio_max);
+        }
+    }
+}
+
+/* ---- ENGINE PLATFORM IDENTITY (2026-07-31) --------------------------------
+ * TTPlatform::GetPlatformType() is a TWO-INSTRUCTION STUB in the shipped binary:
+ *     mov r0, #8      ; ePlatform_Android
+ *     bx  lr
+ * ePlatform_Vita is 9 and has never been used by this port. Enum order was taken
+ * from the string table's ADDRESS layout (16-byte stride at 0xF64B78+), not from
+ * sorted `strings` output, which is alphabetical and would have given the wrong index:
+ *     0 None 1 All 2 PC 3 Wii 4 Xbox 5 PS3 6 Mac 7 iPhone
+ *     8 Android  9 Vita  10 Linux 11 PS4 12 XBOne 13 WiiU 14 Count
+ *
+ * It feeds only five call sites, three of them render-critical:
+ *     RenderConfiguration::Initialize()
+ *     RenderConfiguration::GetSupportedQualityTypes()
+ *     T3EffectCacheInternal::GetProgram(...)   <- picks the shader program PER DRAW
+ * and the effect system filters features by platform AND quality
+ * (T3EffectUtil::GetValidDynamicFeatures(type, features, quality, PlatformType)).
+ * With render at 75% of the frame, that makes this the most direct untested lever.
+ *
+ * OFF BY DEFAULT and behind graphics.txt `platform_vita`, because the per-platform
+ * quality table lives in .bss and is built during init -- so whether Vita and Android
+ * differ AT ALL cannot be determined offline. The PLATQUAL line below answers that on
+ * device by asking the engine for BOTH, which is cheaper than shipping a guess. */
+#define MCSM_EPLATFORM_ANDROID 8
+#define MCSM_EPLATFORM_VITA    9
+
+static so_hook g_hook_get_platform_type;
+static int hook_get_platform_type(void) {
+    static uint32_t count = 0;
+    count++;
+    if (mcsm_cfg()->platform_vita) {
+        if (count <= 8U)
+            l_info("FIX: TTPlatform::GetPlatformType -> ePlatform_Vita(%d) (#%u)",
+                   MCSM_EPLATFORM_VITA, count);
+        return MCSM_EPLATFORM_VITA;
+    }
+    return MCSM_EPLATFORM_ANDROID;   /* the stub's own constant; no SO_CONTINUE needed */
+}
+
+/* Ask the engine which render quality types each platform supports. The function is
+ * `void GetSupportedQualityTypes(uint32_t *out, PlatformType)` -- r0 is an OUT pointer,
+ * r1 the platform -- and it guards on a table pointer that is NULL until the render
+ * config initialises, so `out` is left untouched when called too early. Seeded with a
+ * sentinel so "not yet initialised" is distinguishable from "returned 0". */
+void mcsm_report_platform_quality(void) {
+    typedef void (*get_qual_fn)(uint32_t *, int);
+    get_qual_fn f = (get_qual_fn)so_symbol(&so_mod_gameengine,
+        "_ZN19RenderConfiguration24GetSupportedQualityTypesE12PlatformType");
+    if (!f) { l_info("PLATQUAL: GetSupportedQualityTypes(PlatformType) not found"); return; }
+    uint32_t a = 0xDEADBEEFu, v = 0xDEADBEEFu;
+    f(&a, MCSM_EPLATFORM_ANDROID);
+    f(&v, MCSM_EPLATFORM_VITA);
+    /* The signature is confirmed against the binary, not guessed: at 0x00aa9d24 the
+     * function takes r0 = sret out-pointer, r1 = PlatformType, and ends
+     * `cmp r3,#0 / addne r1,r1,#28 / ldrne r3,[r3,r1,lsl #2] / str r3,[r0] / bx lr`.
+     *
+     * Note the store is UNCONDITIONAL, so "not built yet" writes 0 rather than
+     * leaving the sentinel. Testing for the sentinel therefore never fired, and an
+     * empty table was reported as "Android == Vita -> platform_vita cannot help" --
+     * a firm conclusion drawn from no data, about the single most direct untested
+     * perf lever this port has. Zero on BOTH sides means the table is empty; a
+     * platform with genuinely no supported quality types would be a different and
+     * far stranger finding, and would still be worth reporting as unbuilt. */
+    if ((a == 0xDEADBEEFu && v == 0xDEADBEEFu) || (a == 0u && v == 0u)) {
+        l_info("PLATQUAL: quality table not built yet (called before render init)");
+        return;   /* not latched: this is the "ask again later" case */
+    }
+    l_info("PLATQUAL: supported quality types  Android(8)=0x%08X  Vita(9)=0x%08X  -> %s",
+           a, v, (a == v) ? "IDENTICAL, platform_vita cannot help here"
+                          : "DIFFERENT, platform_vita changes the engine's quality set");
+}
+
+/* ---- ACHIEVEMENT PROBE (2026-07-30) ---------------------------------------
+ * The game's Lua already calls PlatformUnlockAchievement("<name>") at the right
+ * story beats -- the engine exposes luaPlatformUnlockAchievement ->
+ * TTPlatform::UnlockAchievement -> Platform_Android::UnlockAchievement, and on
+ * Vita that last one goes nowhere (it was Google Play Games on Android).
+ *
+ * Before ANY trophy work is possible we need the exact achievement name strings,
+ * because a Vita TROPHY.TRP has to map name -> trophy index and nothing documents
+ * them. So: log what the engine passes, then continue unchanged. This unlocks
+ * nothing by itself and needs no plugin -- it is purely the discovery step.
+ *
+ * SAFE TO HOOK: this is a cold, script-thread function taking a single reference
+ * (pointer) argument. No floats, so the SO_CONTINUE float-argument corruption
+ * hazard does not apply, and it is nowhere near the render path.
+ *
+ * The Telltale `String` layout is NOT documented here, so rather than guess we
+ * dump the first 16 bytes AND a best-effort text read. One device run settles the
+ * layout for good instead of shipping a wrong assumption. */
+/* Resolve a Telltale `String` to a C string without assuming its layout.
+ * The layout is NOT documented in this port, so both plausible forms are tried and
+ * VALIDATED before use: a char* at +0 (the usual Telltale shape) or characters stored
+ * inline in the object (small-string optimisation). A wrong guess here would fault
+ * inside the engine's script thread, so every candidate pointer is range-checked and
+ * every byte is required to be printable before it is trusted.
+ * Returns 1 and fills `out` on success. */
+static int telltale_string_read(const void *str, char *out, size_t cap) {
+    if (!str || !out || cap < 2u) return 0;
+    const uint32_t *w = (const uint32_t *)str;
+    const uint32_t p0 = w[0];
+    if (p0 > 0x1000u && p0 < 0xF0000000u) {          /* candidate: char* at +0 */
+        const char *cand = (const char *)(uintptr_t)p0;
+        size_t n = 0;
+        while (n < cap - 1u) {
+            const char c = cand[n];
+            if (c == 0) break;
+            if (c < 0x20 || (unsigned char)c > 0x7E) { n = 0; break; }
+            out[n] = c; n++;
+        }
+        if (n) { out[n] = 0; return 1; }
+    }
+    { const char *inl = (const char *)str;           /* candidate: inline chars */
+      size_t n = 0;
+      while (n < cap - 1u && inl[n] >= 0x20 && (unsigned char)inl[n] <= 0x7E) { out[n] = inl[n]; n++; }
+      if (n) { out[n] = 0; return 1; } }
+    return 0;
+}
+
+static so_hook g_hook_unlock_achievement;
+static void hook_unlock_achievement(void *self, const void *str) {
+    char name[80];
+    if (str && telltale_string_read(str, name, sizeof(name))) {
+        /* Hand it to the trophy backend. That call does NOT block on the unlock
+         * itself -- it flags the id and wakes a worker -- which matters because we
+         * are on the engine's script thread mid-scene here. It also owns the
+         * logging: the engine re-fires the same achievement whenever its beat
+         * replays, and only the backend knows whether the trophy is already held. */
+        extern void mcsm_trophies_unlock_by_name(const char *);
+        mcsm_trophies_unlock_by_name(name);
+    } else {
+        /* Keep the raw bytes in the log: if the String layout ever changes this is
+         * what identifies it, instead of a silent "(unreadable)". */
+        const uint32_t *w = (const uint32_t *)str;
+        l_warn("ACHIEVEMENT unlock: name unreadable | String bytes %08X %08X %08X %08X",
+               str ? w[0] : 0u, str ? w[1] : 0u, str ? w[2] : 0u, str ? w[3] : 0u);
+    }
+    SO_CONTINUE_VOID(g_hook_unlock_achievement, self, str);
+}
+
+#if !MCSM_FAST_FINAL_RUNTIME
+static so_hook g_hook_scene_update, g_hook_script_update;
+static void hook_scene_update(void) {
+    const uint64_t t0 = MCSM_PHASE_T0();
+    SO_CONTINUE_VOID(g_hook_scene_update);
+    MCSM_PHASE_ADD(g_scene_us, g_scene_n, t0);
+}
+static void hook_script_update(uint32_t dt_bits) {
+    /* float arg arrives in r0 on this softfp build; pass the bits straight through
+     * so nothing reinterprets it (SO_CONTINUE would promote a real float to double). */
+    const uint64_t t0 = MCSM_PHASE_T0();
+    SO_CONTINUE_VOID(g_hook_script_update, dt_bits);
+    MCSM_PHASE_ADD(g_script_us, g_script_n, t0);
+}
+#endif /* !MCSM_FAST_FINAL_RUNTIME */
+
+static void hook_chore_update_all(void) {
+    g_chore_ticks++;
+    const uint64_t t0 = MCSM_PHASE_T0();
+    SO_CONTINUE_VOID(g_hook_chore_update_all);
+    MCSM_PHASE_ADD(g_chore_us, g_chore_n, t0);
+}
+
+void mcsm_anim_report(void) {
+    static unsigned last = 0;
+    unsigned n = g_chore_ticks;
+    if (n == last) return;
+    l_info("ANIM: chore ticks=%u (+%u since last report)", n, n - last);
+    last = n;
+    /* mcsm_skin_report is deliberately NOT called from here. This function returns
+     * early when the chore counter has not moved, which would suppress the whole
+     * upload/skinning probe in menus, during scene loads, and in any scene with no
+     * active chores. The watchdog calls both independently (main.c). */
+}
+
+/* SKINPROBE reporter (2026-07-30). Answers, per report window, the one question
+ * the whole "collapses with more characters" thread rests on: how much work the
+ * per-skinned-mesh upload path is doing per frame, and what the engine itself
+ * says software skinning costs.
+ *
+ * Read these as follows:
+ *   locks/f    T3VertexBuffer::PlatformLock calls per frame. This IS the skinned
+ *              mesh count per frame (DoSoftwareSkinning -> Lock, one per mesh).
+ *              If this rises with on-screen characters, the path scales with them.
+ *   respec/f   full glBufferData respecifies per frame. Each one is a GPU free +
+ *              GPU alloc + full-buffer memcpy inside vitaGL, NOT a partial update.
+ *   KB/f       bytes copied CPU->GPU per frame by those respecifies alone.
+ *   malloc/f   CPU staging buffers allocated AND freed per frame.
+ *   skin       Metrics::mSoftwareSkinningTime, the engine's own timer. Printed as
+ *              float-seconds->ms and as raw u32, since the type is not provable
+ *              from the symbol table; whichever column is plausible is the real one.
+ * Runs on the watchdog thread every 5s. Deltas, so no shared per-frame reset. */
+void mcsm_skin_report(void) {
+    static uint32_t last_locks = 0, last_respec = 0, last_kb = 0, last_mallocs = 0;
+    static uint32_t last_frames = 0;
+
+    const uint32_t locks   = g_vb_locks;
+    const uint32_t respec  = g_vb_respec;
+    const uint32_t kb      = g_vb_kb;
+    const uint32_t mallocs = g_vb_mallocs;
+    const uint32_t frames  = launch_state_get_present_count();
+
+    /* Unsigned subtraction wraps correctly, so a counter rollover still yields a
+     * usable delta rather than a nonsense huge number. */
+    const uint32_t dframes_raw = frames - last_frames;
+    /* ☠ DEVICE-CONFIRMED (r79): the early `if (dframes == 0) return;` that used to
+     * be here made this probe emit NOTHING for an entire 86s session. The first
+     * report of a run lands during the load screen, when nothing has presented
+     * yet -- so it returned before reaching `last_frames = frames`, leaving the
+     * baseline latched at 0, and every later report differenced against a stale
+     * zero. One fire, zero SKINPROBE/SIMSPLIT lines, silently. Report
+     * unconditionally and clamp only the divisor: a report with no presented
+     * frames is still evidence (it says the renderer is stalled), which is
+     * precisely when the probe is most worth reading. */
+    const uint32_t dframes = dframes_raw ? dframes_raw : 1u;
+
+    const uint32_t dlocks   = locks   - last_locks;
+    const uint32_t drespec  = respec  - last_respec;
+    const uint32_t dkb      = kb      - last_kb;
+    const uint32_t dmallocs = mallocs - last_mallocs;
+
+    uint32_t skin_bits = 0;
+    if (g_metrics_diag.software_skinning_time_bits)
+        skin_bits = *g_metrics_diag.software_skinning_time_bits;
+    const float skin_f = float_from_bits(skin_bits);
+
+    /* mShadowFrameTime is a 2-entry ring with its own index. Which slot holds the
+     * freshest sample depends on whether GameRender::RenderFrame writes-then-
+     * increments or increments-then-writes, and that was NOT established from the
+     * disassembly -- so picking one was a coin flip that would have reported a
+     * permanently stale value half the time, silently. Report BOTH slots and the
+     * index; one device run then settles the convention for good. */
+    float shadow_a = 0.0f, shadow_b = 0.0f;
+    uint32_t shadow_idx = 0u;
+    if (g_metrics_diag.shadow_frame_time_bits) {
+        shadow_a = float_from_bits(g_metrics_diag.shadow_frame_time_bits[0]);
+        shadow_b = float_from_bits(g_metrics_diag.shadow_frame_time_bits[1]);
+        if (g_metrics_diag.shadow_frame_time_index)
+            shadow_idx = *g_metrics_diag.shadow_frame_time_index;
+    }
+    const float gc_f = g_metrics_diag.script_gc_time_bits
+                     ? float_from_bits(*g_metrics_diag.script_gc_time_bits) : 0.0f;
+    const uint32_t gc_n = g_metrics_diag.script_gc_num ? *g_metrics_diag.script_gc_num : 0u;
+
+    /* x100 fixed point: these are fractions per frame and integer division to 0
+     * would hide exactly the signal we are looking for. */
+    /* KB/f is the number that converts straight into milliseconds: it is a
+     * CPU->GPU copy that the engine's own mapped path would not perform at all.
+     * At a realistic Vita large-block copy rate (~500 MB/s) 1 KB is ~2 us, so
+     * KB/f x 2 us is a first-order estimate of the time this path costs per
+     * frame -- before the GPU alloc/free churn and the malloc/free pair. */
+    l_info("SKINPROBE: frames=%u locks/f=%u.%02u respec/f=%u.%02u KB/f=%u.%02u malloc/f=%u.%02u "
+           "maxbytes=%u tid=0x%08X subdata=%u reuse=%u evict=%u skin=%.3fms(raw=%u) est=%u.%02ums/f "
+           "[locks=%u respec=%u KB=%u malloc=%u]",
+           dframes_raw,
+           dlocks / dframes,   (dlocks   * 100u / dframes) % 100u,
+           drespec / dframes,  (drespec  * 100u / dframes) % 100u,
+           dkb / dframes,      (dkb      * 100u / dframes) % 100u,
+           dmallocs / dframes, (dmallocs * 100u / dframes) % 100u,
+           g_vb_max_bytes, g_vb_tid, g_vb_subdata, g_vb_reuse, g_vb_evict,
+           (double)(skin_f * 1000.0f), skin_bits,
+           (dkb * 2u / dframes) / 1000u, ((dkb * 2u / dframes) / 10u) % 100u,
+           locks, respec, kb, mallocs);
+    /* Separate line so the upload probe above stays readable. shadow[] finally
+     * puts a measured cost on the shadows lever; gc= exposes Lua GC hitches. */
+    const uint32_t caps = g_render_caps_ptr ? *g_render_caps_ptr : 0u;
+    /* Per-frame averages of the two animation entry points, against DIP-SIM's
+     * 25-27ms total. Whatever is left over is neither chore nor playback. */
+    /* ☠ THESE WERE PER-CALL AVERAGES PRINTED UNDER A "/frame" LABEL (fixed 2026-07-30).
+     * Each phase was divided by the delta of its OWN call counter, not by frames, so
+     * any phase invoked more than once per frame reported 1/N of its real per-frame
+     * cost -- silently, because the call counts were never printed. The entire
+     * optimisation strategy rests on "render is 75% of the frame", and that reading
+     * was only correct if GameEngine::Render happens to run exactly once per frame.
+     * Now divided by dframes (true per-frame cost, which is what the label promises)
+     * and every phase also prints its calls-per-frame in x0.00 form, so a reader can
+     * both trust the number and see if a phase is running more often than assumed. */
+    static uint32_t l_cu = 0, l_cn = 0, l_pu = 0, l_pn = 0;
+    const uint32_t cu = g_chore_us, cn = g_chore_n, pu = g_pbc_us, pn = g_pbc_n;
+    const uint32_t dcn = cn - l_cn, dpn = pn - l_pn;
+    const uint32_t chore_pf = (cu - l_cu) / dframes;
+    const uint32_t pbc_pf   = (pu - l_pu) / dframes;
+    l_cu = cu; l_cn = cn; l_pu = pu; l_pn = pn;
+    static uint32_t l_ru=0,l_rn=0,l_su=0,l_sn=0,l_cu2=0,l_cn2=0;
+    const uint32_t ru=g_render_us, rn=g_render_n, su=g_scene_us, sn=g_scene_n,
+                   cu2=g_script_us, cn2=g_script_n;
+    const uint32_t drn=rn-l_rn, dsn=sn-l_sn, dcn2=cn2-l_cn2;
+    const uint32_t r_pf  = (ru  - l_ru ) / dframes;
+    const uint32_t s_pf  = (su  - l_su ) / dframes;
+    const uint32_t sc_pf = (cu2 - l_cu2) / dframes;
+    l_ru=ru; l_rn=rn; l_su=su; l_sn=sn; l_cu2=cu2; l_cn2=cn2;
+#if MCSM_FAST_FINAL_RUNTIME
+    /* ☠ SAY SO. With MCSM_PHASE_ADD compiled to a no-op, every accumulator above
+     * stays 0 and the normal line below would render as
+     *     SIMSPLIT: render=0.000ms(x0.00) chore=0.000ms(x0.00) ... PER FRAME
+     * -- a well-formed measurement claiming every engine phase is free, which is
+     * indistinguishable from a real reading of an idle frame. This project has
+     * already burned debugging cycles twice on exactly that shape: mcsm_skin_report
+     * disabling itself by early-returning before updating its baseline, and a GL
+     * dedup reporting success while never firing. A diagnostic that is switched off
+     * must announce it, not emit zeros. */
+    (void)r_pf; (void)chore_pf; (void)pbc_pf; (void)s_pf; (void)sc_pf;
+    (void)drn;  (void)dcn;      (void)dpn;    (void)dsn;  (void)dcn2;
+    l_info("SIMSPLIT: phase timers COMPILED OUT (MCSM_FAST_FINAL_RUNTIME=1) — these "
+           "cost 2 syscalls per instrumented call and shipped by mistake. Rebuild with "
+           "-DMCSM_FAST_FINAL_RUNTIME=0 to measure render/chore/playback/scenes/script.");
+#else
+    l_info("SIMSPLIT: render=%u.%03ums(x%u.%02u) chore=%u.%03ums(x%u.%02u) "
+           "playback=%u.%03ums(x%u.%02u) scenes=%u.%03ums(x%u.%02u) script=%u.%03ums(x%u.%02u)"
+           " PER FRAME (xN = calls/frame) — GameEngine::Render runs INSIDE Loop, so DIP-SIM includes it",
+           r_pf/1000u,     r_pf%1000u,     drn/dframes,  (drn  * 100u / dframes) % 100u,
+           chore_pf/1000u, chore_pf%1000u, dcn/dframes,  (dcn  * 100u / dframes) % 100u,
+           pbc_pf/1000u,   pbc_pf%1000u,   dpn/dframes,  (dpn  * 100u / dframes) % 100u,
+           s_pf/1000u,     s_pf%1000u,     dsn/dframes,  (dsn  * 100u / dframes) % 100u,
+           sc_pf/1000u,    sc_pf%1000u,    dcn2/dframes, (dcn2 * 100u / dframes) % 100u);
+#endif
+    /* Dedup effectiveness. If skipped/total is ~0 the dedup is not firing and the
+     * assumption behind it is wrong -- which is exactly what went unnoticed for the
+     * depth/cull dedup between 2026-07-20 and now. */
+    /* ★ vitaGL's OWN DRAW-PATH PROFILER (HAVE_PROFILING build only).
+     * These are plain global uint32_t in vitaGL's gxm.c, so they link directly --
+     * no accessor needed. shaders_draw_profiler_cnt accumulates microseconds spent
+     * INSIDE the shader draw path, which is the number that finally separates GL
+     * submission from engine simulation. Declared weak so a normal (non-profiling)
+     * libvitaGL.a still links: the symbols resolve to 0 and the line reports 0.
+     *
+     * COSTS WHAT IT MEASURES: vitaGL calls sceKernelGetProcessTimeLow twice per
+     * draw, so at ~890 draws/frame this build carries ~1780 extra syscalls a frame.
+     * Use it to find the answer, then ship without it. */
+    { extern uint32_t shaders_draw_profiler_cnt __attribute__((weak));
+      extern uint32_t shaders_draw_cnt __attribute__((weak));
+      extern uint32_t frame_profiler_cnt __attribute__((weak));
+      static uint32_t l_dp = 0, l_dc = 0;
+      /* ☠ SAY SO WHEN THE SYMBOLS ARE NOT THERE -- same rule as the SIMSPLIT block
+       * twenty lines up, which this failed to follow. The counters are weak, so on a
+       * libvitaGL.a built WITHOUT HAVE_PROFILING (i.e. the one we ship) they resolve
+       * to NULL and this printed
+       *     VGLPROF: draw_submit=0.000ms/f draws/f=0 vgl_frame=0us
+       * -- a well-formed measurement stating that draw submission is free, on a port
+       * whose entire remaining problem is draw submission. Device log 2026-07-31
+       * carried that line beside a scene doing hundreds of thousands of draws. */
+      if (!(&shaders_draw_profiler_cnt) || !(&shaders_draw_cnt)) {
+          l_info("VGLPROF: unavailable — this libvitaGL.a was not built with "
+                 "HAVE_PROFILING, so there are no draw-submission counters to read "
+                 "(rebuild vitaGL with it to attribute GL submission vs engine sim)");
+      } else {
+          const uint32_t dp = shaders_draw_profiler_cnt;
+          const uint32_t dc = shaders_draw_cnt;
+          const uint32_t fp = (&frame_profiler_cnt) ? frame_profiler_cnt : 0u;
+          const uint32_t ddp = dp - l_dp, ddc = dc - l_dc;
+          l_dp = dp; l_dc = dc;
+          /* dframes is clamped to >=1 above, so no guard is needed here. */
+          l_info("VGLPROF: draw_submit=%u.%03ums/f draws/f=%u vgl_frame=%uus "
+                 "(vitaGL HAVE_PROFILING; compare against DIP-SIM total)",
+                 (ddp / dframes) / 1000u, (ddp / dframes) % 1000u,
+                 ddc / dframes, fp);
+      } }
+    /* Only the depth/cull dedup is left to report: the glUseProgram and glBindTexture
+     * counters were deleted with their compares on 2026-07-30 after two device runs
+     * measured them at ~1% and 0% respectively. */
+    /* GLDEDUP is gone: all three redundant-call dedups were retired after their own
+     * counters measured them dead on device (see the note above g_uniform_* in
+     * glutil.c). Nothing left to report. */
+    l_info("ENGPROF: shadow[0]=%.3fms shadow[1]=%.3fms idx=%u gc=%.3fms gcNum=%u "
+           "rendercaps=0x%08X map_buffer(b21)=%u range(b22)=%u alt(b23)=%u",
+           (double)(shadow_a * 1000.0f), (double)(shadow_b * 1000.0f), shadow_idx,
+           (double)(gc_f * 1000.0f), gc_n,
+           caps, (caps >> 21) & 1u, (caps >> 22) & 1u, (caps >> 23) & 1u);
+
+    last_locks = locks; last_respec = respec; last_kb = kb;
+    last_mallocs = mallocs; last_frames = frames;
+}
+
 static void patch_chore_full_update_path(void) {
     static int applied = 0;
     if (applied) {
@@ -1365,22 +1890,27 @@ static void patch_chore_full_update_path(void) {
      * On Vita this leaves menu/diorama agents with advancing controllers but
      * incomplete value application. Patch the call sites to use the engine's
      * own full-update path without adding hot per-chore hooks. */
-    uintptr_t update_all = so_symbol(&so_mod_gameengine,
-        "_ZN9ChoreInst20UpdateChoreInstancesEv");
     uintptr_t set_controller = so_symbol(&so_mod_gameengine,
         "_ZN14ChoreAgentInst13SetControllerE3PtrI18PlaybackControllerE");
 
-    int ok_update_all = 0;
     int ok_set_controller = 0;
-    if (update_all) {
-        ok_update_all = patch_arm32_instruction(
-            "ANIM ChoreInst::UpdateChoreInstances full-agent update",
-            update_all + 0x1cU,
-            0xE3A01000U, /* mov r1,#0 */
-            0xE3A01001U  /* mov r1,#1 */);
-    } else {
-        l_warn("ANIM: ChoreInst::UpdateChoreInstances symbol not found.");
-    }
+    /* ★ REMOVED 2026-07-30 -- this patch was a PROVEN NO-OP, verified by
+     * disassembly, and its comment claimed a fix it never delivered.
+     *
+     * It flipped `mov r1,#0` -> `mov r1,#1` inside UpdateChoreInstances, i.e.
+     * forced the bool argument of ChoreInst::Update(bool) true for every chore.
+     * Following that argument all the way down:
+     *     ChoreInst::Update(bool)        r1 -> r5 -> r1, just forwards it
+     *     ChoreAgentInst::Update(bool)   r1 -> r2, tail-calls SetCurrentTime
+     *     ChoreAgentInst::SetCurrentTime(float, bool)
+     *         r2 is NEVER READ. It is overwritten with #0 at +0x4c, +0x9c and
+     *         +0xf0 before each virtual call, and appears as a source operand
+     *         nowhere in the function.
+     * So the flag was discarded. The patch changed no behaviour, fixed no
+     * animation, and left a comment asserting otherwise -- which is worse than
+     * doing nothing, because it makes the next reader believe the chore update
+     * path has already been addressed. The symbol lookup that fed it is gone
+     * too -- the hook install below resolves the same name independently. */
 
     if (set_controller) {
         ok_set_controller = patch_arm32_instruction(
@@ -1392,20 +1922,66 @@ static void patch_chore_full_update_path(void) {
         l_warn("ANIM: ChoreAgentInst::SetController symbol not found.");
     }
 
-    l_info("ANIM: full chore update patches update_all=%d set_controller=%d",
-           ok_update_all,
-           ok_set_controller);
+    (void)hook_symbol_checked(&so_mod_gameengine, "_ZN9ChoreInst20UpdateChoreInstancesEv",
+                              "ChoreInst::UpdateChoreInstances (probe)",
+                              (uintptr_t)&hook_chore_update_all, &g_hook_chore_update_all);
+    /* Phase probes: attribute the sim time that chore+playback do NOT explain
+     * (device says those are only ~4.8ms of 26-40ms). */
+    /* Engine platform identity. Installed unconditionally so the hook is always in
+     * place; the hook itself reads graphics.txt each call, which means platform_vita
+     * can be flipped without a rebuild. Safe target: a 2-instruction constant-return
+     * function, cold, no SO_CONTINUE needed. */
+    /* ☠ ONLY HOOK THIS WHEN THE FEATURE IS ON. The engine function is a two-instruction
+     * constant return, and this file's own header note records that its result feeds
+     * T3EffectCacheInternal::GetProgram -- i.e. it is consulted PER DRAW, ~890 times a
+     * frame. Replacing 2 cycles with a patched branch, a counter, a cross-TU
+     * mcsm_cfg() call and a compare cost roughly 50us/frame to return the value the
+     * engine already returned, because platform_vita defaults to 0.
+     * The old justification -- "the hook reads graphics.txt each call, so it can be
+     * flipped without a rebuild" -- was also wrong: mcsm_cfg() latches on first use,
+     * so changing it already needs a restart. Deciding once, here, costs nothing. */
+    if (mcsm_cfg()->platform_vita) {
+        (void)hook_symbol_checked(&so_mod_gameengine,
+                                  "_ZN10TTPlatform15GetPlatformTypeEv",
+                                  "TTPlatform::GetPlatformType",
+                                  (uintptr_t)&hook_get_platform_type, &g_hook_get_platform_type);
+    }
+    /* Read (and optionally override) the engine render/audio globals. Pure data
+     * access -- no hooking -- so it is safe here and the ENGTUNE line records the
+     * LIVE values, which a binary read alone cannot prove. */
+    mcsm_engine_tunables();
+    /* Discovery only: logs the achievement name the game unlocks, changes nothing. */
+    (void)hook_symbol_checked(&so_mod_gameengine,
+                              "_ZN16Platform_Android17UnlockAchievementERK6String",
+                              "Platform_Android::UnlockAchievement (achievement probe)",
+                              (uintptr_t)&hook_unlock_achievement, &g_hook_unlock_achievement);
+#if !MCSM_FAST_FINAL_RUNTIME
+    /* ☠ These two exist ONLY to feed MCSM_PHASE_ADD, which compiles to nothing in the
+     * shipping build -- so installing them there bought a pair of empty SO_CONTINUE
+     * hooks on two once-per-frame engine functions. SO_CONTINUE_VOID is 2 kubridge
+     * memcpys + 2 cache flushes per call, so that was 8 kernel calls a frame for a
+     * measurement the log itself reports as "phase timers COMPILED OUT" -- and it put
+     * live-code rewriting on two more functions, which is the mechanism this file
+     * documents as the cause of the diorama crash. Install them only when they can
+     * actually measure something. */
+    (void)hook_symbol_checked(&so_mod_gameengine, "_ZN5Scene12UpdateScenesEv",
+                              "Scene::UpdateScenes (probe)",
+                              (uintptr_t)&hook_scene_update, &g_hook_scene_update);
+    (void)hook_symbol_checked(&so_mod_gameengine, "_ZN13ScriptManager6UpdateEf",
+                              "ScriptManager::Update (probe)",
+                              (uintptr_t)&hook_script_update, &g_hook_script_update);
+#endif
+
+    /* Only set_controller is still a patch. update_all was removed as a proven
+     * no-op (see above); reporting it as `update_all=0` forever read as a failing
+     * patch on every boot, in a log that is the primary debugging surface. */
+    l_info("ANIM: full chore update patch set_controller=%d", ok_set_controller);
 }
 
 static void hook_gameengine_start(void) {
     static uint32_t count = 0;
-    static uint64_t first_ms = 0;
 
     count++;
-    if (!first_ms) {
-        first_ms = now_ms();
-    }
-    log_diag_counter("GameEngine_Start", count, first_ms, NULL);
     force_animation_runtime_flags("start-pre");
     SO_CONTINUE_VOID(g_hook_gameengine_start);
     force_animation_runtime_flags("start-post");
@@ -1413,12 +1989,8 @@ static void hook_gameengine_start(void) {
 
 static void hook_metrics_new_frame(uint32_t min_frame_time_bits) {
     static uint32_t count = 0;
-    static uint64_t first_ms = 0;
 
     count++;
-    if (!first_ms) {
-        first_ms = now_ms();
-    }
 
     typedef void (*metrics_new_frame_raw_fn)(uint32_t);
     kuKernelCpuUnrestrictedMemcpy((void *)g_hook_metrics_new_frame.addr,
@@ -1441,26 +2013,12 @@ static void hook_metrics_new_frame(uint32_t min_frame_time_bits) {
     const float fixed_dt = animation_governor_update(engine_ft, engine_aft, "newframe", count);
     metrics_force_animation_dt(fixed_dt, "newframe", count);
 
-    if (should_log_diag_count(count)) {
-        char extra[128];
-        snprintf(extra,
-                 sizeof(extra),
-                 "min=%.6f scene=%d governed=%.6f",
-                 float_from_bits(min_frame_time_bits),
-                 (int)g_boot_scene_active,
-                 fixed_dt);
-        log_diag_counter("Metrics::NewFrame", count, first_ms, extra);
-    }
 }
 
 static void hook_gameengine_loop(void) {
     static uint32_t count = 0;
-    static uint64_t first_ms = 0;
 
     count++;
-    if (!first_ms) {
-        first_ms = now_ms();
-    }
     /* STREAMING FIX: pump the async preload batch every frame while a
      * ScenePreload is in flight. */
     stream_pump_preload();
@@ -1470,10 +2028,6 @@ static void hook_gameengine_loop(void) {
 
     force_application_active("loop-pre");
     force_native_render_dimensions("loop-pre");
-    if (should_log_diag_count(count)) {
-        log_diag_counter("GameEngine_Loop", count, first_ms, NULL);
-        log_render_gate_diag(count, "loop-pre");
-    }
     metrics_diag_tick(count, "pre");
     /* DIP PROFILER: time the actual engine sim work (excludes our frame pace).
      * If the sim loop itself spikes (>22ms) the bottleneck is engine-side
@@ -1490,9 +2044,6 @@ static void hook_gameengine_loop(void) {
      * DIP-RENDER dt for the same frames: sim≈dt => CPU-bound; sim<<dt => GPU/VRAM-bound. */
     { static unsigned s_simc = 0;
       if (sim_ms > 20U && (s_simc++ & 0xFU) == 0U) l_info("DIP-SIM frame=%u work=%ums", count, sim_ms); }
-    if (should_log_diag_count(count)) {
-        l_info("Diag: GameEngine_Loop returned count=%u", count);
-    }
     force_application_active("loop-post");
     force_native_render_dimensions("loop-post");
     metrics_diag_tick(count, "post");
@@ -1502,92 +2053,50 @@ static void hook_gameengine_loop(void) {
             g_metrics_diag.actual_frame_time ? *g_metrics_diag.actual_frame_time : 0.0f),
         "loop-post",
         count);
-    if (should_log_diag_count(count)) {
-        log_render_gate_diag(count, "loop-post");
-    }
     /* Steady frame pacing so the engine's animation delta is consistent. */
     mcsm_pace_frame();
 }
 
 static void hook_gameengine_render(void) {
     static uint32_t count = 0;
-    static uint64_t first_ms = 0;
 
     count++;
-    if (!first_ms) {
-        first_ms = now_ms();
-    }
     force_native_render_dimensions("render-enter");
-    if (should_log_diag_count(count)) {
-        log_diag_counter("GameEngine::Render", count, first_ms, NULL);
-        log_render_gate_diag(count, "render-enter");
-    }
+    const uint64_t r_t0 = MCSM_PHASE_T0();
     SO_CONTINUE_VOID(g_hook_gameengine_render);
+    MCSM_PHASE_ADD(g_render_us, g_render_n, r_t0);
     force_native_render_dimensions("render-exit");
-    if (should_log_diag_count(count)) {
-        log_render_gate_diag(count, "render-exit");
-    }
 }
 
 static int hook_renderdevice_begin_frame(void) {
     static uint32_t count = 0;
-    static uint64_t first_ms = 0;
 
     count++;
-    if (!first_ms) {
-        first_ms = now_ms();
-    }
 
     force_native_render_dimensions("begin-frame-pre");
     int ret = SO_CONTINUE(int, g_hook_render_begin_frame);
     force_native_render_dimensions("begin-frame-post");
-    if (should_log_diag_count(count)) {
-        char extra[32];
-        snprintf(extra, sizeof(extra), "ret=%d", ret);
-        log_diag_counter("RenderDevice::BeginFrame", count, first_ms, extra);
-    }
     return ret;
 }
 
 static void hook_renderdevice_end_frame(void) {
     static uint32_t count = 0;
-    static uint64_t first_ms = 0;
 
     count++;
-    if (!first_ms) {
-        first_ms = now_ms();
-    }
-    if (should_log_diag_count(count)) {
-        log_diag_counter("RenderDevice::EndFrame", count, first_ms, NULL);
-    }
     SO_CONTINUE_VOID(g_hook_render_end_frame);
 }
 
 static void hook_renderdevice_present(void) {
     static uint32_t count = 0;
-    static uint64_t first_ms = 0;
 
     count++;
-    if (!first_ms) {
-        first_ms = now_ms();
-    }
-    if (should_log_diag_count(count)) {
-        log_diag_counter("RenderDevice::Present", count, first_ms, NULL);
-    }
     SO_CONTINUE_VOID(g_hook_render_present);
 }
 
 static void hook_application_sdl_swap(void) {
     static uint32_t count = 0;
-    static uint64_t first_ms = 0;
 
     count++;
-    if (!first_ms) {
-        first_ms = now_ms();
-    }
-    if (should_log_diag_count(count)) {
-        log_diag_counter("Application_SDL::Swap", count, first_ms, NULL);
-    }
     SO_CONTINUE_VOID(g_hook_app_swap);
 }
 
@@ -1710,18 +2219,12 @@ static void hook_android_jni_poll_input_devices(void) {
     count++;
     launch_state_mark_poll();
     mcsm_register_virtual_controller();
-    if (count <= 16U || (count % 256U) == 0U) {
-        log_diag_counter("Android_JNI_PollInputDevices bypass", count, 0, NULL);
-    }
 }
 
 static void hook_android_pump_events(void) {
     static uint32_t count = 0;
     count++;
     launch_state_mark_poll();
-    if (count <= 16U || (count % 256U) == 0U) {
-        log_diag_counter("Android_PumpEvents bypass", count, 0, NULL);
-    }
 }
 
 /* Some SDL wait calls happen on an engine-created thread with SP at the stack
@@ -1747,16 +2250,9 @@ __attribute__((naked)) static int hook_sdl_wait_event_timeout_real(void *event, 
 static void hook_suspend_game_loop(int suspend) {
     static int last_suspend = -1;
     static uint32_t count = 0;
-    static uint64_t first_ms = 0;
 
     count++;
-    if (!first_ms) {
-        first_ms = now_ms();
-    }
-    if (suspend != last_suspend || should_log_diag_count(count)) {
-        char extra[32];
-        snprintf(extra, sizeof(extra), "suspend=%d", suspend);
-        log_diag_counter("GameEngine::SetSuspendGameLoop", count, first_ms, extra);
+    if (suspend != last_suspend) {   /* the should_log_diag_count() disjunct was always false */
         last_suspend = suspend;
     }
     SO_CONTINUE_VOID(g_hook_suspend_game_loop, suspend);
@@ -1764,58 +2260,33 @@ static void hook_suspend_game_loop(int suspend) {
 
 static void hook_renderthread_submit_current_frame(void) {
     static uint32_t count = 0;
-    static uint64_t first_ms = 0;
 
     count++;
-    if (!first_ms) {
-        first_ms = now_ms();
-    }
 
-    if (should_log_diag_count(count)) {
-        log_diag_counter("RenderThread::SubmitCurrentFrame", count, first_ms, NULL);
-    }
     SO_CONTINUE_VOID(g_hook_renderthread_submit_current_frame);
 }
 
 static void hook_renderthread_end_frame(void) {
     static uint32_t count = 0;
-    static uint64_t first_ms = 0;
 
     count++;
-    if (!first_ms) {
-        first_ms = now_ms();
-    }
 
-    if (should_log_diag_count(count)) {
-        log_diag_counter("RenderThread::EndFrame", count, first_ms, NULL);
-    }
     SO_CONTINUE_VOID(g_hook_renderthread_end_frame);
 }
 
 static void hook_renderthread_finish_frame(void) {
     static uint32_t count = 0;
-    static uint64_t first_ms = 0;
 
     count++;
-    if (!first_ms) {
-        first_ms = now_ms();
-    }
 
-    if (should_log_diag_count(count)) {
-        log_diag_counter("RenderThread::FinishFrame", count, first_ms, NULL);
-    }
     SO_CONTINUE_VOID(g_hook_renderthread_finish_frame);
 }
 
 static int hook_renderframe_execute(void *self, void *other_frame) {
     static uint32_t count = 0;
-    static uint64_t first_ms = 0;
     static uint32_t paired_overlay_count = 0;
 
     count++;
-    if (!first_ms) {
-        first_ms = now_ms();
-    }
 
     const uintptr_t overlay_frame = g_overlay_render_frame;
     const int paired_overlay_frame =
@@ -1835,60 +2306,29 @@ static int hook_renderframe_execute(void *self, void *other_frame) {
     const int log_paired =
         paired_overlay_frame &&
         (paired_overlay_count <= 8U || (paired_overlay_count % 256U) == 0U);
-    if (should_log_diag_count(count) ||
+    if (/* the should_log_diag_count() disjunct was always false */
         (!g_boot_scene_active && ret != 0) ||
         (g_boot_scene_active && (ret == 0 || log_paired))) {
-        char extra[160];
-        snprintf(extra,
-                 sizeof(extra),
-                 "self=%p other=%p used=%p overlay=%p ret=%d forced=%d scene=%d drop=0 filter=0 pair=%d",
-                 self,
-                 other_frame,
-                 other_frame,
-                 (void *)overlay_frame,
-                 ret,
-                 forced,
-                 (int)g_boot_scene_active,
-                 paired_overlay_frame);
-        log_diag_counter("RenderFrame::Execute", count, first_ms, extra);
     }
     return forced;
 }
 
 static void hook_gamerender_render_frame(void) {
     static uint32_t count = 0;
-    static uint64_t first_ms = 0;
 
     count++;
-    if (!first_ms) {
-        first_ms = now_ms();
-    }
-    if (should_log_diag_count(count)) {
-        log_diag_counter("GameRender::RenderFrame", count, first_ms, NULL);
-    }
     force_native_render_dimensions("game-render-frame");
     SO_CONTINUE_VOID(g_hook_gamerender_render_frame);
 }
 
 static void hook_gamerender_render_scene(void *scene_ctx, const void *params) {
     static uint32_t count = 0;
-    static uint64_t first_ms = 0;
 
     count++;
-    if (!first_ms) {
-        first_ms = now_ms();
-    }
     if (count == 1U) {
-        /* First real scene render = assets loaded, game is starting. Stop the
-         * loading screen and log the total asset-load time. */
+        /* First real scene render = assets loaded, the game is starting. */
         g_boot_scene_active = 1;
         launch_state_mark_scene_active();
-        LS_DONE();
-    }
-    if (count <= 8U || (count % 1024U) == 0U) {
-        char extra[96];
-        snprintf(extra, sizeof(extra), "scene_ctx=%p params=%p", scene_ctx, params);
-        log_diag_counter("GameRender::RenderScene", count, first_ms, extra);
     }
     force_native_render_dimensions("game-render-scene");
     SO_CONTINUE_VOID(g_hook_gamerender_render_scene, scene_ctx, params);
@@ -1902,7 +2342,6 @@ static void hook_playback_controller_update(uint32_t frame_time_bits,
                                             uint32_t actual_frame_time_bits) {
     static uint32_t count = 0;
     static uint32_t repaired = 0;
-    static uint64_t first_ms = 0;
 
     /* Animation-rate throttle (opt-in anim_rate.txt): on non-Nth frames, accumulate
      * this frame's dt and SKIP the whole update (controllers don't advance); on the
@@ -1925,9 +2364,31 @@ static void hook_playback_controller_update(uint32_t frame_time_bits,
             extern volatile uint32_t g_mcsm_present_dt_us;
             const uint32_t pdt = g_mcsm_present_dt_us;
             static uint32_t slow = 0, fast = 0;
-            if      (pdt > 38000u) { slow++; fast = 0; }   /* < ~26 fps: dropping   */
-            else if (pdt < 33000u) { fast++; slow = 0; }   /* > ~30 fps: healthy    */
-            else                   { slow = 0; fast = 0; } /* dead-band: hold state */
+            /* ★ THRESHOLDS MUST FOLLOW THE CONFIGURED CAP (fixed 2026-07-30).
+             * These were the literals 38000 and 33000, i.e. hand-tuned for a 30fps
+             * cap only, which made the throttle misbehave on every other rate:
+             *   fps_cap=24 (period 41666): a PERFECTLY paced frame is 41666us, which
+             *     is > 38000, so it counted as "dropping" -- the throttle would latch
+             *     ON permanently and halve animation on a profile that was hitting
+             *     its target exactly.
+             *   fps_cap=60 (period 16666): a frame at 33ms is a catastrophic miss
+             *     (half rate), yet 33000 is neither > 38000 nor < 33000, so it landed
+             *     in the dead-band and the throttle NEVER engaged -- anim_rate=2 on
+             *     the performance profile was silently inert.
+             * Derive both from the real period instead. The ratios reproduce the old
+             * 30fps behaviour (37500/33333 vs the old 38000/33000) so that rate is
+             * unchanged, while 24 and 60 now mean what they say. */
+            const uint32_t period = mcsm_frame_period_us();
+            const uint32_t drop_us = period ? (period + period / 8u)  : 38000u; /* 1.125x */
+            /* "Healthy" must be slightly ABOVE the period, not equal to it. A
+             * perfectly paced frame measures the period (or a hair over), which is
+             * neither > drop_us nor < period -- so with ok_us == period it landed in
+             * the dead-band forever and a throttle that had once engaged could never
+             * release. +3% makes an on-target frame count as healthy. */
+            const uint32_t ok_us   = period ? (period + period / 32u) : 34000u;
+            if      (pdt > drop_us) { slow++; fast = 0; }   /* clearly dropping      */
+            else if (pdt < ok_us)   { fast++; slow = 0; }   /* holding target        */
+            else                    { slow = 0; fast = 0; } /* dead-band: hold state */
             if (!throttle_active && slow >= 5u) {
                 throttle_active = 1; phase = 0; acc_ft = 0.0f; acc_aft = 0.0f;
                 l_info("ANIM: throttle ON 1/%d (present=%uus dropping)", rate, pdt);
@@ -1951,9 +2412,6 @@ static void hook_playback_controller_update(uint32_t frame_time_bits,
     }
 
     count++;
-    if (!first_ms) {
-        first_ms = now_ms();
-    }
 
     const float frame_time = float_from_bits(frame_time_bits);
     const float actual_frame_time = float_from_bits(actual_frame_time_bits);
@@ -1985,18 +2443,6 @@ static void hook_playback_controller_update(uint32_t frame_time_bits,
     if (count <= 16U ||
         (did_repair && (repaired <= 8U || (repaired % 512U) == 0U)) ||
         (count % 2048U) == 0U) {
-        char extra[256];
-        snprintf(extra,
-                 sizeof(extra),
-                 "scene=%d ft=%.6f aft=%.6f out_ft=%.6f out_aft=%.6f repair=%d repaired=%u",
-                 (int)g_boot_scene_active,
-                 frame_time,
-                 actual_frame_time,
-                 out_frame_time,
-                 out_actual_frame_time,
-                 did_repair,
-                 repaired);
-        log_diag_counter("PlaybackController::Update", count, first_ms, extra);
     }
 
     /* libGameEngine was built softfp, so these float arguments arrive in r0/r1.
@@ -2011,7 +2457,9 @@ static void hook_playback_controller_update(uint32_t frame_time_bits,
     playback_update_raw_fn fn = g_hook_playback_controller_update.thumb_addr
         ? (playback_update_raw_fn)g_hook_playback_controller_update.thumb_addr
         : (playback_update_raw_fn)g_hook_playback_controller_update.addr;
+    const uint64_t t0_pbc = MCSM_PHASE_T0();
     fn(out_frame_bits, out_actual_bits);
+    MCSM_PHASE_ADD(g_pbc_us, g_pbc_n, t0_pbc);
     kuKernelCpuUnrestrictedMemcpy((void *)g_hook_playback_controller_update.addr,
                                   g_hook_playback_controller_update.patch_instr,
                                   sizeof(g_hook_playback_controller_update.patch_instr));
@@ -2019,93 +2467,41 @@ static void hook_playback_controller_update(uint32_t frame_time_bits,
                         sizeof(g_hook_playback_controller_update.patch_instr));
 }
 
+__attribute__((unused))
 static void *hook_renderframe_allocate_view(void *self, const void *params) {
     static uint32_t count = 0;
-    static uint64_t first_ms = 0;
 
     count++;
-    if (!first_ms) {
-        first_ms = now_ms();
-    }
 
     if (!self || !params) {
-        if (count <= 8U || (count % 256U) == 0U) {
-            char extra[128];
-            char caller_desc[96];
-            describe_return_address(__builtin_return_address(0), caller_desc, sizeof(caller_desc));
-            snprintf(extra, sizeof(extra), "caller=%s self=%p params=%p skipped=1", caller_desc, self, params);
-            log_diag_counter("RenderFrameScene::AllocateView", count, first_ms, extra);
-        }
         return NULL;
     }
 
     void *view = SO_CONTINUE(void *, g_hook_renderframe_allocate_view, self, params);
     if (!view) {
-        if (should_log_diag_count(count)) {
-            char extra[80];
-            char caller_desc[96];
-            describe_return_address(__builtin_return_address(0), caller_desc, sizeof(caller_desc));
-            snprintf(extra, sizeof(extra), "caller=%s view=NULL", caller_desc);
-            log_diag_counter("RenderFrameScene::AllocateView", count, first_ms, extra);
-        }
         return NULL;
     }
 
-    const uint8_t *u8 = (const uint8_t *)view;
-    const uint32_t pass_type = *(const uint32_t *)(const void *)(u8 + 64);
-    const uint32_t target_ref = *(const uint32_t *)(const void *)(u8 + 176);
-    const int log_this = (count <= 16U) || ((count % 512U) == 0U) || (u8[144] != 0U);
+    /* pass_type/target_ref/log_this were three pointer derefs computed only to
+     * feed a diagnostic string nobody read; removed with it. */
 
-    if (log_this) {
-        char extra[256];
-        char caller_desc[96];
-        describe_return_address(__builtin_return_address(0), caller_desc, sizeof(caller_desc));
-        snprintf(extra,
-                 sizeof(extra),
-                 "caller=%s view=%p pass=%u flags128=%u/%u/%u flags144=%u/%u/%u mask=%u aux=%u target=%08X",
-                 caller_desc,
-                 view,
-                 pass_type,
-                 u8[128],
-                 u8[129],
-                 u8[130],
-                 u8[144],
-                 u8[145],
-                 u8[146],
-                 u8[147],
-                 u8[148],
-                 target_ref);
-        log_diag_counter("RenderFrameScene::AllocateView", count, first_ms, extra);
-    }
 
     return view;
 }
 
+/* Compiled-in but unreferenced while ENABLE_HOT_RENDER_VIEW_DIAG_HOOKS is 0.
+ * Kept because these are the per-view diagnostics, and deliberately NOT installed:
+ * AllocateView/PushView run per view per frame on multiple render threads, which is
+ * the exact profile that made the SO_CONTINUE hooks crash. */
+__attribute__((unused))
 static void *hook_renderframe_push_view(void *self, void *frame_scene, const void *params) {
     static uint32_t count = 0;
-    static uint64_t first_ms = 0;
     static uint32_t overlay_track_logs = 0;
 
     count++;
-    if (!first_ms) {
-        first_ms = now_ms();
-    }
 
     void *caller = __builtin_return_address(0);
     if (!self || !frame_scene || !params) {
-        if (count <= 8U || (count % 256U) == 0U) {
-            char extra[192];
-            char caller_desc[96];
-            describe_return_address(caller, caller_desc, sizeof(caller_desc));
-            snprintf(extra,
-                     sizeof(extra),
-                     "caller=%s self=%p frame=%p params=%p skipped=1",
-                     caller_desc,
-                     self,
-                     frame_scene,
-                     params);
-            log_diag_counter("RenderFrame::PushView", count, first_ms, extra);
-        }
         return NULL;
     }
 
@@ -2122,64 +2518,21 @@ static void *hook_renderframe_push_view(void *self, void *frame_scene, const voi
     }
 
     void *view = SO_CONTINUE(void *, g_hook_renderframe_push_view, self, frame_scene, params);
-    if (count <= 8U || (count % 256U) == 0U) {
-        char extra[224];
-        char caller_desc[96];
-        describe_return_address(caller, caller_desc, sizeof(caller_desc));
-        snprintf(extra,
-                 sizeof(extra),
-                 "caller=%s self=%p frame=%p params=%p ret=%p",
-                 caller_desc,
-                 self,
-                 frame_scene,
-                 params,
-                 view);
-        log_diag_counter("RenderFrame::PushView", count, first_ms, extra);
-    }
     return view;
 }
 
 static void *hook_renderobject_viewport_prepare_view(void *self, void *frame_scene, void *target_ctx) {
     static uint32_t count = 0;
-    static uint64_t first_ms = 0;
 
     count++;
-    if (!first_ms) {
-        first_ms = now_ms();
-    }
 
     if (!self || !frame_scene) {
-        if (count <= 8U || (count % 128U) == 0U) {
-            char extra[128];
-            snprintf(extra,
-                     sizeof(extra),
-                     "self=%p frame=%p rtctx=%p skipped=1",
-                     self,
-                     frame_scene,
-                     target_ctx);
-            log_diag_counter("RenderObject_Viewport::PrepareView", count, first_ms, extra);
-        }
         return NULL;
     }
 
     void *view = SO_CONTINUE(void *, g_hook_viewport_prepare_view, self, frame_scene, target_ctx);
-    if (count <= 8U || (count % 128U) == 0U || !view) {
-        const uint32_t *u32 = (const uint32_t *)self;
-        void *scene_ptr = self ? (void *)(uintptr_t)u32[0x08 / 4] : NULL;
-        void *camera_slot = self ? (void *)(uintptr_t)u32[0x10 / 4] : NULL;
-        char extra[192];
-
-        snprintf(extra,
-                 sizeof(extra),
-                 "self=%p frame=%p rtctx=%p scene=%p camera_slot=%p ret=%p",
-                 self,
-                 frame_scene,
-                 target_ctx,
-                 scene_ptr,
-                 camera_slot,
-                 view);
-        log_diag_counter("RenderObject_Viewport::PrepareView", count, first_ms, extra);
-    }
+    /* The throttled block here only unpacked scene_ptr/camera_slot for a
+     * discarded diagnostic string; removed with it. */
 
     return view;
 }
@@ -2187,45 +2540,13 @@ static void *hook_renderobject_viewport_prepare_view(void *self, void *frame_sce
 static void hook_rendertexture_prepare_view(void *self, void *frame_scene, void *target_ctx,
                                             void *render_scene_ctx, int index) {
     static uint32_t count = 0;
-    static uint64_t first_ms = 0;
 
     count++;
-    if (!first_ms) {
-        first_ms = now_ms();
-    }
 
     if (!self || !frame_scene) {
-        if (count <= 8U || (count % 256U) == 0U) {
-            char extra[128];
-            snprintf(extra,
-                     sizeof(extra),
-                     "self=%p frame=%p rtctx=%p scene_ctx=%p index=%d skipped=1",
-                     self,
-                     frame_scene,
-                     target_ctx,
-                     render_scene_ctx,
-                     index);
-            log_diag_counter("RenderTexture::PrepareView", count, first_ms, extra);
-        }
         return;
     }
 
-    if (count <= 8U || (count % 256U) == 0U) {
-        char extra[160];
-        const uint32_t *u32 = (const uint32_t *)self;
-        void *camera_slot = self ? (void *)(uintptr_t)u32[0x14 / 4] : NULL;
-        snprintf(extra,
-                 sizeof(extra),
-                 "self=%p frame=%p rtctx=%p scene_ctx=%p index=%d camera_slot=%p width=%u",
-                 self,
-                 frame_scene,
-                 target_ctx,
-                 render_scene_ctx,
-                 index,
-                 camera_slot,
-                 self ? u32[0x38 / 4] : 0U);
-        log_diag_counter("RenderTexture::PrepareView", count, first_ms, extra);
-    }
 
     SO_CONTINUE_VOID(g_hook_rendertexture_prepare_view, self, frame_scene, target_ctx, render_scene_ctx, index);
 }
@@ -2334,26 +2655,9 @@ static void *hook_platform_android_get_base_user_directory(void *out_str, void *
 
 static void hook_switch_default_render_target(const void *clear) {
     static uint32_t count = 0;
-    static uint64_t first_ms = 0;
 
     count++;
-    if (!first_ms) {
-        first_ms = now_ms();
-    }
 
-    if (count <= 8U || (count % 128U) == 0U) {
-        char extra[96];
-        const uint32_t *u32 = (const uint32_t *)clear;
-        snprintf(extra,
-                 sizeof(extra),
-                 "clear=%p rgba=%08X/%08X/%08X/%08X",
-                 clear,
-                 clear ? u32[0] : 0U,
-                 clear ? u32[1] : 0U,
-                 clear ? u32[2] : 0U,
-                 clear ? u32[3] : 0U);
-        log_diag_counter("RenderDevice::SwitchDefaultRenderTarget", count, first_ms, extra);
-    }
 
     SO_CONTINUE_VOID(g_hook_switch_default_render_target, clear);
 }
@@ -2393,6 +2697,238 @@ static allocate_gl_buffer_fn resolve_allocate_gl_buffer(void) {
     return fn;
 }
 
+/* ★ PER-CALL OVERHEAD IS THE COST, NOT BANDWIDTH (device-measured 2026-07-30).
+ *
+ * SKINPROBE on a heavy scene, per frame:
+ *     locks/f 525.7   respec/f 262.8   KB/f 231.6   malloc/f 262.8
+ * so 263 full glBufferData respecifies per frame, each paired with a malloc and a
+ * free -- and the average payload is 231.6KB/263 = 902 BYTES. The earlier estimate
+ * assumed a handful of large buffers and therefore predicted ~0.46ms of memcpy.
+ * Wrong shape entirely: at 902 bytes the copy is free and the cost is 263 x
+ * (malloc + free + vitaGL GPU-alloc + GPU-free), i.e. 1.3-5.3ms depending on
+ * allocator cost. It is also what makes free VRAM collapse 80912KB -> 75KB, because
+ * every respecify pushes the old allocation onto vitaGL's deferred-free list.
+ *
+ * Two side tables remove that overhead without changing a single byte the engine
+ * sees:
+ *   VB_CPU   T3VertexBuffer* -> a CPU staging buffer that PERSISTS across frames.
+ *            [self+0xd0] is still set on lock and cleared on unlock, so the engine
+ *            never observes our pointer outside the lock window -- which is what
+ *            makes this safe even though the engine frees that field with
+ *            operator delete[] on its own path.
+ *   VB_SIZE  GL buffer name -> the size currently allocated on the GPU, so unlock
+ *            can use glBufferSubData (verified in the SHIPPED libvitaGL.a to be a
+ *            bare sceClibMemcpy/sceDmacMemcpy with NO allocation, because
+ *            BUFFERS_SPEEDHACK is on) whenever the size has not changed.
+ *
+ * THREADING: SKINPROBE reports a single, unchanging tid (0x400103D5) for every lock
+ * in a session, so this path is single-threaded in practice. Rather than assume it,
+ * the tables record the owning thread and any call from a different one falls back
+ * to the original malloc/glBufferData path, which is always correct. */
+#define VB_SLOTS 1024u
+typedef struct { void *key; void *cpu; uint32_t cap; } VbCpuSlot;
+static VbCpuSlot g_vb_cpu[VB_SLOTS];
+typedef struct { unsigned int name; uint32_t size; } VbSizeSlot;
+static VbSizeSlot g_vb_size[VB_SLOTS];
+static SceUID g_vb_owner_tid = -1;
+static uint32_t g_vb_foreign = 0;
+/* Consecutive locks by a thread that is NOT the current table owner. Reset to 0 the
+ * moment the owner locks again, so this only climbs while the owner is truly idle. */
+static uint32_t g_vb_steal_run = 0;
+
+/* ★ REWRITTEN AFTER THE DEVICE PROVED THE FIRST VERSION INERT (2026-07-30).
+ *
+ * v1 was open-addressed, linear-probed and NEVER DELETED, on the assumption that a
+ * few hundred live buffers would keep the load factor low. Device says otherwise:
+ * 709 355 locks in one session and SKINPROBE reported `subdata=0 reuse=0` -- the
+ * tables saturated almost immediately and every lookup fell back to the old path,
+ * so the whole optimisation executed zero times while still compiling cleanly and
+ * reporting "0 warnings". Compiling is not running.
+ *
+ * Fix: bounded probe with REPLACEMENT. A colliding key evicts the resident entry
+ * (freeing its buffer) instead of walking the table and eventually failing. That
+ * makes the tables self-renewing and O(1) worst case, so a hit rate below 100%
+ * costs one realloc rather than disabling the feature. Slots raised to 1024. */
+#define VB_PROBE 4u
+
+/* ☠ SCAN THE WHOLE WINDOW FOR A MATCH BEFORE INSERTING. Both tables used to insert
+ * at the FIRST FREE slot the moment they saw one, without checking whether the key
+ * already lived further along the probe window -- and entries are deleted (evicted,
+ * or cleared by mcsm_vb_forget_gl_buffer), so a free slot BEFORE an occupied one is
+ * a normal state, not an impossible one.
+ *
+ * That produced TWO live entries for one key, and the two lookups then disagreed:
+ *   - g_vb_size: the delete-forget guard cleared the first copy and left the second
+ *     holding the OLD byte count. GL recycles buffer names, so the next buffer to
+ *     get that name could match the stale entry, see `ss->size == size` on its very
+ *     first upload, and take the glBufferSubData branch into storage vitaGL never
+ *     allocated at that size -- exactly the memory-unsafe case the forget guard
+ *     exists to prevent, reintroduced behind it.
+ *   - g_vb_cpu: vb_cpu_slot (lock) and vb_cpu_find (unlock) could land on different
+ *     copies, so unlock would see `slot->cpu != ptr`, conclude the staging buffer was
+ *     a plain malloc, and free a pointer the table still hands out.
+ *
+ * Find first, then insert or evict. */
+static VbCpuSlot *vb_cpu_slot(void *key) {
+    uint32_t h = (uint32_t)(uintptr_t)key;
+    h ^= h >> 16; h *= 0x7feb352du; h ^= h >> 15;
+    VbCpuSlot *freeslot = NULL, *victim = NULL;
+    for (uint32_t i = 0; i < VB_PROBE; ++i) {
+        VbCpuSlot *s = &g_vb_cpu[(h + i) & (VB_SLOTS - 1u)];
+        if (s->key == key) return s;
+        if (!s->key) { if (!freeslot) freeslot = s; }
+        else if (!victim) victim = s;
+    }
+    if (freeslot) { freeslot->key = key; freeslot->cpu = NULL; freeslot->cap = 0; return freeslot; }
+    /* Evict. Freeing here is safe: the slot is not the live lock (that one matched
+     * above), and unlock only frees a pointer the table does not own. */
+    if (victim->cpu) { free_soloader(victim->cpu); g_vb_evict++; }
+    victim->key = key; victim->cpu = NULL; victim->cap = 0;
+    return victim;
+}
+/* ☠ MUST be called when a GL buffer name is deleted. The size table is keyed on the
+ * GL NAME and its entries used to live for the whole process, but GL RECYCLES deleted
+ * names: the engine streams a mesh out with glDeleteBuffers and a later glGenBuffers
+ * hands the same name to an unrelated buffer. The stale entry then carries the OLD
+ * size, and if the new buffer's first upload happens to be that same byte count,
+ * upload_cpu_buffer sees `ss->size == size` on its VERY FIRST upload and takes the
+ * glBufferSubData branch -- writing into storage vitaGL never allocated at that size.
+ * Forgetting the name forces that first upload back through the allocating path.
+ * (g_vb_cpu is NOT touched here: it is keyed on the T3VertexBuffer object, not the GL
+ * name, so a deleted GL buffer says nothing about it.) */
+void mcsm_vb_forget_gl_buffer(unsigned int name) {
+    if (!name) return;
+    uint32_t h = name; h ^= h >> 16; h *= 0x7feb352du; h ^= h >> 15;
+    /* Clears EVERY match in the window, not just the first. vb_size_slot can no
+     * longer create a duplicate, but this is the guard that stands between a
+     * recycled GL name and an unallocated glBufferSubData -- it should not depend on
+     * the insert path staying correct. */
+    for (uint32_t i = 0; i < VB_PROBE; ++i) {   /* mirror vb_size_slot's hash+probe */
+        VbSizeSlot *s = &g_vb_size[(h + i) & (VB_SLOTS - 1u)];
+        if (s->name == name) { s->name = 0; s->size = 0; }
+    }
+}
+
+/* PURE lookup: never inserts, never evicts, never frees. Unlock needs to answer
+ * "does the table own this pointer?" and must not perturb the table to do it.
+ * Scans the FULL window rather than stopping at the first free slot, so it agrees
+ * with vb_cpu_slot by construction instead of by relying on g_vb_cpu never clearing
+ * an entry -- the two disagreeing is what frees a live staging buffer. */
+static VbCpuSlot *vb_cpu_find(void *key) {
+    uint32_t h = (uint32_t)(uintptr_t)key;
+    h ^= h >> 16; h *= 0x7feb352du; h ^= h >> 15;
+    for (uint32_t i = 0; i < VB_PROBE; ++i) {
+        VbCpuSlot *s = &g_vb_cpu[(h + i) & (VB_SLOTS - 1u)];
+        if (s->key == key) return s;
+    }
+    return NULL;
+}
+
+/* Find-then-insert, for the reason spelled out above vb_cpu_slot: entries here ARE
+ * cleared (mcsm_vb_forget_gl_buffer), so a free slot ahead of an occupied one is
+ * routine, and inserting on sight of it would leave a second entry for the same GL
+ * name carrying a stale byte count. */
+static VbSizeSlot *vb_size_slot(unsigned int name) {
+    uint32_t h = name; h ^= h >> 16; h *= 0x7feb352du; h ^= h >> 15;
+    VbSizeSlot *freeslot = NULL, *victim = NULL;
+    for (uint32_t i = 0; i < VB_PROBE; ++i) {
+        VbSizeSlot *s = &g_vb_size[(h + i) & (VB_SLOTS - 1u)];
+        if (s->name == name) return s;
+        if (!s->name) { if (!freeslot) freeslot = s; }
+        else if (!victim) victim = s;
+    }
+    if (freeslot) { freeslot->name = name; freeslot->size = 0; return freeslot; }
+    victim->name = name; victim->size = 0;   /* forces one full respecify, then hits */
+    return victim;
+}
+/* Are we the thread that owns the staging tables?
+ *
+ * ☠ "FIRST CALLER CLAIMS THEM" WAS WRONG, AND IT COST 256 MALLOCS PER FRAME.
+ * Device evidence (r82, heavy scene): SKINPROBE reported malloc/f=256 and reuse=0 --
+ * i.e. the reuse path this gate protects NEVER ran -- alongside 16204 warnings, all
+ * identical: `lock from foreign tid 0x400103D5 (owner 0x400101F5)`. Exactly ONE
+ * foreign tid in the whole session. The first PlatformLock of a run happens on an
+ * init-time thread, which claimed the tables permanently; every REAL lock then came
+ * from the render thread and was rejected, falling through to a raw malloc/free pair
+ * per skinned mesh per frame.
+ *
+ * Fix: ownership is now TRANSFERABLE. A thread that is consistently doing the locking
+ * takes the tables over from an owner that has gone quiet. The counter resets whenever
+ * the incumbent owner locks, so a genuinely contended pattern (two threads alternating)
+ * never reaches the threshold and both keep using the safe malloc path -- the tables
+ * are still only ever touched by one thread at a time, which is what makes them safe
+ * without a lock. Only a persistently absent owner is displaced. */
+#define VB_STEAL_AFTER 64u   /* consecutive foreign locks before ownership moves */
+
+/* ☠ CALL vb_thread_claim() EXACTLY ONCE PER LOCK. It is the side-effecting half --
+ * it counts foreign locks and can transfer ownership -- so calling it again later in
+ * the same lock/unlock cycle inflates both the counter and the steal rate. It used to
+ * be called three times per vertex buffer (lock, upload, unlock), which made
+ * VB_STEAL_AFTER mean 21 locks rather than 64, tripled the reported `foreign=` count,
+ * and, worse, let ownership move BETWEEN a lock and its unlock: the unlocking thread
+ * would then see itself as a non-owner, conclude the staging buffer was its own
+ * malloc, and free a pointer the table still holds -- a dangling table entry handed
+ * straight to the next lock of that buffer.
+ * Everywhere else asks vb_thread_is_owner(), or (at unlock) does not ask at all and
+ * uses vb_cpu_find() to answer the only question that actually matters: is this
+ * pointer ours to free? */
+/* ☠ THIS DOES THE SYSCALL, AND IT HAS TO. A cached "am I the owner" flag was tried
+ * on 2026-07-31 to save ~525 sceKernelGetThreadId() calls a frame, and it was WRONG
+ * in two ways that only a release review caught:
+ *   - vb_thread_claim() runs inside PlatformLock's `if (!ptr)` branch, so a re-lock
+ *     (ptr already set) never refreshes the flag -- the upload then consumed a verdict
+ *     from an EARLIER lock cycle;
+ *   - the T3IndexBuffer path never calls vb_thread_claim() at all, yet its unlock goes
+ *     through upload_cpu_buffer() and read the flag anyway -- so index uploads used
+ *     whatever the last VERTEX lock happened to leave behind.
+ * The flag gates use of g_vb_size, which drives the no-allocation glBufferSubData
+ * path. A wrongly-affirmative answer from a foreign thread is precisely the race this
+ * gate exists to prevent, and that path is memory-unsafe when the bookkeeping is
+ * wrong. A kernel round-trip per upload is the price of the guarantee.
+ *
+ * The saving that DID survive is the third call site: unlock no longer asks "am I the
+ * owner" at all, because vb_cpu_find() answers the only question it actually has --
+ * is this pointer ours to free -- which is a property of the pointer, not the caller. */
+static int vb_thread_is_owner(void) {
+    return g_vb_owner_tid == sceKernelGetThreadId();
+}
+
+static int vb_thread_claim(void) {
+    SceUID me = sceKernelGetThreadId();
+    if (g_vb_owner_tid == -1) { g_vb_owner_tid = me; return 1; }
+    if (g_vb_owner_tid == me) { g_vb_steal_run = 0; return 1; }
+
+    g_vb_foreign++;
+    if (++g_vb_steal_run >= VB_STEAL_AFTER) {
+        /* The incumbent has not locked once in VB_STEAL_AFTER consecutive locks.
+         * Take the tables and LEAVE THE EXISTING ENTRIES ALONE.
+         *
+         * ☠ An earlier version freed every cached buffer here "so the new owner
+         * cannot hand out a stale one". That was a use-after-free waiting to happen:
+         * these pointers are given to the engine by writing them into the
+         * T3VertexBuffer at u32[0xd0/4], and by design the slot RETAINS the pointer
+         * across unlock (unlock only clears the engine's copy). If the previous owner
+         * were between its PlatformLock and PlatformUnlock at the moment of transfer,
+         * its live staging buffer would be freed underneath it and the engine would
+         * skin vertices into freed memory. vb_thread_ok() is deliberately lock-free,
+         * so nothing orders those two threads.
+         * Keeping the entries is safe AND correct: slots are keyed on the buffer's
+         * own `self` pointer so the new owner can only reach an entry by presenting
+         * the same object, and the existing `slot->cap < bytes` growth check already
+         * handles an entry sized for different traffic. */
+        l_info("VBOPT: staging tables move 0x%08X -> 0x%08X after %u consecutive "
+               "foreign locks (was costing a malloc per lock)",
+               (unsigned)g_vb_owner_tid, (unsigned)me, VB_STEAL_AFTER);
+        g_vb_owner_tid = me;
+        g_vb_steal_run = 0;
+        return 1;
+    }
+    if ((g_vb_foreign & 0xFFu) == 0u)
+        l_warn("VBOPT: lock from foreign tid 0x%08X (owner 0x%08X) — using the "
+               "malloc path for it (#%u)", (unsigned)me, (unsigned)g_vb_owner_tid, g_vb_foreign);
+    return 0;
+}
+
 static int upload_cpu_buffer(unsigned int buffer,
                              unsigned int target,
                              size_t size,
@@ -2414,9 +2950,71 @@ static int upload_cpu_buffer(unsigned int buffer,
 
     static uint32_t s_upload_count = 0;
     s_upload_count++;
+    g_vb_kb += (uint32_t)(size / 1024u);
+    if ((uint32_t)size > g_vb_max_bytes) g_vb_max_bytes = (uint32_t)size;
+    /* Sample the owning thread on the FIRST upload as well as every 256th. The
+     * `& 0xFF` test alone never fired below 256 uploads, and a menu produces about
+     * 16 -- so SKINPROBE reported `tid=0x00000000` for the whole session, which
+     * reads as "no thread" or "the probe is broken" rather than "not sampled yet".
+     * Device log 2026-07-31 showed exactly that next to a perfectly healthy run. */
+    if (s_upload_count == 1u || (s_upload_count & 0xFFu) == 0u)
+        g_vb_tid = (uint32_t)sceKernelGetThreadId();
+
+    /* ★ glBufferSubData WHEN THE SIZE HAS NOT CHANGED (2026-07-30).
+     *
+     * RenderDevice::AllocateGLBuffer ends in glBufferData, which in vitaGL frees the
+     * old GPU allocation (onto a deferred dirty list), takes a NEW one, and copies.
+     * Doing that 263 times a frame for buffers averaging 902 bytes is where the time
+     * went, and the deferred frees are why free VRAM fell 80912KB -> 75KB.
+     *
+     * glBufferSubData needs no allocation at all. Verified in the SHIPPED
+     * libvitaGL.a (not the source -- that mistake already cost one crash):
+     *     glNamedBufferSubData:
+     *       ldr r0,[r0,#0] ; add r0,r1 ; <size>=8192 && addr>=0x81000000 ?
+     *       b sceDmacMemcpy : b sceClibMemcpy
+     * i.e. a bare memcpy with a DMA fast path, because BUFFERS_SPEEDHACK is on.
+     * It also has no NULL/bounds check (NO_DEBUG), which is exactly why this is
+     * gated on OUR OWN record of the size we last allocated for this buffer name --
+     * never on an assumption about vitaGL's state. First sight of a buffer, or any
+     * size change, still goes through the full allocating path. */
+    /* ★ INDEX BUFFERS BELONG HERE TOO (2026-07-30). This used to test
+     * `target == GL_ARRAY_BUFFER`, which let only HALF the traffic take the
+     * no-allocation path. Device (r82 heavy scene): locks/f=512 against respec/f=256
+     * -- the engine locks a vertex AND an index buffer per skinned mesh, ~256 of each
+     * per frame. The vertex half reached glBufferSubData; the ~256
+     * GL_ELEMENT_ARRAY_BUFFER uploads fell through to the allocating path below,
+     * which inside vitaGL is a GPU free + realloc + full copy EVERY FRAME. Index data
+     * for a skinned mesh is static -- only the vertex positions change -- so those
+     * respecifies were near-pure waste.
+     * Safe because the table is keyed on the GL buffer NAME, which is unique across
+     * targets (glGenBuffers hands out one namespace), so vertex and index buffers
+     * cannot collide in vb_size_slot. The size-change and first-sight paths are
+     * unchanged: anything new or resized still goes through the full allocation. */
+    VbSizeSlot *ss = ((target == GL_ARRAY_BUFFER || target == GL_ELEMENT_ARRAY_BUFFER)
+                      && vb_thread_is_owner()) ? vb_size_slot(buffer) : NULL;
+    if (ss && ss->size == (uint32_t)size && size > 0) {
+        glBindBuffer(target, buffer);
+        glBufferSubData(target, 0, (GLsizeiptr)size, data);
+        g_vb_subdata++;
+        return 1;
+    }
+
+    g_vb_respec++;
     GLenum pre_err = patch_drain_gl_errors();
     int ret = alloc(buffer, target, (unsigned int)size, data, GL_STREAM_DRAW);
     GLenum err = glGetError();
+    /* ☠ RECORD THE SIZE ONLY IF THE ALLOCATION ACTUALLY HAPPENED, and that means
+     * BOTH signals. This used to check the GL error alone and ignore the engine
+     * allocator's own return value, which it merely logged. If AllocateGLBuffer failed
+     * WITHOUT leaving a GL error -- an early-out on its own bookkeeping, say -- we
+     * recorded a size for storage that was never created, and the next upload of the
+     * same size would sail into the glBufferSubData fast path and write into a buffer
+     * GL never allocated at that size. That path is memory-unsafe by construction
+     * (vitaGL is built NO_DEBUG, so glNamedBufferSubData is a bare memcpy with no
+     * bounds check); the whole point of this record is that it is only ever set from
+     * an allocation we watched succeed. Being wrong in the conservative direction just
+     * costs one extra respecify. */
+    if (ss && ret && err == GL_NO_ERROR) ss->size = (uint32_t)size;
     if (s_upload_count <= 32U || err != GL_NO_ERROR || pre_err != GL_NO_ERROR) {
         l_info("Patch: %s AllocateGLBuffer #%u buffer=%u target=0x%X size=%u data=%p ret=%d pre=0x%X err=0x%X",
                label,
@@ -2438,6 +3036,7 @@ static int hook_vertexbuffer_platform_lock(void *self, int read_only) {
         return 0;
     }
 
+    g_vb_locks++;
     uint32_t *u32 = (uint32_t *)self;
     uint32_t elem_count = u32[0xc0 / 4];
     uint32_t mode = u32[0xd4 / 4];
@@ -2471,12 +3070,34 @@ static int hook_vertexbuffer_platform_lock(void *self, int read_only) {
             return 0;
         }
 
-        ptr = malloc_soloader(bytes);
-        if (!ptr) {
-            l_error("Patch: T3VertexBuffer::PlatformLock fallback malloc failed (%u bytes).", (unsigned)bytes);
-            return 0;
+        /* REUSE the staging buffer across frames instead of malloc/free per lock.
+         * Device data: 263 of these per frame at an average of 902 bytes, so the
+         * allocator traffic -- not the copy -- was the cost. Grow-only; the slot
+         * keeps the pointer after unlock clears [self+0xd0], so the engine never
+         * sees a pointer it might free with the wrong allocator. */
+        VbCpuSlot *slot = vb_thread_claim() ? vb_cpu_slot(self) : NULL;
+        if (slot) {
+            if (slot->cap < bytes) {
+                void *grown = slot->cpu ? realloc_soloader(slot->cpu, bytes)
+                                        : malloc_soloader(bytes);
+                if (!grown) {
+                    l_error("Patch: T3VertexBuffer::PlatformLock staging grow to %u FAILED.", (unsigned)bytes);
+                    return 0;
+                }
+                slot->cpu = grown; slot->cap = (uint32_t)bytes;
+                g_vb_mallocs++;              /* counts only real allocations now */
+            } else {
+                g_vb_reuse++;
+            }
+            ptr = slot->cpu;
+        } else {
+            ptr = malloc_soloader(bytes);
+            if (!ptr) {
+                l_error("Patch: T3VertexBuffer::PlatformLock fallback malloc failed (%u bytes).", (unsigned)bytes);
+                return 0;
+            }
+            g_vb_mallocs++;
         }
-
         u32[0xd0 / 4] = (uint32_t)(uintptr_t)ptr;
         /* Throttled: this fired 7420x/run (the #1 log-spam line) — synchronous
          * file writes that pile up during the already-slow scene loads. */
@@ -2554,8 +3175,14 @@ static int hook_vertexbuffer_platform_unlock(void *self) {
         return 0;
     }
 
+    /* Only free when the allocation is NOT owned by the reuse table. Asked as a plain
+     * table lookup rather than "am I the owner thread?": ownership can move between a
+     * lock and its unlock, and a thread that had just lost it would otherwise free the
+     * table's live staging buffer and leave the entry dangling. Whether the pointer is
+     * ours to free is a property of the pointer, not of the caller. */
     if (ptr) {
-        free_soloader(ptr);
+        VbCpuSlot *slot = vb_cpu_find(self);
+        if (!slot || slot->cpu != ptr) free_soloader(ptr);
     }
 
     u32[0xd0 / 4] = 0;
@@ -2570,17 +3197,22 @@ static int hook_indexbuffer_platform_unlock(void *self) {
     }
 
     uint32_t *u32 = (uint32_t *)self;
-    if (u32[0x20 / 4] == 0) {
-        return 0;
-    }
 
+    /* ☠ DECREMENT BEFORE THE GL-NAME BAIL. This used to `return 0` on a zero GL
+     * buffer name WITHOUT touching the lock counter, while PlatformLock increments it
+     * unconditionally (it only inspects the element count). One unlock down that path
+     * therefore left the counter permanently above zero, and PlatformLock's
+     * `if (lock_count > 1) return 1;` fast path then short-circuited every subsequent
+     * lock -- so that index buffer would never allocate its CPU staging buffer and
+     * never upload again, for the rest of the session. The vertex unlock next door
+     * decrements on every path, which is the correct shape. */
     uint32_t lock_count = u32[0x24 / 4];
     if (lock_count > 0) {
         lock_count -= 1;
         u32[0x24 / 4] = lock_count;
     }
 
-    if (lock_count > 0) {
+    if (lock_count > 0 || u32[0x20 / 4] == 0) {
         return 0;
     }
 
@@ -2588,11 +3220,17 @@ static int hook_indexbuffer_platform_unlock(void *self) {
 
     const void *ptr = (const void *)(uintptr_t)u32[0x3c / 4];
     const size_t bytes = (size_t)u32[0x2c / 4] * (size_t)u32[0x30 / 4];
-    if (!upload_cpu_buffer(u32[0x20 / 4], GL_ELEMENT_ARRAY_BUFFER, bytes, ptr, "T3IndexBuffer")) {
-        return 0;
-    }
-
-    return 1;
+    const int ok = upload_cpu_buffer(u32[0x20 / 4], GL_ELEMENT_ARRAY_BUFFER, bytes, ptr, "T3IndexBuffer");
+    /* Leave the element-array binding as we found it, exactly as the vertex unlock
+     * does for GL_ARRAY_BUFFER. Walking away with a mesh's index buffer still bound
+     * changes what a later glDrawElements with a client-side pointer reads, and the
+     * failure path did not restore it at all.
+     * ☠ The CPU pointer is deliberately NOT freed and [self+0x3c] deliberately NOT
+     * cleared: unlike the vertex path, that field normally holds the ENGINE's own
+     * buffer (PlatformLock only allocates when it finds NULL there), so freeing it
+     * would hand the engine's allocation to the wrong allocator. */
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+    return ok ? 1 : 0;
 }
 
 static void patch_vertexbuffer_platform_lock(void) {
@@ -2898,36 +3536,23 @@ static so_hook g_hook_job_init;
 
 static int hook_scriptmgr_init(int a, int b) {
     static uint32_t count = 0;
-    static uint64_t first_ms = 0;
     count++;
-    if (!first_ms) first_ms = now_ms();
-    char extra[32];
-    snprintf(extra, sizeof(extra), "a=%d b=%d", a, b);
-    log_diag_counter("ScriptManager::Initialize", count, first_ms, extra);
     return SO_CONTINUE(int, g_hook_scriptmgr_init, a, b);
 }
 
 static int hook_lua_register_resdesc(void *L) {
     static uint32_t count = 0;
-    static uint64_t first_ms = 0;
     count++;
-    if (!first_ms) first_ms = now_ms();
     launch_state_mark_progress();
-    if (should_log_diag_count(count)) {
-        log_diag_counter("luaRegisterResourceDescriptionWithEngine", count, first_ms, NULL);
-    }
     return SO_CONTINUE(int, g_hook_lua_register_resdesc, L);
 }
 
 static int hook_lua_retry_resdesc(void *L) {
     static uint32_t count = 0;
-    static uint64_t first_ms = 0;
     count++;
-    if (!first_ms) first_ms = now_ms();
     launch_state_mark_progress();
     // Always log: if this fires repeatedly, resource descriptions are failing to
     // load and the boot is stuck retrying them.
-    log_diag_counter("luaResourceRetryFailedResDescs", count, first_ms, "RESDESC RETRY/FAIL");
     return SO_CONTINUE(int, g_hook_lua_retry_resdesc, L);
 }
 
@@ -2939,12 +3564,8 @@ static int hook_lua_retry_resdesc(void *L) {
     static so_hook hook_var;                                            \
     static int fn_name(void *L) {                                      \
         static uint32_t count = 0;                                     \
-        static uint64_t first_ms = 0;                                 \
         count++;                                                       \
-        if (!first_ms) first_ms = now_ms();                           \
         launch_state_mark_progress();                                 \
-        log_diag_counter(label, count, first_ms, NULL);               \
-        LS_TICK();                                                     \
         return SO_CONTINUE(int, hook_var, L);                         \
     }
 
@@ -2974,9 +3595,7 @@ static int lua_push_forced_integer(void *L, int value, const char *label);
     static int fn_name(void *L) {                                       \
         (void)L;                                                        \
         static uint32_t count = 0;                                      \
-        static uint64_t first_ms = 0;                                   \
         count++;                                                         \
-        if (!first_ms) first_ms = now_ms();                             \
         launch_state_mark_progress();                                   \
         if (count <= 8U || (count & 0x3FU) == 0U) {                     \
             l_info("Login bypass: %s -> 0 values (offline) count=%u",   \
@@ -3152,10 +3771,29 @@ static int redirect_logical_user_to_temp(void *L, int idx) {
     if (!s) {
         return 0;
     }
-    static const char kPrefix[] = "logical:<User>/";
+    /* ★ BOTH SPELLINGS. The game writes the SAME location two ways, and this
+     * matched only one of them until 2026-07-31:
+     *
+     *     StatChoicesHandler.lua   "logical:<User>/choice.prop"     (one slash)
+     *     menu_stats.lua           "logical://<User>/choice.prop"   (TWO slashes)
+     *
+     * Both strings are literals in the shipped Lua -- read out of the packed
+     * .ttarch2 constant tables, not inferred -- and the engine treats them as the
+     * same location. The two-slash form is what the end-of-episode / stats screen
+     * uses to persist the choice_tracker document, so under a one-slash-only match
+     * that write was never redirected: it addressed the <User> location, which does
+     * not bind on this port, and was dropped. That is the "choices do not save"
+     * mechanism, and it has nothing to do with being online -- the data is local.
+     *
+     * (The engine's own <Project>/<Menu> paths use the two-slash form as well, so
+     * this is the general spelling rather than a one-off typo.) */
+    static const char kPrefix1[] = "logical:<User>/";
+    static const char kPrefix2[] = "logical://<User>/";
     const char *suffix = NULL; /* the part after any location prefix, or the whole bare name */
-    if (strncmp(s, kPrefix, sizeof(kPrefix) - 1) == 0) {
-        suffix = s + (sizeof(kPrefix) - 1);
+    if (strncmp(s, kPrefix1, sizeof(kPrefix1) - 1) == 0) {
+        suffix = s + (sizeof(kPrefix1) - 1);
+    } else if (strncmp(s, kPrefix2, sizeof(kPrefix2) - 1) == 0) {
+        suffix = s + (sizeof(kPrefix2) - 1);
     } else if (!strchr(s, '/') && !strchr(s, ':')) {
         /* Bare filename, no location qualifier at all. `Save(bundle)` /
          * `Save('_saveslot1_id.estore')` etc. reference the resource by its
@@ -3306,6 +3944,22 @@ static int hook_lua_resource_copy(void *L) {
  * (the Bundle* family + Unload/ResourceDelete/QueryEventLog), so every
  * reference -- create, load, save, metadata access, delete, event-log
  * query -- resolves to the single <Temp>-backed entry. */
+/* ★ CHOICE-SAVE SPLIT-BRAIN (fixed 2026-07-30). luaPropertyGet and
+ * luaPropertyExists were redirected logical:<User>/ -> logical:<Temp>/ but the
+ * WRITE side never was: luaPropertySet, luaPropertyCreate, luaPropertyRemove and
+ * luaPropertyClearKeys all shipped unhooked despite existing in the engine.
+ *
+ * So every read resolved to <Temp> while every write went to the still-unbound
+ * <User> location -- the exact dead-location failure the redirect exists to fix.
+ * Choices were written into nowhere and read back from a file that never received
+ * them. That is the mechanism behind "my choices vanish next session": not a
+ * durability or fsync problem, a destination problem.
+ *
+ * ChoiceStats.lua is the clearest case -- its read path (PropertyGet /
+ * PropertyExists / ResourceExists on choice.prop) was redirected while its write
+ * path (PropertyClearKeys + PropertyCreate on choicestats.prop) was not.
+ *
+ * All four take the resource name in arg1, so the existing macro applies. */
 #define REDIRECT_ARG1_HOOK(fn_name, hook_var)                          \
     static so_hook hook_var;                                           \
     static int fn_name(void *L) {                                      \
@@ -3353,6 +4007,10 @@ REDIRECT_ARG1_HOOK(hook_lua_property_exists, g_hook_lua_property_exists)
  * with no location, so they resolve against whatever EventLogCreate bound --
  * fixing EventLogCreate's resource arg fixes the whole chain.) */
 REDIRECT_ARG1_HOOK(hook_lua_resource_set_nonpurgable, g_hook_lua_resource_set_nonpurgable)
+REDIRECT_ARG1_HOOK(hook_lua_property_set,        g_hook_lua_property_set)
+REDIRECT_ARG1_HOOK(hook_lua_property_create,     g_hook_lua_property_create)
+REDIRECT_ARG1_HOOK(hook_lua_property_remove,     g_hook_lua_property_remove)
+REDIRECT_ARG1_HOOK(hook_lua_property_clearkeys,  g_hook_lua_property_clearkeys)
 
 /* CHOICE-LOSS DIAGNOSTIC (2026-07-24): player choices survive the session they
  * are made in but are gone on the next launch. Device evidence: the .estore
@@ -3412,7 +4070,10 @@ static int hook_lua_save_downloaded_doc_as_propset(void *L) {
     const char *a2 = trace_arg_str(L, 2);
     l_info("CHOICEIO: SaveDownloadedDoc arg1='%s' arg2='%s'", a1 ? a1 : "?", a2 ? a2 : "?");
     redirect_logical_user_to_temp(L, 1);
-    redirect_logical_user_to_temp(L, 2); /* "logical:<User>/choice.prop" output path */
+    /* The output path. Two callers, two spellings -- StatChoicesHandler.lua passes
+     * "logical:<User>/choice.prop" and menu_stats.lua passes
+     * "logical://<User>/choice.prop"; the redirect accepts both. */
+    redirect_logical_user_to_temp(L, 2);
     return SO_CONTINUE(int, g_hook_lua_save_downloaded_doc_as_propset, L);
 }
 
@@ -3479,25 +4140,14 @@ static int hook_lua_sceneopen(void *L) {
     launch_state_mark_progress();
     const char *nm = trace_arg_str(L, 1);
     l_info("Diag: luaSceneOpen #%u scene='%s'", count, nm ? nm : "(non-string)");
-    /* Menu vs gameplay (see g_at_menu): menu scenes are ui_boot / *menuMain* /
-     * ui_select* (episode select). Anything else is gameplay -> report online so
-     * end-of-episode crowd-choice stats work; menu stays offline -> no upsell. */
-    if (nm) {
-        g_at_menu = (strstr(nm, "menu") || strstr(nm, "ui_boot") ||
-                     strstr(nm, "ui_select") || strstr(nm, "episodeSelect")) ? 1 : 0;
-    }
-#ifndef USE_PVR_PSP2
-    /* SceneOpen loads the scene's textures synchronously (multi-second freeze).
-     * Flag it so glutil's texture-upload path animates the loading screen, and
-     * reset the per-load timer. Cleared after the load completes. */
-    loading_screen_begin();
-    g_scene_loading = 1;
-    int rc = SO_CONTINUE(int, g_hook_lua_sceneopen, L);
-    g_scene_loading = 0;
-    return rc;
-#else
+    /* A menu-vs-gameplay flag used to be tracked here, to report "online" only
+     * during gameplay. It was never read by anything, and the reasoning behind it
+     * was wrong twice over: the end-of-episode choice-stats screen -- the one place
+     * that needs the online report -- IS a menu (menu_endepisode.lua gates it on
+     * MenuUtils_PlatformIsConnectedToInternet), and the upsell banner it was meant
+     * to suppress is suppressed by forcing the season purchased instead. Removed
+     * rather than left as a lie in the source. */
     return SO_CONTINUE(int, g_hook_lua_sceneopen, L);
-#endif
 }
 
 /* DIAGNOSTIC (2026-06-21): the menu reached its scripts but parks in
@@ -3509,18 +4159,13 @@ static int hook_lua_sceneopen(void *L) {
  * forever on an async load that never completes. Main-thread Lua -> safe. */
 static so_hook g_hook_lua_load;
 static int hook_lua_load(void *L) {
-    static uint32_t count = 0;
-    count++;
+    /* ☠ NO trace_arg_str() HERE. It was a real lua_tolstring round trip on every
+     * luaLoad, and its only two readers were verbose-diag log lines that had already
+     * been compiled out to `return 0` -- so the engine paid for a string conversion
+     * on every resource load to produce a value nothing could read. The redirect is
+     * the entire job of this hook. */
     redirect_logical_user_to_temp(L, 1);
-    const char *nm = trace_arg_str(L, 1);
-    if (mcsm_mega_diag_enabled()) {
-        l_info("Diag: luaLoad #%u ENTER name='%s'", count, nm ? nm : "(?)");
-    }
-    int ret = SO_CONTINUE(int, g_hook_lua_load, L);
-    if (mcsm_mega_diag_enabled()) {
-        l_info("Diag: luaLoad #%u RETURN name='%s'", count, nm ? nm : "(?)");
-    }
-    return ret;
+    return SO_CONTINUE(int, g_hook_lua_load, L);
 }
 static so_hook g_hook_lua_resource_is_loaded;
 static int hook_lua_resource_is_loaded(void *L) {
@@ -3579,10 +4224,6 @@ static void stream_pump_preload(void) {
 
     int pumped = 0;
     const uint64_t pump_t0 = sceKernelGetSystemTimeWide();
-#ifndef USE_PVR_PSP2
-    const int old_scene_loading = g_scene_loading;
-    g_scene_loading = 1;
-#endif
     for (int i = 0; i < 2 && g_preload_pending; ++i) {
         int ret = g_advance_preload_fn(g_preload_lua_state);
         pumped++;
@@ -3596,9 +4237,6 @@ static void stream_pump_preload(void) {
             break;
         }
     }
-#ifndef USE_PVR_PSP2
-    g_scene_loading = old_scene_loading;
-#endif
     if (pumped && g_preload_pending && !g_preload_log_once) {
         g_preload_log_once = 1;
         l_info("STREAM: preload pump still pending after %d calls", pumped);
@@ -3627,15 +4265,7 @@ static int hook_lua_scene_preload(void *L) {
     g_preload_lua_state = L;
     g_preload_pending   = 1;
     g_preload_log_once  = 0;
-#ifndef USE_PVR_PSP2
-    const int old_scene_loading = g_scene_loading;
-    loading_screen_begin();
-    g_scene_loading = 1;
-#endif
     int ret = SO_CONTINUE(int, g_hook_lua_scene_preload, L);
-#ifndef USE_PVR_PSP2
-    g_scene_loading = old_scene_loading;
-#endif
     l_info("STREAM: luaScenePreload #%u returned %d", count, ret);
     if (ret == 0) {
         g_preload_pending = 0;
@@ -3777,11 +4407,23 @@ static int hook_lua_platform_is_connected_to_internet(void *L) {
      * checks THIS right before reading the (locally-served) choice.prop and shows
      * "offline" when it's false. Every real call happens in-game (device logs: all
      * at frame ~3000+, none during the boot DLC verification), so report connected
-     * ONCE A SCENE IS LIVE and stay false during pure boot. License server stays
-     * false; internet-true+license-false is a benign real state (not the documented
-     * license-true+internet-false boot loop). Online once a scene is live (menu
-     * included) so the crowd-choice stats work; the upsell banner is killed
-     * separately by forcing the season purchased (IsEpisodePurchased=1). */
+     * ONCE A SCENE IS LIVE and stay false during pure boot. Online once a scene is
+     * live (menu included) so the crowd-choice stats work; the upsell banner is
+     * killed separately by forcing the season purchased (IsEpisodePurchased=1).
+     *
+     * ★ CONFIRMED FROM THE SHIPPED LUA (2026-07-31), not inferred. Two different
+     * gates read this, and they disagree about whether it is required:
+     *   menu_endepisode.lua: connected = MenuUtils_PlatformIsConnectedToInternet()
+     *       and not IsPlatformWiiU(); if false -> popupSplash_statsOffline_body.
+     *       No local fallback -- so the end-of-episode stats genuinely need this.
+     *   menu_main.lua: the Stats entry also accepts ResourceExists('choice.prop'),
+     *       i.e. the game's OWN offline path, which is why the pre-baked crowd file
+     *       matters (init.c mirror_crowd_choice_data).
+     * Nothing about SAVING choices depends on this flag; that path was broken by an
+     * unredirected "logical://<User>/" spelling and is fixed in
+     * redirect_logical_user_to_temp(). Every server call this flag can reach
+     * (SessionLogProcess, Upload*ToServer, CloudSyncUserData) is already bypassed to
+     * an immediate local success, so "online" costs no network wait. */
     int forced = launch_state_scene_active() ? 1 : 0;
     int ret = hook_forced_lua_bool(L, forced, "PlatformIsConnectedToInternet", &count);
     return ret >= 0 ? ret : SO_CONTINUE(int, g_hook_lua_platform_is_connected_to_internet, L);
@@ -4277,23 +4919,56 @@ static int hook_lua_resource_set_enable(void *L) {
  * set still-enabled and skips the reload -> loads ONCE, never re-decodes.
  * Engine state stays consistent (we simply never call the real disable, so
  * "enabled" and the loaded resources both remain true). Bounded memory (~30-48MB
- * for the current episode's Jesse; the 320MB heap has room). Escape hatch:
- * ux0:data/mcsm/no_keep_resident.txt (read once). */
+ * for the current episode's Jesse; the 320MB heap has room).
+ *
+ * ☠ ONE SWITCH, NOT TWO (fixed 2026-07-31). There used to be a second, opt-OUT
+ * file here (no_keep_resident.txt) from back when this was on by default. Once the
+ * feature became opt-in the two switches were ANDed together, which is the same
+ * "two switches for one resource" shape that previously left the ARM clock owned by
+ * nobody -- and here it had a worse property: keep_resident_opt_in() LOGS
+ * "keep-resident ENABLED", while the opt-out vetoed silently. A user with a stale
+ * no_keep_resident.txt from an older build who then created keep_resident.txt got a
+ * log line saying the feature was on and a game where it was off, with nothing to
+ * explain the difference. The opt-in file is now the only control. */
 static const char *resource_set_arg_name(void *L); /* fwd decl (defined below) */
-static int g_keep_resident_off = -1;
-static int keep_resident_enabled(void) {
-    if (g_keep_resident_off < 0) {
-        FILE *f = fopen("ux0:data/mcsm/no_keep_resident.txt", "r");
-        g_keep_resident_off = f ? 1 : 0;
+/* ★ THIS OPTIMISATION CAUSED THE "female Jesse reverts to male" BUG (fixed
+ * 2026-07-30). It is now OPT-IN and off by default.
+ *
+ * The stutter analysis above was correct about the mechanism but wrong about the
+ * meaning. It observed that "PlayerChoice_Set (Lua) disables THEN re-enables the
+ * character resource set" and read that as pure scene-transition thrash. It is
+ * not: PlayerChoice_Set is the GENDER CHOICE. Disabling JesseMale and enabling
+ * JesseFemale is exactly how the game switches Jesse's model.
+ *
+ * By dropping the disable we left BOTH genders enabled simultaneously, and the
+ * engine resolved to male -- the default. That matches every report: it happened
+ * on brand-new saves (so never a save-persistence problem, which is what it was
+ * originally misdiagnosed as), and "she sometimes appears if I reload" was just
+ * load-order luck between two sets that were both live.
+ *
+ * A correct version is possible -- defer the disable, cancel it if the SAME set
+ * is re-enabled (real thrash), execute it if the OPPOSITE gender is enabled (a
+ * real switch) -- but replaying a dropped Lua call means rewriting the argument
+ * at stack index 1 under a hook, and that is not worth the risk against a
+ * visible gameplay bug. Correctness first; the freeze is an annoyance, a Jesse
+ * the player did not choose is not.
+ *
+ * Opt back in with ux0:data/mcsm/keep_resident.txt if you play male Jesse and
+ * want the ~4-5s character-swap freezes gone. */
+static int keep_resident_opt_in(void) {
+    static int s_on = -1;
+    if (s_on < 0) {
+        FILE *f = mcsm_open_setting("keep_resident.txt", "r");
+        s_on = f ? 1 : 0;
         if (f) fclose(f);
+        if (s_on) l_warn("PERF: keep-resident ENABLED via keep_resident.txt — "
+                         "note this forces MALE Jesse regardless of your choice.");
     }
-    return g_keep_resident_off == 0;
+    return s_on;
 }
+
 static int resource_set_should_stay_resident(const char *name) {
-    /* "JesseMale" is a prefix of both "JesseMale101" (30MB model) and
-     * "JesseMaleChores101" (9.5MB) -> one match covers the model + its chores.
-     * "JesseFemale" mirror for female Jesse. */
-    return name && keep_resident_enabled() &&
+    return name && keep_resident_opt_in() &&
         (strstr(name, "JesseMale") != NULL ||
          strstr(name, "JesseFemale") != NULL);
 }
@@ -4701,8 +5376,26 @@ static int hook_lua_property_get(void *L) {
      * crowd file that ResourceExists already resolves — without this the stats screen
      * is empty after a chapter. Whitelist-scoped: other keys (user.prop, the Licensed
      * gate below, etc.) are unaffected. */
-    redirect_logical_user_to_temp(L, 1);
+    /* ★ ORDER IS LOAD-BEARING (fixed 2026-07-30). Capture the property-set name
+     * BEFORE redirecting, because the redirect rewrites arg1 in place.
+     *
+     * The character-select Licensed gate below compares arg1 against the literal
+     * "user.prop". On 2026-07-24 "user.prop" was added to the bare-name redirect
+     * whitelist, so by the time that comparison ran arg1 had already become
+     * "logical:<Temp>/user.prop" and it could never match again. The gate has been
+     * silently dead since -- PropertyGet("user.prop","Licensed") always returned
+     * true during character select, which per the bytecode notes below sends
+     * Menu_CharacterSelect_Complete down SubProject_Switch("Menu_Main") instead of
+     * Menu_StartEpisode. The safety counter never decremented either, so the armed
+     * window was never disarmed. One whitelist entry disabled a whole fix. */
     resolve_lua_str_api();
+    const char *pset_pre_redirect =
+        (g_lua_type_fast && g_lua_tolstring_fast && g_lua_type_fast(L, 1) == LUA_TSTRING_TAG)
+            ? g_lua_tolstring_fast(L, 1, NULL) : NULL;
+    const int is_userprop_gate_pre = pset_pre_redirect &&
+        (strcmp(pset_pre_redirect, "user.prop") == 0 ||
+         strstr(pset_pre_redirect, "/user.prop") != NULL);
+    redirect_logical_user_to_temp(L, 1);
     if (g_lua_type_fast && g_lua_tolstring_fast && g_lua_gettop_fast) {
         const int top = g_lua_gettop_fast(L);
         for (int i = 1; i <= top; ++i) {
@@ -4729,10 +5422,9 @@ static int hook_lua_property_get(void *L) {
                  * "user.prop" gate; leave "user" (IsLicensed) genuinely TRUE so
                  * slot values + the event log always use the real, persistent slot.
                  * The property-set name is arg 1; the "Licensed" key is arg 2. */
-                const char *pset = (g_lua_type_fast(L, 1) == LUA_TSTRING_TAG)
-                                       ? g_lua_tolstring_fast(L, 1, NULL)
-                                       : NULL;
-                const int is_userprop_gate = pset && strcmp(pset, "user.prop") == 0;
+                /* Use the pre-redirect answer; see the note at the top of this
+                 * function. Comparing the post-redirect name here is what broke it. */
+                const int is_userprop_gate = is_userprop_gate_pre;
                 int force_demo_path = (g_character_select_license_active != 0) && is_userprop_gate;
                 if (g_character_select_license_active && is_userprop_gate) {
                     if (g_character_select_license_safety > 0) {
@@ -4985,8 +5677,6 @@ static so_hook g_hook_sm_load;
 static so_hook g_hook_sm_doload;
 
 static int hook_ge_init2(void *arg) {
-    static uint64_t first_ms = 0;
-    if (!first_ms) first_ms = now_ms();
     l_info("Diag: GameEngine::Initialize2 ENTER arg=%p", arg);
     int ret = SO_CONTINUE(int, g_hook_ge_init2, arg);
     l_info("Diag: GameEngine::Initialize2 RETURNED %d (0 => _boot.lua will NOT load)", ret);
@@ -4995,9 +5685,7 @@ static int hook_ge_init2(void *arg) {
 
 static int hook_sm_load(void *str, int b) {
     static uint32_t count = 0;
-    static uint64_t first_ms = 0;
     count++;
-    if (!first_ms) first_ms = now_ms();
     l_info("Diag: ScriptManager::Load ENTER #%u (boot script load reached!) b=%d", count, b);
     int ret = SO_CONTINUE(int, g_hook_sm_load, str, b);
     l_info("Diag: ScriptManager::Load RETURNED %d", ret);
@@ -5006,9 +5694,7 @@ static int hook_sm_load(void *str, int b) {
 
 static int hook_sm_doload(void *str) {
     static uint32_t count = 0;
-    static uint64_t first_ms = 0;
     count++;
-    if (!first_ms) first_ms = now_ms();
     l_info("Diag: ScriptManager::DoLoad ENTER #%u", count);
     int ret = SO_CONTINUE(int, g_hook_sm_doload, str);
     l_info("Diag: ScriptManager::DoLoad RETURNED %d", ret);
@@ -5036,15 +5722,6 @@ static int dlc_resource_index(const char *name) {
     return -1;
 }
 
-static const char *dlc_resource_name_for_index(int index) {
-    switch (index) {
-        case 0: return "DLCStatus.lua";
-        case 1: return "DownloadManager.lua";
-        case 2: return "PurchaseManager.lua";
-        default: return "(unknown)";
-    }
-}
-
 static int hook_sm_loadresource(void *L, const char *name) {
     static uint32_t count = 0;
     static uint32_t dlc_load_counts[3];
@@ -5052,37 +5729,19 @@ static int hook_sm_loadresource(void *L, const char *name) {
 
     const int dlc_index = dlc_resource_index(name);
 
-    /* Show the asset on the loading screen BEFORE the (blocking) load. */
-    if (name) LS_SET_ASSET(name);
     launch_state_mark_progress();
-    LS_TICK();
     int ret = SO_CONTINUE(int, g_hook_sm_loadresource, L, name);
     launch_state_mark_progress();
     if (dlc_index >= 0) {
         dlc_load_counts[dlc_index]++;
-        if (mcsm_mega_diag_enabled() &&
-            (dlc_load_counts[dlc_index] <= 16U || (dlc_load_counts[dlc_index] & 0x3fU) == 0U)) {
-            l_info("Diag: ScriptManager::LoadResource DLC script load key=%s load=%u L=%p ret=%d",
-                   dlc_resource_name_for_index(dlc_index),
-                   dlc_load_counts[dlc_index],
-                   L,
-                   ret);
-        }
-    }
-    if (mcsm_mega_diag_enabled()) {
-        l_info("Diag: ScriptManager::LoadResource #%u L=%p name='%s' ret=%d (raw engine result; not decoded)",
-               count, L, name ? name : "(null)", ret);
     }
     return ret;
 }
 
 static int hook_job_init(void) {
     static uint32_t count = 0;
-    static uint64_t first_ms = 0;
     count++;
     launch_state_mark_progress();
-    if (!first_ms) first_ms = now_ms();
-    log_diag_counter("JobScheduler::Initialize", count, first_ms, NULL);
     return SO_CONTINUE(int, g_hook_job_init);
 }
 
@@ -5120,55 +5779,60 @@ static int hook_is_contributing_shadow(void *self) {
  * safe gate -- a Test* predicate is unambiguously boolean -- and it is the single
  * point the renderer asks "is feature N enabled?", so logging its arguments gives us
  * the exact RenderFeatureType ids to target, with zero behaviour change now. */
-static unsigned g_fx_glow_calls = 0, g_fx_mblur_calls = 0;
-static unsigned g_fx_feature_seen[64];   /* TestFeature(id) -> times answered true */
-static unsigned g_fx_feature_tot[64];
 
-static so_hook g_hook_fx_drawglow;
-static void hook_fx_drawglow(void *a, void *b, int c) {
-    g_fx_glow_calls++;
-    SO_CONTINUE_VOID(g_hook_fx_drawglow, a, b, c);
-}
-static so_hook g_hook_fx_motionblur;
-static void hook_fx_motionblur(void *scene, void *cam) {
-    g_fx_mblur_calls++;
-    SO_CONTINUE_VOID(g_hook_fx_motionblur, scene, cam);
-}
-static so_hook g_hook_fx_testfeature;
-static int hook_fx_testfeature(void *self, int feature) {
-    int r = SO_CONTINUE(int, g_hook_fx_testfeature, self, feature);
-    if (feature >= 0 && feature < 64) {
-        g_fx_feature_tot[feature]++;
-        if (r) g_fx_feature_seen[feature]++;
-    }
-    return r;
-}
+/* REMOVED 2026-07-29 -- THIS HOOK WAS THE DIORAMA CRASH.
+ *
+ * RenderConfiguration::TestFeature was hooked in r39 for the post-effect audit.
+ * The crash dump resolves the faulting PC to RenderFrame::RenderFrame +0x60,
+ * which disassembles to the instruction immediately AFTER
+ *     bl <RenderConfiguration::TestFeature>
+ * i.e. threads were faulting on the way back out of this exact function, in both
+ * captured MCSM dumps, with the same crashed-thread marker.
+ *
+ * The mechanism is SO_CONTINUE itself: it UNPATCHES the target, calls the
+ * original, then RE-PATCHES it, rewriting live instruction bytes on every single
+ * invocation. That is neither reentrant nor thread-safe. TestFeature is called
+ * from the render path -- the audit it enabled logged 5066 calls in one session --
+ * and this game has multiple render threads. When two overlap, one rewrites the
+ * instructions the other is executing.
+ *
+ * It was report-only and it already gave its answer (RenderFeature[0] answered
+ * false 5066/5066, nothing to disable), so it is pure liability now. The lesson
+ * generalises: SO_CONTINUE hooks are only safe on functions that are called
+ * rarely and from one thread. Never put one on a hot render-path function. */
 
-void mcsm_postfx_report(void) {
-    l_info("POSTFX: DrawGlow=%u _UpdateMotionBlur=%u", g_fx_glow_calls, g_fx_mblur_calls);
-    for (int i = 0; i < 64; i++) {
-        if (g_fx_feature_tot[i]) {
-            l_info("POSTFX: RenderFeature[%d] enabled %u/%u times%s", i,
-                   g_fx_feature_seen[i], g_fx_feature_tot[i],
-                   g_fx_feature_seen[i] ? "  <-- ACTIVE, candidate to disable" : "  (already off)");
-        }
-    }
-}
+
+/* LinearHeap instrumentation REMOVED 2026-07-29 (added and withdrawn same day).
+ * It hooked _AllocatePage with SO_CONTINUE -- the identical unpatch/call/repatch
+ * of live instruction bytes that had just been identified as the diorama crash,
+ * on a function this file's own comment placed inside RenderFrame::RenderFrame,
+ * the faulting frame. Adding it directly contradicted the rule written 30 lines
+ * above it, and _AllocatePage is called far more often than TestFeature was.
+ *
+ * It had also already answered its question and found nothing: pages=34,
+ * live_bytes=3017, fails=0 -- a 3KB heap that never fails. Exhaustion was not the
+ * crash. Keeping a probe with a known-fatal mechanism to re-measure a settled
+ * negative is not a trade worth making. The counters were global across every
+ * LinearHeap instance anyway, so they could not have answered it properly. */
+
+
+/* Scene FX levers REMOVED 2026-07-29 (added and withdrawn same day). Three
+ * reasons, any one sufficient:
+ *
+ *  1. Three of the six mangled names carried the wrong Itanium length prefix
+ *     (26/27/25 where libGameEngine.so has 27/28/24), so AmbientOcclusion,
+ *     EnvReflections and VignetteTint never bound at all. The report then printed
+ *     "AO 0/0 Refl 0/0" -- which reads as "the scene never asked for it", the
+ *     exact false negative the audit existed to avoid.
+ *  2. The three that DID bind measured the levers as near-worthless: Spec 0/9,
+ *     DOF 1/9, Tonemap 2/9. The engine had already declined them, same as the
+ *     post-effect chain before it.
+ *  3. They used SO_CONTINUE_VOID on engine setters -- the mechanism that caused
+ *     the diorama crash. Carrying that risk for a lever worth ~1 effect in 9 is
+ *     not a trade worth making. */
+
 
 static void patch_boot_diag_hooks(void) {
-    /* Report-only post-effect probes; see the comment above. */
-    (void)hook_symbol_checked(&so_mod_gameengine,
-        "_ZN16T3PostEffectUtil8DrawGlowER15RenderSceneViewR21T3RenderTargetContextb",
-        "T3PostEffectUtil::DrawGlow",
-        (uintptr_t)&hook_fx_drawglow, &g_hook_fx_drawglow);
-    (void)hook_symbol_checked(&so_mod_gameengine,
-        "_Z17_UpdateMotionBlurP5SceneP6Camera", "_UpdateMotionBlur",
-        (uintptr_t)&hook_fx_motionblur, &g_hook_fx_motionblur);
-    (void)hook_symbol_checked(&so_mod_gameengine,
-        "_ZN19RenderConfiguration11TestFeatureE17RenderFeatureType",
-        "RenderConfiguration::TestFeature",
-        (uintptr_t)&hook_fx_testfeature, &g_hook_fx_testfeature);
-
     if (shadows_disabled()) {
         (void)hook_symbol_checked(&so_mod_gameengine, "_ZN13LightInstance13IsShadowLightEv",
                                   "LightInstance::IsShadowLight",
@@ -5517,6 +6181,19 @@ static void patch_dlc_fast_path_hooks(void) {
                               &g_hook_lua_property_get);
     /* CHOICES FIX: PropertyExists("choice.prop","Options") must resolve to <Temp>
      * too, or the stats screen's existence gate fails even after PropertyGet works. */
+    /* The write side of the same redirect -- see the note above the macro. */
+    (void)hook_symbol_checked(&so_mod_gameengine, "_Z14luaPropertySetP9lua_State",
+                              "luaPropertySet",
+                              (uintptr_t)&hook_lua_property_set, &g_hook_lua_property_set);
+    (void)hook_symbol_checked(&so_mod_gameengine, "_Z17luaPropertyCreateP9lua_State",
+                              "luaPropertyCreate",
+                              (uintptr_t)&hook_lua_property_create, &g_hook_lua_property_create);
+    (void)hook_symbol_checked(&so_mod_gameengine, "_Z17luaPropertyRemoveP9lua_State",
+                              "luaPropertyRemove",
+                              (uintptr_t)&hook_lua_property_remove, &g_hook_lua_property_remove);
+    (void)hook_symbol_checked(&so_mod_gameengine, "_Z20luaPropertyClearKeysP9lua_State",
+                              "luaPropertyClearKeys",
+                              (uintptr_t)&hook_lua_property_clearkeys, &g_hook_lua_property_clearkeys);
     (void)hook_symbol_checked(&so_mod_gameengine,
                               "_Z17luaPropertyExistsP9lua_State",
                               "luaPropertyExists",
@@ -5892,7 +6569,9 @@ static void hook_set_toon_outline(void *self, int on) {
  * OPT-IN + gated on settings/detail_scale.txt (0.1..1.0): the hooks are not even
  * installed without it, so the default build is zero-risk. Logs the engine's
  * natural detail values so the scale can be tuned from a device run. */
+static int unsafe_render_hooks_enabled(void);   /* defined below with the rationale */
 static float detail_scale(void) {
+    if (!unsafe_render_hooks_enabled()) return -1.0f;   /* see the note above */
     /* Consolidated into settings/graphics.txt (`detail`, stored x1000). Returns
      * -1 for "no override" so the hooks stay uninstalled at the default, exactly
      * as the stray-file version did -- the default build is unchanged. */
@@ -5901,15 +6580,176 @@ static float detail_scale(void) {
     return (float)d / 1000.0f;
 }
 static so_hook g_hook_scene_far_detail, g_hook_scene_near_detail;
-#define MCSM_DETAIL_TRAMPOLINE(H, SELF, V) do { \
-    kuKernelCpuUnrestrictedMemcpy((void *)(H).addr, (H).orig_instr, sizeof((H).orig_instr)); \
-    kuKernelFlushCaches((void *)(H).addr, sizeof((H).orig_instr)); \
-    void (*fn_)(void *, float) = (H).thumb_addr ? (void (*)(void *, float))(H).thumb_addr \
-                                                : (void (*)(void *, float))(H).addr; \
-    fn_((SELF), (V)); \
-    kuKernelCpuUnrestrictedMemcpy((void *)(H).addr, (H).patch_instr, sizeof((H).patch_instr)); \
-    kuKernelFlushCaches((void *)(H).addr, sizeof((H).patch_instr)); \
-} while (0)
+static uintptr_t g_hook_scene_far_detail_tramp, g_hook_scene_near_detail_tramp;
+/* HISTORY, and why these three hooks are shaped the way they are.
+ *
+ * They CRASHED the render thread until 2026-07-30. The macro below was named
+ * "trampoline" but was not one: it fixed the FLOAT argument (via a correctly-typed
+ * function pointer, which SO_CONTINUE genuinely does corrupt) and then did the
+ * exact thing that caused the diorama crash -- unpatch the live function, call it,
+ * re-patch it, on EVERY invocation.
+ *
+ * Crash dump proof, kept because it is the evidence that shaped the fix. Faulting
+ * thread marker (+0x70 = 0x00030003) points at the render thread; its PC resolves
+ * to RenderFrameScene::AllocateView(RenderViewParams const&) +0x25c, which
+ * disassembles to the instruction immediately AFTER `bl Camera::SetFarClip` -- a
+ * thread faulting on the way back out of the hooked function, the identical
+ * signature that identified RenderConfiguration::TestFeature as the previous
+ * crash. AllocateView runs per view per frame and this game has more than one
+ * render thread, so two overlapped and one rewrote the bytes the other was
+ * executing.
+ *
+ * ★ FIXED, and therefore ON BY DEFAULT NOW: mcsm_build_tramp() builds a real
+ * cave trampoline ONCE at install time (stolen instructions + LDR PC,[PC,#-4] +
+ * resume address). The live function keeps its patch permanently, nothing is ever
+ * rewritten, and concurrent callers cannot collide. mcsm_insn_is_relocatable()
+ * enforces the precondition that relocating the stolen instructions is legal,
+ * rather than trusting a one-time manual audit, and mcsm_install_tramp_hook()
+ * restores the original bytes if a trampoline cannot be built -- so a refusal
+ * costs the lever, never the engine's own call.
+ *
+ * That matters because draw_distance and detail are the only runtime levers that
+ * attack the vertex count, and disabling them measured 341k verts / 21 fps.
+ * no_render_hooks.txt turns them back off if anything regresses. */
+static int unsafe_render_hooks_enabled(void) {
+    /* Back ON by default: these no longer rewrite live code. mcsm_build_tramp()
+     * gives each hook a real cave trampoline, so the crash mechanism is gone and
+     * the vertex levers (draw_distance, detail) are usable again -- which matters,
+     * because heavy scenes measured 341k verts / 21 fps with them disabled.
+     * no_render_hooks.txt turns them back off if anything regresses. */
+    static int s_on = -1;
+    if (s_on < 0) {
+        FILE *f = mcsm_open_setting("no_render_hooks.txt", "r");
+        s_on = f ? 0 : 1;
+        if (f) fclose(f);
+        if (!s_on) l_info("PERF: far-clip/detail hooks disabled (no_render_hooks.txt)");
+    }
+    return s_on;
+}
+
+/* A REAL trampoline, built ONCE at install time (2026-07-30).
+ *
+ * What was here rewrote the live function on EVERY call -- unpatch, call,
+ * re-patch -- which is the mechanism that crashed the render thread. Crash dump:
+ * the faulting PC was RenderFrameScene::AllocateView +0x25c, which disassembles
+ * to the instruction immediately after `bl Camera::SetFarClip`, i.e. a thread
+ * faulting on the way back out while another rewrote those same bytes.
+ *
+ * This builds the standard thing instead: copy the two stolen instructions into
+ * so_util's code cave, append LDR PC,[PC,#-4] + the resume address, call THAT.
+ * The live function keeps its patch permanently, nothing is ever rewritten, and
+ * concurrent callers cannot collide. Same shape as so_util's own trampoline_ldm.
+ *
+ * Only safe because the stolen instructions are position-independent -- checked
+ * against the binary before writing this:
+ *   Camera::SetFarClip         vldr s14,[r0,#392] ; vmov s15,r1   register-relative
+ *   Scene::SetBrushFarDetail   str r1,[r0,#..]    ; bx lr         8-byte function --
+ *   Scene::SetBrushNearDetail  str r1,[r0,#..]    ; bx lr         bx returns before
+ *                                                                 the LDR, so the
+ *                                                                 tail is dead code
+ * No PC-relative loads in any of them. Float typing is preserved, which is why
+ * these needed their own path rather than SO_CONTINUE (which corrupts floats). */
+/* so_util.c defines this but does not export it in the header. */
+extern uintptr_t so_alloc_arena(so_module *so, uintptr_t range, uintptr_t dst, size_t sz);
+/* Is this ARM instruction safe to EXECUTE FROM A DIFFERENT ADDRESS?
+ *
+ * mcsm_build_tramp copies the two stolen instructions into a code cave and runs
+ * them there, so anything whose behaviour depends on its own address changes
+ * meaning. The rule used to be "checked against the binary before writing this"
+ * -- a one-time manual audit recorded in a comment, with nothing enforcing it.
+ * That is a trap rather than a safeguard: RenderConfiguration::SetQuality, the
+ * next hook in this very file and the obvious candidate for migrating off
+ * SO_CONTINUE, begins
+ *     ldr r3, [pc, #32]
+ *     add r3, pc, r3
+ * which is the standard GOT-base idiom. Relocated into the cave, that computes a
+ * GOT base from the WRONG pc and every subsequent global access reads garbage --
+ * silently, with no crash at the point of the mistake.
+ *
+ * Conservative: reject anything that reads or writes pc, or branches relatively.
+ * Rejecting a safe instruction only costs us a lever; accepting an unsafe one
+ * corrupts the renderer.
+ * Verified against the three current users, all of which pass:
+ *   Camera::SetFarClip          vldr s14,[r0,#392] / vmov s15,r1
+ *   Scene::SetBrushFarDetail    str r1,[r0,#700]   / bx lr
+ *   Scene::SetBrushNearDetail   str r1,[r0,#692]   / bx lr */
+static int mcsm_insn_is_relocatable(uint32_t insn) {
+    /* BX/BLX <register> encode Rn=Rd=0xF as should-be-one bits, so they trip the
+     * pc checks below despite being fully position-independent. Allow explicitly. */
+    const uint32_t noncond = insn & 0x0FFFFFF0u;
+    if (noncond == 0x012FFF10u || noncond == 0x012FFF30u) return 1;  /* BX / BLX reg */
+
+    const uint32_t op = (insn >> 25) & 0x7u;
+    if (op == 0x5u) return 0;                       /* B / BL: pc-relative target  */
+    if (((insn >> 25) & 0x7Fu) == 0x7Du) return 0;  /* BLX immediate               */
+    if (((insn >> 24) & 0xFu) == 0xFu)   return 0;  /* SVC                         */
+
+    /* Rn == pc for data-processing (00x), load/store (01x), block transfer (100),
+     * or coprocessor load/store (110) means the address is the operand. */
+    const uint32_t rn = (insn >> 16) & 0xFu;
+    if (rn == 0xFu && (op <= 0x3u || op == 0x4u || op == 0x6u)) return 0;
+
+    /* Writing pc is a branch by another name. */
+    const uint32_t rd = (insn >> 12) & 0xFu;
+    if (rd == 0xFu && op <= 0x3u) return 0;
+
+    return 1;
+}
+
+static uintptr_t mcsm_build_tramp(so_hook *h) {
+    if (!h || !h->addr) return 0;
+    /* Refuse rather than relocate something position-dependent. The caller must
+     * then leave the function UNHOOKED -- swallowing the call would be worse. */
+    for (int i = 0; i < 2; ++i) {
+        if (!mcsm_insn_is_relocatable(h->orig_instr[i])) {
+            l_error("TRAMP: REFUSING hook @0x%08X — stolen insn[%d]=0x%08X is "
+                    "position-DEPENDENT (reads/writes pc or branches relatively); "
+                    "copying it into the cave would compute from the wrong address",
+                    (unsigned)h->addr, i, (unsigned)h->orig_instr[i]);
+            return 0;
+        }
+    }
+    uintptr_t t = so_alloc_arena(&so_mod_gameengine, 0, h->addr, 16);
+    if (!t) { l_error("TRAMP: no cave space for hook @0x%08X", (unsigned)h->addr); return 0; }
+    uint32_t code[4];
+    code[0] = h->orig_instr[0];
+    code[1] = h->orig_instr[1];
+    code[2] = 0xE51FF004u;              /* LDR PC, [PC, #-4] */
+    code[3] = (uint32_t)(h->addr + 8);  /* resume just past the patched bytes */
+    kuKernelCpuUnrestrictedMemcpy((void *)t, code, sizeof(code));
+    kuKernelFlushCaches((void *)t, sizeof(code));
+    l_info("TRAMP: hook @0x%08X -> cave 0x%08X (no live-code rewriting)",
+           (unsigned)h->addr, (unsigned)t);
+    return t;
+}
+
+/* Install a hook AND its trampoline as one unit, or leave the function alone.
+ *
+ * hook_symbol_checked patches the live function immediately, and the trampoline
+ * was built afterwards -- so any failure to build one (no cave space, or now a
+ * position-dependent stolen instruction) left the function patched with a NULL
+ * trampoline. MCSM_DETAIL_TRAMPOLINE then quietly does nothing, which does not
+ * merely disable the lever: it SWALLOWS the call. Camera::SetFarClip never
+ * running means the camera's far plane is never set at all, which is far worse
+ * than not having the lever in the first place. Restore the original bytes so the
+ * engine's own function runs unhooked. */
+static int mcsm_install_tramp_hook(const char *symbol, const char *label,
+                                   uintptr_t handler, so_hook *h, uintptr_t *tramp_out) {
+    *tramp_out = 0;
+    if (!hook_symbol_checked(&so_mod_gameengine, symbol, label, handler, h)) return 0;
+    uintptr_t t = mcsm_build_tramp(h);
+    if (!t) {
+        kuKernelCpuUnrestrictedMemcpy((void *)h->addr, h->orig_instr, sizeof(h->orig_instr));
+        kuKernelFlushCaches((void *)h->addr, sizeof(h->orig_instr));
+        l_error("TRAMP: %s left UNHOOKED (original instructions restored) — the "
+                "lever is off, but the engine's own call still runs", label);
+        return 0;
+    }
+    *tramp_out = t;
+    return 1;
+}
+
+#define MCSM_DETAIL_TRAMPOLINE(H, SELF, V) do {     uintptr_t t_ = (H##_tramp);     if (t_) ((void (*)(void *, float))t_)((SELF), (V)); } while (0)
 static void hook_scene_far_detail(void *self, float v) {
     static unsigned n = 0; const float s = detail_scale();
     if (n++ < 8U) l_info("DETAIL: Scene::SetBrushFarDetail=%d/1000 scale=%d/1000", (int)(v * 1000.0f), (int)(s * 1000.0f));
@@ -5931,10 +6771,12 @@ static void hook_scene_near_detail(void *self, float v) {
  * visual pop at the boundary, scene-dependent (only helps scenes with distant
  * geometry), so default-off + per-scene tuned. Logs the natural far value. */
 static float far_clip_cap(void) {
+    if (!unsafe_render_hooks_enabled()) return -1.0f;   /* see the note above */
     int d = mcsm_cfg()->draw_distance;   /* 0 = engine default (no clamp) */
     return d > 0 ? (float)d : -1.0f;
 }
 static so_hook g_hook_camera_far_clip;
+static uintptr_t g_hook_camera_far_clip_tramp;
 static void hook_camera_far_clip(void *self, float v) {
     static unsigned n = 0; const float cap = far_clip_cap();
     if (n++ < 8U) l_info("FARCLIP: Camera::SetFarClip=%d cap=%d", (int)v, (int)cap);
@@ -5961,20 +6803,23 @@ static void patch_render_perf_hooks(void) {
         l_info("PERF: toon outlines DISABLED (graphics.txt outlines=off) — outline submit skipped.");
     }
     if (detail_scale() > 0.0f) {
-        (void)hook_symbol_checked(&so_mod_gameengine, "_ZN5Scene17SetBrushFarDetailEf",
-                                  "Scene::SetBrushFarDetail",
-                                  (uintptr_t)&hook_scene_far_detail, &g_hook_scene_far_detail);
-        (void)hook_symbol_checked(&so_mod_gameengine, "_ZN5Scene18SetBrushNearDetailEf",
-                                  "Scene::SetBrushNearDetail",
-                                  (uintptr_t)&hook_scene_near_detail, &g_hook_scene_near_detail);
-        l_info("PERF: brush detail scaled to %d/1000 (detail_scale.txt) — NOTE: verified post-effect, NOT a vert cut.",
+        (void)mcsm_install_tramp_hook("_ZN5Scene17SetBrushFarDetailEf",
+                                      "Scene::SetBrushFarDetail",
+                                      (uintptr_t)&hook_scene_far_detail,
+                                      &g_hook_scene_far_detail, &g_hook_scene_far_detail_tramp);
+        (void)mcsm_install_tramp_hook("_ZN5Scene18SetBrushNearDetailEf",
+                                      "Scene::SetBrushNearDetail",
+                                      (uintptr_t)&hook_scene_near_detail,
+                                      &g_hook_scene_near_detail, &g_hook_scene_near_detail_tramp);
+        l_info("PERF: brush detail scaled to %d/1000 (graphics.txt detail) — NOTE: verified post-effect, NOT a vert cut.",
                (int)(detail_scale() * 1000.0f));
     }
     if (far_clip_cap() > 0.0f) {
-        (void)hook_symbol_checked(&so_mod_gameengine, "_ZN6Camera10SetFarClipEf",
-                                  "Camera::SetFarClip",
-                                  (uintptr_t)&hook_camera_far_clip, &g_hook_camera_far_clip);
-        l_info("PERF: far-clip capped at %d (far_clip.txt) — culls distant geometry (verts+draws).",
+        (void)mcsm_install_tramp_hook("_ZN6Camera10SetFarClipEf",
+                                      "Camera::SetFarClip",
+                                      (uintptr_t)&hook_camera_far_clip,
+                                      &g_hook_camera_far_clip, &g_hook_camera_far_clip_tramp);
+        l_info("PERF: far-clip capped at %d (graphics.txt draw_distance) — culls distant geometry (verts+draws).",
                (int)far_clip_cap());
     }
 }
@@ -5988,8 +6833,85 @@ void so_patch(void) {
     patch_login_diag_hooks();
     patch_boot_diag_hooks();
     patch_render_perf_hooks();
-    patch_vertexbuffer_platform_lock();
-    patch_vertexbuffer_platform_unlock();
-    patch_indexbuffer_platform_lock();
-    patch_indexbuffer_platform_unlock();
+
+    /* ★ ZERO-COPY BUFFER PATH (2026-07-30) -----------------------------------
+     * These four hooks replace T3VertexBuffer/T3IndexBuffer PlatformLock and
+     * PlatformUnlock, and they implement ONLY the engine's slow non-mapped
+     * branch: malloc a CPU staging buffer -> let the skinner fill it -> full
+     * glBufferData RESPECIFY -> free. Inside vitaGL that respecify is a GPU
+     * free + a GPU alloc + a full-buffer memcpy, and it happens once per
+     * SKINNED MESH per FRAME (RenderObject_Mesh::_RenderMeshInstance ->
+     * DoSoftwareSkinning -> T3VertexBuffer::Lock), so it scales with character
+     * count -- the reported failure exactly.
+     *
+     * The engine has a zero-copy path for this and it is ALREADY FULLY WIRED,
+     * verified end to end against the shipped libGameEngine.so:
+     *   1. vitaGL advertises "GL_OES_mapbuffer" (get_info.c extension list).
+     *   2. RenderDevice::Initialize (@0x579e64) does
+     *        strstr(glGetString(GL_EXTENSIONS), "GL_OES_mapbuffer")
+     *      and on a hit calls _SetCap(21), i.e. sets bit 0x200000 of
+     *      RenderDevice::mRenderCaps, then resolves glMapBufferOES and
+     *      glUnmapBufferOES through GetExtension -> eglGetProcAddress.
+     *   3. Our eglGetProcAddress goes to lookup_symbol_soloader_quiet, and
+     *      dynlib.c already binds glMapBufferOES/glUnmapBufferOES/
+     *      glMapBufferRange to vitaGL's real implementations. They resolve.
+     *   4. So with bit 21 set, PlatformLock/Unlock (@0x57b998/@0x57ba74) use
+     *      RenderDevice::MapGLBuffer + glUnmapBuffer -- the skinner writes
+     *      STRAIGHT INTO GPU MEMORY. No staging buffer, no copy, no alloc.
+     * vitaGL's glMapNamedBufferRange is literally `mapped = TRUE; return
+     * ptr + offset;`.
+     *
+     * So the engine was ready to do this all along and these hooks are the only
+     * thing preventing it. Not installing them hands the path back to the
+     * engine. Confirm with the SKINPROBE line: respec/f and KB/f should fall to
+     * ~0, because the respecify stops happening at all.
+     *
+     * ☠ DEVICE RESULT 2026-07-30: map_buffers = 1 CRASHES ON BOOT. Default 0.
+     *
+     * The engine half above is all confirmed on device -- the boot log shows
+     * `GL extensions: OES_mapbuffer=1 EXT_map_buffer_range=1`, so caps 21 and 22
+     * are both set and MapGLBuffer genuinely is reached. What is NOT true is the
+     * assumption that the vitaGL entry point behind those pointers is usable.
+     * The SHIPPED libvitaGL.a is built NO_DEBUG (SKIP_ERROR_HANDLING), which
+     * reduces glMapNamedBufferRange to five instructions:
+     *     ldr r3,[r0,#0]        ; gpu_buf->ptr   -- NO null check
+     *     movs r2,#1 ; strb r2,[r0,#16]
+     *     adds r0,r3,r1         ; return ptr+offset -- NO bounds check
+     *     bx lr
+     * It hands back ptr+offset unconditionally. These four hooks were the thing
+     * that ALLOCATED that buffer, so with them gone ptr is NULL on the first lock
+     * and the skinner writes hundreds of KB to a near-null address.
+     *
+     * I verified the vitaGL SOURCE (which has the checks behind
+     * #ifndef SKIP_ERROR_HANDLING) instead of the installed BINARY (which does
+     * not). Check the shipped .a, not the repo, before trusting a vitaGL path.
+     *
+     * TO MAKE THIS WORK: keep a lock hook that guarantees the GL buffer exists at
+     * the right size -- glBufferData(size, NULL) once per buffer and on any size
+     * change -- and only then let the engine map it. That keeps the zero-copy win
+     * (no per-frame respecify, no full-buffer memcpy) while removing the
+     * unallocated-pointer hazard. Not attempted yet; do not enable this until it
+     * is, and re-verify against the installed lib. */
+    if (mcsm_cfg()->map_buffers) {
+        l_info("PERF: map_buffers=1 — NOT installing the T3Vertex/IndexBuffer "
+               "Platform(Un)Lock hooks; the engine's own zero-copy glMapBuffer "
+               "path takes over (expect SKINPROBE respec/f -> ~0)");
+    } else {
+        patch_vertexbuffer_platform_lock();
+        patch_vertexbuffer_platform_unlock();
+        patch_indexbuffer_platform_lock();
+        patch_indexbuffer_platform_unlock();
+    }
+
+    /* mRenderCaps is resolved here but READ LATER, from mcsm_skin_report.
+     * Reading it at patch time reported 0x00000000 and I briefly took that as
+     * proof the engine never sets the caps -- it isn't. so_patch runs BEFORE
+     * RenderDevice::Initialize, which is the function that calls _SetCap, so the
+     * word is legitimately still zero at this point. The boot log's
+     * "GL extensions: OES_mapbuffer=1 EXT_map_buffer_range=1" is the real evidence
+     * that caps 21 and 22 do get set a moment later. */
+    g_render_caps_ptr = (const uint32_t *)so_symbol(&so_mod_gameengine,
+                            "_ZN12RenderDevice11mRenderCapsE");
+    l_info("RENDERCAPS: mRenderCaps at %p (value read later, once the engine has "
+           "run RenderDevice::Initialize)", (const void *)g_render_caps_ptr);
 }

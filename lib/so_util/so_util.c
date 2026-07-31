@@ -61,7 +61,11 @@ typedef struct ldst_enc {
 static so_module *head = NULL, *tail = NULL;
 
 so_hook hook_thumb(uintptr_t addr, uintptr_t dst) {
-    so_hook h;
+    /* Zero-initialised: the addr==0 path below returns h BY VALUE, and an
+     * uninitialised so_hook carries a garbage .addr that SO_CONTINUE would then
+     * memcpy over. Callers happen to reject a null symbol first, but this
+     * function must not rely on that to be memory-safe. */
+    so_hook h = {0};
     sceClibPrintf("THUMB HOOK\n");
     if (addr == 0)
         return h;
@@ -84,11 +88,10 @@ so_hook hook_thumb(uintptr_t addr, uintptr_t dst) {
 }
 
 so_hook hook_arm(uintptr_t addr, uintptr_t dst) {
-    so_hook h;
+    so_hook h = {0};                 /* see hook_thumb */
     sceClibPrintf("ARM HOOK\n");
     if (addr == 0)
         return h;
-    uint32_t hook[2];
     h.thumb_addr = 0;
     h.addr = addr;
     h.patch_instr[0] = 0xe51ff004; // LDR PC, [PC, #-0x4]
@@ -101,7 +104,7 @@ so_hook hook_arm(uintptr_t addr, uintptr_t dst) {
 
 so_hook hook_addr(uintptr_t addr, uintptr_t dst) {
     if (addr == 0) {
-        so_hook h;
+        so_hook h = {0};             /* see hook_thumb */
         return h;
     }
 

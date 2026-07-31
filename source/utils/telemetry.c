@@ -88,6 +88,19 @@ void telemetry_reset(void) {
     trace_write_active("[BOOT] telemetry reset\n", SCE_O_WRONLY | SCE_O_CREAT | SCE_O_APPEND);
 }
 
+/* Always compiled in -- see the contract in telemetry.h. One line, one write, once
+ * per boot, so it costs nothing measurable even in a performance test build. */
+void telemetry_stamp(const char *line) {
+    if (!line) {
+        return;
+    }
+    char buf[512];
+    const int n = snprintf(buf, sizeof(buf), "%s\n", line);
+    if (n > 0) {
+        trace_write_active(buf, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_APPEND);
+    }
+}
+
 void telemetry_log(const char *tag, const char *fmt, ...) {
 #ifndef DEBUG_SOLOADER
     /* Production: telemetry logging (the [WATCH] watchdog to loader.log) fully OFF

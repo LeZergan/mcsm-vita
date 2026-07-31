@@ -1,4 +1,7 @@
+#include <psp2/power.h>
 #include "utils/init.h"
+#include "utils/config.h"   /* clock_mhz / clock_adaptive for the CLOCK re-assert */
+#include "utils/utils.h"    /* framebuffer / render-scale dimensions, file helpers */
 #include "utils/logger.h"
 #include "utils/dialog.h"
 #include "utils/launch_state.h"
@@ -9,6 +12,7 @@
 #include <stdint.h>
 #include <psp2/io/fcntl.h>
 #include <psp2/kernel/clib.h>
+#include <psp2/kernel/processmgr.h>   /* sceKernelPowerTick */
 #include <psp2/kernel/threadmgr.h>
 
 #include <falso_jni/FalsoJNI.h>
@@ -16,7 +20,6 @@
 
 #ifdef USE_PVR_PSP2
 #include "utils/pvr_init.h"
-#include "utils/loading_screen.h"
 #endif
 
 #include "reimpl/controls.h"
@@ -233,6 +236,20 @@ static void *watchdog_thread(void *arg) {
     while (1) {
         sceKernelDelayThread(1000000);
 
+        /* ☠ KEEP THE CONSOLE AWAKE DURING THE LOAD, NOT JUST DURING PLAY.
+         * The only other sceKernelPowerTick is in gl_swap -- and gl_swap does not run
+         * until the engine presents its first frame. Device log 2026-07-31: the whole
+         * run sat in NATIVEINIT_CALL with `frames=0 present_age=-1ms`, i.e. NOTHING
+         * ticked the idle timer for the entire asset load, which on this port takes
+         * minutes. That is exactly the window in which the app was observed to
+         * disappear with a healthy, still-progressing log, no fatal_error and no core
+         * dump -- the signature of the system acting on the process rather than a
+         * fault inside it. This thread already wakes once a second and is alive from
+         * before nativeInit, so it costs one syscall per second and closes the gap.
+         * NOT a proven cause: it is a documented hole in our own behaviour that had to
+         * be closed before anything else could be blamed. */
+        sceKernelPowerTick(SCE_KERNEL_POWER_TICK_DEFAULT);
+
         const LaunchStage stage = launch_state_get_stage();
         const uint64_t stage_age_ms = launch_state_stage_age_ms();
         const uint64_t uptime_ms = launch_state_uptime_ms();
@@ -245,13 +262,154 @@ static void *watchdog_thread(void *arg) {
             telemetry_log("WATCH", "%s", snap);
             telemetry_log("WATCH", "%s", memstats);
             last_log_ms = uptime_ms;
-            /* Post-effect audit: which of the engine's full-screen passes actually
-             * run, and which RenderFeatures it reports enabled. Report-only; every
-             * 30s is enough to characterise a session without flooding the log. */
+            /* Report-only diagnostics. THROTTLED TO 30s: these are the log-heavy
+             * ones, the logger is buffered onto ux0, and the throttle that used to
+             * gate them was silently dropped when mcsm_postfx_report was deleted --
+             * leaving them firing on every 5s tick against a comment that still
+             * claimed 30. last_fx_ms is the original throttle variable, which had
+             * become dead code; it is load-bearing again.
+             *
+             * mcsm_skin_report is called HERE rather than from inside
+             * mcsm_anim_report: that function returns early when the chore counter
+             * has not advanced, which silently suppressed the whole upload/skinning
+             * probe in menus, during scene loads, and in any scene without active
+             * chores -- i.e. exactly when a hang most needs describing. The two
+             * diagnostics are unrelated and must not gate each other. */
             {
-                extern void mcsm_postfx_report(void);
                 static uint64_t last_fx_ms = 0;
-                if (uptime_ms - last_fx_ms >= 30000) { mcsm_postfx_report(); last_fx_ms = uptime_ms; }
+                /* 10s, not 30s. At 30s an 86s device session produced exactly ONE
+                 * fire, and it landed on the load screen -- so the probes had a
+                 * single sample taken before the game was even rendering. 6 lines
+                 * per 10s is a fraction of what WATCH itself already writes every
+                 * 5s, so the buffered-logger cost this throttle exists to bound is
+                 * not the binding constraint; sample count is. */
+                if (uptime_ms - last_fx_ms >= 10000) {
+                    last_fx_ms = uptime_ms;
+                    { extern void mcsm_fmod_output_report(void); mcsm_fmod_output_report(); }
+                    { extern void mcsm_anim_report(void);        mcsm_anim_report(); }
+                    { extern void mcsm_skin_report(void);        mcsm_skin_report(); }
+                    /* Answers on device what cannot be known offline: whether the
+                     * engine's per-platform quality table actually differs between
+                     * Android and Vita. Reported on the same throttle as the other
+                     * probes; the table is empty until render init, so the first
+                     * fire may legitimately say 'not built yet'. */
+                    { extern void mcsm_report_platform_quality(void); mcsm_report_platform_quality(); }
+                }
+
+            /* CLOCK RE-ASSERT (2026-07-30). The boot-time set is not sticky. Device
+             * log, with every call returning rc=0:
+             *     CLOCK: arm req=444 got=333MHz | gpu req=222 got=111MHz
+             * The Vita's power manager walks these back once the app settles, so we
+             * had been running the GPU at HALF the requested clock and the CPU a
+             * third under -- on a frame that is vertex-bound at ~436k verts and ~887
+             * draws, which is exactly the workload a downclocked GPU punishes.
+             *
+             * Re-assert on the watchdog tick, and only act when the readback has
+             * actually drifted, so the common case is two cheap getters. Logged the
+             * first few times and thereafter only on a change -- if the system keeps
+             * clawing it back, that is itself the finding.
+             *
+             * ★ MUST NOT FIGHT THE CLOCK GOVERNOR (fixed 2026-07-30). This block
+             * hardcoded 444 and re-asserted it whenever the readback was lower.
+             * mcsm_clock_governor_tick() deliberately steps the ARM DOWN to as low
+             * as its 266 floor after sustained light frames, so on any profile with
+             * clock_adaptive the governor stepped down and this yanked it back up
+             * within 5s, forever: a permanent 266<->444 oscillation. That is the
+             * specific failure already measured to make fps LESS stable, not more,
+             * so re-asserting the ARM here was actively counterproductive on the
+             * battery profile.
+             *
+             * The ARM is now owned by exactly one thing: the governor when it is
+             * enabled, this block when it is not. The GPU/bus/xbar are never
+             * touched by the governor, so re-asserting those is always ours to do.
+             * The target follows graphics.txt clock_mhz instead of a literal, so a
+             * user running an overclock plugin is not silently clamped to 444. */
+            {
+                static unsigned s_clk_logs = 0;
+                static int s_last_arm = -1, s_last_gpu = -1;
+                const McsmCfg *cfg = mcsm_cfg();
+                /* Ask the governor whether it is ACTUALLY driving the ARM, rather
+                 * than inferring it from graphics.txt. Inferring was wrong: the
+                 * governor can also be disabled by a non-adaptive graphics.txt
+                 * `clock`, or by having only one
+                 * usable clock step, and in those cases this block stood down while
+                 * the governor never started -- leaving the ARM owned by nobody and
+                 * free to drift to 333MHz with nothing logging it. */
+                extern int mcsm_clock_governor_active(void);
+                const int arm_is_ours = !mcsm_clock_governor_active();
+                const int want_arm = cfg->clock_mhz > 0 ? cfg->clock_mhz : 444;
+                /* GPU/bus/xbar are stock literals because NO CONFIG KNOB EXISTS for
+                 * them. An earlier edit routed want_gpu through mcsm_read_clock_cfg()
+                 * to "honour user configuration" -- but that function assigns
+                 * cfg->gpu = 222 unconditionally and nothing else ever writes it, so
+                 * the value was identical and the code merely LOOKED configurable,
+                 * which is worse than an honest literal. If a GPU knob is ever wanted
+                 * it belongs in graphics.txt next to clock_mhz, and this line should
+                 * read it from McsmCfg. */
+                const int want_gpu = 222, want_bus = 222, want_xbar = 166;
+                int arm = scePowerGetArmClockFrequency();
+                int gpu = scePowerGetGpuClockFrequency();
+                int bus = scePowerGetBusClockFrequency();
+                int xbar = scePowerGetGpuXbarClockFrequency();
+                const int arm_low  = arm_is_ours && arm < want_arm;
+                const int gpu_low  = gpu  < want_gpu;
+                const int bus_low  = bus  < want_bus;
+                const int xbar_low = xbar < want_xbar;
+                if (arm_low || gpu_low || bus_low || xbar_low) {
+                    /* Each write is gated on ITS OWN readback. Previously bus and
+                     * xbar were re-asserted unconditionally whenever the ARM or GPU
+                     * had drifted, so a deliberately lower bus/xbar setting could
+                     * never persist and two syscalls were spent every tick. */
+                    if (arm_low)  scePowerSetArmClockFrequency(want_arm);
+                    if (gpu_low)  scePowerSetGpuClockFrequency(want_gpu);
+                    if (bus_low)  scePowerSetBusClockFrequency(want_bus);
+                    if (xbar_low) scePowerSetGpuXbarClockFrequency(want_xbar);
+                    int arm2 = scePowerGetArmClockFrequency();
+                    int gpu2 = scePowerGetGpuClockFrequency();
+                    if (s_clk_logs < 6U || arm2 != s_last_arm || gpu2 != s_last_gpu) {
+                        s_clk_logs++;
+                        l_info("CLOCK re-assert: arm %d->%dMHz%s gpu %d->%dMHz bus=%d xbar=%d (targets %d/%d)",
+                               arm, arm2, arm_is_ours ? " " : " (governor owns ARM) ",
+                               gpu, gpu2, bus, xbar, want_arm, want_gpu);
+                    }
+                    s_last_arm = arm2; s_last_gpu = gpu2;
+                }
+            }
+            /* EXIT-PATH EVIDENCE (2026-07-29). The app dies in the menu with no
+             * core dump, a cleanly terminated log, and frames/audio/memory all
+             * healthy at the last line. A CPU fault would have produced a dump, so
+             * it is either a signal kill, a deliberate exit, or the user closing a
+             * frozen picture -- and those need completely different fixes. Rather
+             * than infer again, record whether the ENGINE threads are still moving
+             * independently of the watchdog, so the final line distinguishes a
+             * freeze (frames stop, watchdog keeps logging) from a kill (both stop
+             * together at a healthy line). */
+            {
+                static unsigned long s_prev_frames = 0;
+                static int s_frozen_ticks = 0;
+                unsigned long fr = (unsigned long)launch_state_get_present_count();
+                /* Ignore fr==0: before the first present the counter is legitimately
+                 * zero, and the earlier version reported that as a freeze for the
+                 * whole of boot -- 6 false positives that made the real end-of-run
+                 * state unreadable. */
+                const int was_frozen = (s_frozen_ticks >= 2);
+                if (fr != 0 && fr == s_prev_frames) s_frozen_ticks++; else s_frozen_ticks = 0;
+                s_prev_frames = fr;
+                /* Log the TRANSITIONS, not the state. `>= 2` was true on every tick
+                 * for the rest of the run, so the one scenario this exists to
+                 * describe -- a hang lasting tens of seconds -- buried its own
+                 * evidence under a FREEZE line every 5s, each a synchronous buffered
+                 * write to ux0 issued from the only thread still alive. One line in,
+                 * one line out, and the WATCH ticks either side already show how long
+                 * it lasted. */
+                if (!was_frozen && s_frozen_ticks >= 2) {
+                    telemetry_log("WATCH", "FREEZE: frames stuck at %lu for %d ticks (~%ds) — "
+                                  "render thread is not advancing; this is a HANG, not a kill",
+                                  fr, s_frozen_ticks, s_frozen_ticks * 5);
+                } else if (was_frozen && s_frozen_ticks == 0) {
+                    telemetry_log("WATCH", "FREEZE ENDED: frames advancing again (now %lu)", fr);
+                }
+            }
             }
         }
 
@@ -468,10 +626,6 @@ static void *run_game(void *arg) {
         launch_state_set_stage(LS_NATIVE_RESIZE);
         telemetry_log("BOOT", "calling onNativeResize(%d,%d,RGBA8888)", fb_w, fb_h);
         on_native_resize(&jni, NULL, fb_w, fb_h, 1);
-#ifdef USE_PVR_PSP2
-        loading_screen_set_status("Surface configured: %dx%d", fb_w, fb_h);
-        loading_screen_render();
-#endif
     } else {
         l_warn("onNativeResize not found in libSDL2.so.");
     }
@@ -545,20 +699,10 @@ static void *run_game(void *arg) {
 
         launch_state_set_stage(LS_NATIVEINIT_CALL);
         telemetry_log("BOOT", "calling nativeInit");
-#ifdef USE_PVR_PSP2
-        loading_screen_set_status("Native engine starting...");
-        loading_screen_set_progress(0.35f);
-        loading_screen_render();
-#endif
 
         native_init(&jni, NULL, NULL);
         launch_state_set_stage(LS_NATIVEINIT_RETURN);
         telemetry_log("BOOT", "nativeInit returned");
-#ifdef USE_PVR_PSP2
-        loading_screen_set_status("Game engine initialized.");
-        loading_screen_set_progress(0.85f);
-        loading_screen_render();
-#endif
 
         if (poke_thread_started) {
             pthread_join(poke_thread, NULL);
@@ -576,11 +720,6 @@ static void *run_game(void *arg) {
     if (sdl_main) {
         launch_state_set_stage(LS_SDL_MAIN_CALL);
         telemetry_log("BOOT", "calling SDL_main");
-#ifdef USE_PVR_PSP2
-        loading_screen_set_status("Starting game...");
-        loading_screen_set_progress(0.95f);
-        loading_screen_render();
-#endif
         sdl_main();
         launch_state_set_stage(LS_SDL_MAIN_RETURN);
         telemetry_log("BOOT", "SDL_main returned");
@@ -596,6 +735,11 @@ static void *run_game(void *arg) {
 }
 
 int main(void) {
+    /* FIRST, ahead of every writer. Both loggers share DATA_PATH "loader.log", so
+     * whichever truncates LAST wipes what the other already wrote -- and this call
+     * used to sit in soloader_init_all(), i.e. after main() had logged the build
+     * stamp inputs and the boot-picture result. Reset once, here. */
+    log_reset_file();
     launch_state_set_stage(LS_BOOT);
 
     telemetry_reset();
@@ -606,6 +750,14 @@ int main(void) {
     telemetry_log("BOOT", "telemetry path: %s", telemetry_last_path() ? telemetry_last_path() : "(none)");
     telemetry_log("BOOT", "build: %s %s", __DATE__, __TIME__);
     telemetry_log("BOOT", "heap_user_mb=%d", _newlib_heap_size_user / (1024 * 1024));
+
+    /* BOOT PICTURE REMOVED 2026-07-31, by request, after seeing it on device.
+     * A held pic0 makes the (multi-minute, legitimately slow) asset load look like a
+     * frozen picture rather than a black screen, which reads as a hang. The load
+     * length is unchanged either way -- the picture only ever changed what was on
+     * screen during it -- so the screen goes back to blank until the engine's first
+     * present. splash.c/.h, its GL half in glutil.c and the packaged splash.raw are
+     * all gone; see CHANGES_2026-07-31_r100.md for what it did and why. */
 
     launch_state_set_stage(LS_SOLOADER_INIT);
     telemetry_log("BOOT", "calling soloader_init_all");
@@ -846,9 +998,11 @@ static float clamp01(float value) {
 
 static int legacy_touch_pointer_enabled(void) {
     if (g_legacy_touch_pointer_enabled < 0) {
-        SceUID fd = sceIoOpen("ux0:data/mcsm/legacytouch.txt", SCE_O_RDONLY, 0);
-        if (fd >= 0) {
-            sceIoClose(fd);
+        /* mcsm_open_setting(), like every other tunable -- see the note in
+         * glutil.c's animdiag block. */
+        FILE *fd = mcsm_open_setting("legacytouch.txt", "r");
+        if (fd) {
+            fclose(fd);
             g_legacy_touch_pointer_enabled = 1;
             l_info("INPUT legacy TouchScreenState pointer path enabled by legacytouch.txt");
         } else {
