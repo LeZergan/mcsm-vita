@@ -23,8 +23,18 @@ void telemetry_reset(void);
  * gated with the diagnostics. Do not use this for anything else. */
 void telemetry_stamp(const char *line);
 
-void telemetry_log(const char *tag, const char *fmt, ...)
-                   __attribute__((format(printf, 2, 3)));
+void telemetry_log_impl(const char *tag, const char *fmt, ...)
+                        __attribute__((format(printf, 2, 3)));
+
+#ifdef DEBUG_SOLOADER
+#define telemetry_log(...) telemetry_log_impl(__VA_ARGS__)
+#else
+/* Keep compiler format checking, but erase the call and all argument evaluation
+ * from the production object. An out-of-line early-return stub still costs a BL
+ * (and can evaluate expensive arguments) without LTO. */
+#define telemetry_log(...) \
+    do { if (0) telemetry_log_impl(__VA_ARGS__); } while (0)
+#endif
 int telemetry_success_count(void);
 const char *telemetry_last_path(void);
 

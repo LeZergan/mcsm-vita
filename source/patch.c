@@ -41,6 +41,14 @@ extern void mcsm_register_virtual_controller(void);
 #define ENABLE_UNSAFE_ARCHIVE_DIAG_HOOKS 0
 #define ENABLE_HOT_RENDER_VIEW_DIAG_HOOKS 0
 
+/* Keep format-checked diagnostic throttles in telemetry builds without paying a
+ * load/add/store in production handlers whose result is otherwise constant. */
+#ifdef DEBUG_SOLOADER
+#define MCSM_DIAG_COUNTER(name) static uint32_t name = 0; ++name
+#else
+#define MCSM_DIAG_COUNTER(name) enum { name = 0 }
+#endif
+
 #define SO_CONTINUE_VOID(h, ...) do { \
     kuKernelCpuUnrestrictedMemcpy((void *)(h).addr, (h).orig_instr, sizeof((h).orig_instr)); \
     kuKernelFlushCaches((void *)(h).addr, sizeof((h).orig_instr)); \
@@ -60,33 +68,35 @@ static so_hook g_hook_gameengine_loop;
 static so_hook g_hook_gameengine_render;
 static so_hook g_hook_metrics_new_frame;
 static so_hook g_hook_render_begin_frame;
-static so_hook g_hook_render_end_frame;
-static so_hook g_hook_render_present;
-static so_hook g_hook_app_swap;
-static so_hook g_hook_suspend_game_loop;
-static so_hook g_hook_renderthread_submit_current_frame;
-static so_hook g_hook_renderthread_end_frame;
-static so_hook g_hook_renderthread_finish_frame;
 static so_hook g_hook_renderframe_execute;
 static so_hook g_hook_renderframe_allocate_view;
 static so_hook g_hook_renderframe_push_view;
-static so_hook g_hook_viewport_prepare_view;
-static so_hook g_hook_rendertexture_prepare_view;
-static so_hook g_hook_switch_default_render_target;
 static so_hook g_hook_gamerender_render_frame;
 static so_hook g_hook_gamerender_render_scene;
 static so_hook g_hook_playback_controller_update;
+static uintptr_t g_renderframe_execute_tramp;
+static uintptr_t g_gamerender_render_frame_tramp;
+static uintptr_t g_gamerender_render_scene_tramp;
+static uintptr_t g_playback_controller_update_tramp;
+static uintptr_t g_metrics_new_frame_tramp;
 static so_hook g_hook_android_pump_events;
 static so_hook g_hook_android_jni_poll_input_devices;
 static so_hook g_hook_sdl_wait_event_real;
 static so_hook g_hook_sdl_wait_event_timeout_real;
+#ifdef DEBUG_SOLOADER
 static so_hook g_hook_app_on_fingering;
 static so_hook g_hook_app_on_mouse_event;
 static so_hook g_hook_gamewindow_mouse_move;
 static so_hook g_hook_gamewindow_mouse_down;
 static so_hook g_hook_gamewindow_mouse_up;
 static so_hook g_hook_touch_set_legacy_pointer;
+#endif
 static so_hook g_hook_fmod_studio_initialize;
+
+/* Defined with the render-lever trampoline implementation below. Hot hooks use
+ * the same validated cave builder and retain SO_CONTINUE as a fail-safe fallback. */
+static uintptr_t mcsm_build_tramp(so_hook *h);
+static uintptr_t mcsm_build_metrics_new_frame_tramp(so_hook *h);
 
 
 static uintptr_t g_renderframe_push_view_addr = 0;
@@ -128,6 +138,7 @@ static volatile int g_boot_scene_active = 0;
  * loader code. One thread writes them; the watchdog reads them once per 10s and only
  * needs a monotonically-increasing approximation -- exactly the reasoning
  * launch_state.c already applies to g_draw_serial. */
+#ifdef DEBUG_SOLOADER
 static uint32_t g_vb_locks = 0;     /* T3VertexBuffer::PlatformLock calls   */
 static uint32_t g_vb_respec = 0;    /* full glBufferData respecifies        */
 static uint32_t g_vb_kb = 0;        /* KB pushed through those respecifies  */
@@ -148,6 +159,10 @@ static uint32_t g_vb_tid = 0;
 static uint32_t g_vb_subdata = 0;
 static uint32_t g_vb_reuse = 0;
 static uint32_t g_vb_evict = 0;   /* table evictions -- if this tracks locks/f, the keys are transient */
+#define MCSM_VB_DIAG(code) do { code; } while (0)
+#else
+#define MCSM_VB_DIAG(code) do { } while (0)
+#endif
 /* SIM BREAKDOWN (2026-07-30). DIP-SIM says the engine sim is a sustained 25-27ms
  * against a 16.7ms budget, and frames land at 41ms -- so ~26ms sim + ~15ms other.
  * Knowing WHICH of the two once-per-frame animation entry points owns that 26ms is
@@ -642,15 +657,13 @@ static void mcsm_clock_governor_tick(uint32_t sim_us) {
     int render_slow  = (pdt > budget_us + budget_us / 4);              /* >1.25x budget = clearly dropping */
     int frame_smooth = (pdt != 0) && (pdt <= budget_us + budget_us / 8); /* <=~1.12x budget = holding target */
 
-    /* Diagnostic heartbeat: confirms the governor is alive and shows the clock it
-     * settled on, once every 256 frames (~10s at the measured 26fps). This SHIPS --
-     * the comment here used to claim it was "compiled out in production", which was
-     * simply false (l_info is compiled in for this build) and would have told the
-     * next reader that a line they were looking at in a device log could not exist. */
+#ifdef DEBUG_SOLOADER
+    /* Diagnostic heartbeat: confirm the governor's settled clock in logging builds. */
     { static uint32_t hb = 0;
       if (((++hb) & 0xFFu) == 0u)
           l_info("clock-gov: heartbeat ARM=%dMHz sim=%uus present=%uus (down<%u up>%u)",
-                 levels[cur_idx], sim_us, pdt, down_us, up_us); }
+                  levels[cur_idx], sim_us, pdt, down_us, up_us); }
+#endif
 
     /* ESCALATE immediately on CPU pressure OR a render-bound frame. */
     if (sim_us > up_us || render_slow) {
@@ -920,15 +933,22 @@ static int repair_metric_float(float *slot,
     }
 
     *slot = replacement;
+#ifdef DEBUG_SOLOADER
     if (repairs && repairs_size > 0) {
         const size_t used = strlen(repairs);
         if (used < repairs_size - 1U) {
             snprintf(repairs + used, repairs_size - used, "%s%s", used ? "," : "", name);
         }
     }
+#else
+    (void)name;
+    (void)repairs;
+    (void)repairs_size;
+#endif
     return 1;
 }
 
+#ifdef DEBUG_SOLOADER
 static int diag_read_u8(const uint8_t *slot) {
     return slot ? (int)*slot : -1;
 }
@@ -936,14 +956,19 @@ static int diag_read_u8(const uint8_t *slot) {
 static uint32_t diag_read_u32(const uint32_t *slot) {
     return slot ? *slot : 0U;
 }
+#endif
 
 /* From java.c — the low-res the game renders into the FBO before upscaling. */
 extern int mcsm_get_render_scale_width(void);
 extern int mcsm_get_render_scale_height(void);
 
 static void force_native_render_dimensions(const char *phase) {
+#ifdef DEBUG_SOLOADER
     static uint32_t force_count = 0;
     static uint32_t change_count = 0;
+#else
+    (void)phase;
+#endif
 
     if (!g_render_gate_diag.initialized) {
         return;
@@ -959,6 +984,7 @@ static void force_native_render_dimensions(const char *phase) {
     const uint32_t rw = (uint32_t)mcsm_get_render_scale_width();
     const uint32_t rh = (uint32_t)mcsm_get_render_scale_height();
 
+#ifdef DEBUG_SOLOADER
     const uint32_t before_dw = diag_read_u32(g_render_gate_diag.device_width);
     const uint32_t before_dh = diag_read_u32(g_render_gate_diag.device_height);
     const uint32_t before_gw = diag_read_u32(g_render_gate_diag.game_width);
@@ -968,6 +994,7 @@ static void force_native_render_dimensions(const char *phase) {
         before_dh != rh ||
         before_gw != rw ||
         before_gh != rh;
+#endif
 
     if (g_render_gate_diag.device_width) {
         *g_render_gate_diag.device_width = rw;
@@ -982,6 +1009,7 @@ static void force_native_render_dimensions(const char *phase) {
         *g_render_gate_diag.game_height = rh;
     }
 
+#ifdef DEBUG_SOLOADER
     force_count++;
     if (changed) {
         change_count++;
@@ -1001,13 +1029,18 @@ static void force_native_render_dimensions(const char *phase) {
                rw,
                rh);
     }
+#endif
 }
 
 
 static void force_application_active(const char *phase) {
+#ifdef DEBUG_SOLOADER
     static uint32_t log_count = 0;
     const int had_wait = diag_read_u8(g_render_gate_diag.app_wait_for_messages);
     const int had_active = diag_read_u8(g_render_gate_diag.app_active);
+#else
+    (void)phase;
+#endif
 
     if (g_render_gate_diag.app_wait_for_messages) {
         *g_render_gate_diag.app_wait_for_messages = 0;
@@ -1016,6 +1049,7 @@ static void force_application_active(const char *phase) {
         *g_render_gate_diag.app_active = 1;
     }
 
+#ifdef DEBUG_SOLOADER
     if ((had_wait != 0 || had_active != 1) &&
         (log_count < 32U || (log_count % 256U) == 0U)) {
         l_info("Diag: AppState force[%s] wait=%d->0 active=%d->1",
@@ -1024,8 +1058,10 @@ static void force_application_active(const char *phase) {
                had_active);
         log_count++;
     }
+#endif
 }
 
+#ifdef DEBUG_SOLOADER
 static void log_metrics_diag(uint32_t loop_count, const char *phase, int repairs, const char *repair_names) {
     if (!g_metrics_diag.initialized) {
         return;
@@ -1071,9 +1107,14 @@ static void log_metrics_diag(uint32_t loop_count, const char *phase, int repairs
            delay, float_bits(delay),
            min_frame, float_bits(min_frame));
 }
+#endif
 
 static void metrics_diag_tick(uint32_t loop_count, const char *phase) {
+#ifdef DEBUG_SOLOADER
     char repairs[96] = {0};
+#else
+    char *repairs = NULL;
+#endif
     int repair_count = 0;
 
     repair_count += repair_metric_float(g_metrics_diag.frame_time,
@@ -1082,35 +1123,55 @@ static void metrics_diag_tick(uint32_t loop_count, const char *phase) {
                                         0.0f,
                                         5.0f,
                                         repairs,
+#ifdef DEBUG_SOLOADER
                                         sizeof(repairs));
+#else
+                                        0);
+#endif
     repair_count += repair_metric_float(g_metrics_diag.actual_frame_time,
                                         "mActualFrameTime",
                                         1.0f / 30.0f,
                                         0.0f,
                                         5.0f,
                                         repairs,
+#ifdef DEBUG_SOLOADER
                                         sizeof(repairs));
+#else
+                                        0);
+#endif
     repair_count += repair_metric_float(g_metrics_diag.average_frame_time,
                                         "mAverageFrameTime",
                                         1.0f / 30.0f,
                                         0.0f,
                                         5.0f,
                                         repairs,
+#ifdef DEBUG_SOLOADER
                                         sizeof(repairs));
+#else
+                                        0);
+#endif
     repair_count += repair_metric_float(g_metrics_diag.total_time,
                                         "mTotalTime",
                                         0.0f,
                                         0.0f,
                                         86400.0f,
                                         repairs,
+#ifdef DEBUG_SOLOADER
                                         sizeof(repairs));
+#else
+                                        0);
+#endif
     repair_count += repair_metric_float(g_metrics_diag.scale,
                                         "mScale",
                                         1.0f,
                                         0.0f,
                                         10.0f,
                                         repairs,
+#ifdef DEBUG_SOLOADER
                                         sizeof(repairs));
+#else
+                                        0);
+#endif
     /* Metrics::NewFrame stores -1.0 in mNextFrameTime as a sentinel. */
     repair_count += repair_metric_float(g_metrics_diag.fixed_time_step,
                                         "mFixedTimeStep",
@@ -1118,23 +1179,41 @@ static void metrics_diag_tick(uint32_t loop_count, const char *phase) {
                                         0.0f,
                                         5.0f,
                                         repairs,
+#ifdef DEBUG_SOLOADER
                                         sizeof(repairs));
+#else
+                                        0);
+#endif
     repair_count += repair_metric_float(g_metrics_diag.delay,
                                         "mDelay",
                                         0.0f,
                                         0.0f,
                                         5.0f,
                                         repairs,
+#ifdef DEBUG_SOLOADER
                                         sizeof(repairs));
+#else
+                                        0);
+#endif
     repair_count += repair_metric_float(g_metrics_diag.min_frame_time,
                                         "mMinFrameTime",
                                         0.0f,
                                         0.0f,
                                         5.0f,
                                         repairs,
+#ifdef DEBUG_SOLOADER
                                         sizeof(repairs));
+#else
+                                        0);
+#endif
 
+#ifdef DEBUG_SOLOADER
     log_metrics_diag(loop_count, phase, repair_count, repairs);
+#else
+    (void)loop_count;
+    (void)phase;
+    (void)repair_count;
+#endif
 }
 
 static int playback_dt_is_usable(float value);
@@ -1361,15 +1440,44 @@ static int mcsm_anim_rate(void) {
      * stray anim_rate.txt, which left the single biggest remaining sim lever
      * undiscoverable next to every other tunable. mcsm_cfg() caches, so this is
      * just a field read; the value is already clamped to 1..3 at parse time. */
-    static int logged = 0;
     const int rate = mcsm_cfg()->anim_rate;
+#ifdef DEBUG_SOLOADER
+    static int logged = 0;
     if (!logged) { logged = 1; l_info("ANIM: update-rate = 1/%d", rate); }
+#endif
     return rate;
 }
 
 static void force_animation_runtime_flags(const char *phase) {
     static uint32_t count = 0;
     static int last_recursive_full = -1;
+
+    /* ★ ON BY DEFAULT, AND IT MUST STAY THAT WAY (2026-08-01).
+     *
+     * These flags were briefly defaulted OFF on the theory that forcing
+     * GameEngine::mbFixRecursiveAnimationContribution from our thread was racing the
+     * engine's animation update and causing the reported intermittent head detachment.
+     * DEVICE RESULT: animation got dramatically WORSE, not better. The theory was
+     * wrong and the header comment above already said so -- the recursive-bone
+     * contribution fix "is what makes skeletal animation work". The engine's own
+     * default leaves it off; forcing it on is the thing holding skeletons together.
+     *
+     * So the residual "heads disconnect sometimes" is NOT caused by this override --
+     * it is what remains WITH the override doing its job, and the next suspects are
+     * elsewhere (detail/LOD picking a character mesh with different skinning weights,
+     * or gpu_tier selecting a cheaper engine path).
+     *
+     * `anim_engine_flags = off` in graphics.txt still exists, but only to reproduce
+     * the broken state for comparison. It is not a performance setting. */
+    if (!mcsm_cfg()->anim_engine_flags) {
+        if (count == 0U) {
+            l_warn("ANIM: engine animation flags NOT forced (anim_engine_flags = off) — "
+                   "skeletal animation is known to break without them.");
+            count = 1U;
+        }
+        return;
+    }
+
     resolve_animation_runtime_flags();
     const int recursive_full = mcsm_anim_full();
     const int recursive_value =
@@ -1402,6 +1510,12 @@ static void force_animation_runtime_flags(const char *phase) {
         }
         g_set_chore_filter_includes_non_skeleton(s_nonskel);
     }
+    /* BOTH the setter AND the direct write, deliberately. Dropping the raw write on
+     * 2026-08-01 (reasoning: two writers for one piece of state) made animation
+     * WORSE on device, so the direct poke is doing something the setter alone does
+     * not -- most likely the setter only latches a value the engine re-reads later,
+     * while the live global is what the animation update actually consults. Restored.
+     * Do not remove it again without a device test proving animation still works. */
     if (g_set_fix_recursive_animation_contribution && recursive_needs_write) {
         g_set_fix_recursive_animation_contribution(recursive_full);
     }
@@ -1434,7 +1548,9 @@ static void force_animation_runtime_flags(const char *phase) {
  * count or something else. ChoreInst::UpdateChoreInstances is called ONCE per
  * frame -- not per chore -- so hooking it is cheap and, unlike the render-path
  * hooks that crashed, it is not called concurrently from multiple threads. */
+#if !MCSM_FAST_FINAL_RUNTIME
 static so_hook g_hook_chore_update_all;
+#endif
 static volatile unsigned g_chore_ticks = 0;
 /* ---- ENGINE TUNABLE GLOBALS (2026-07-31) ----------------------------------
  * The engine exposes several plain globals that configure the render and audio
@@ -1533,15 +1649,9 @@ static void mcsm_engine_tunables(void) {
 
 static so_hook g_hook_get_platform_type;
 static int hook_get_platform_type(void) {
-    static uint32_t count = 0;
-    count++;
-    if (mcsm_cfg()->platform_vita) {
-        if (count <= 8U)
-            l_info("FIX: TTPlatform::GetPlatformType -> ePlatform_Vita(%d) (#%u)",
-                   MCSM_EPLATFORM_VITA, count);
-        return MCSM_EPLATFORM_VITA;
-    }
-    return MCSM_EPLATFORM_ANDROID;   /* the stub's own constant; no SO_CONTINUE needed */
+    /* The hook is installed only when the latched platform_vita option is enabled.
+     * Avoid re-reading config and updating a diagnostic counter on this per-draw call. */
+    return MCSM_EPLATFORM_VITA;
 }
 
 /* Ask the engine which render quality types each platform supports. The function is
@@ -1661,12 +1771,14 @@ static void hook_script_update(uint32_t dt_bits) {
 }
 #endif /* !MCSM_FAST_FINAL_RUNTIME */
 
+#if !MCSM_FAST_FINAL_RUNTIME
 static void hook_chore_update_all(void) {
     g_chore_ticks++;
     const uint64_t t0 = MCSM_PHASE_T0();
     SO_CONTINUE_VOID(g_hook_chore_update_all);
     MCSM_PHASE_ADD(g_chore_us, g_chore_n, t0);
 }
+#endif
 
 void mcsm_anim_report(void) {
     static unsigned last = 0;
@@ -1698,6 +1810,9 @@ void mcsm_anim_report(void) {
  *              from the symbol table; whichever column is plausible is the real one.
  * Runs on the watchdog thread every 5s. Deltas, so no shared per-frame reset. */
 void mcsm_skin_report(void) {
+#ifndef DEBUG_SOLOADER
+    return;
+#else
     static uint32_t last_locks = 0, last_respec = 0, last_kb = 0, last_mallocs = 0;
     static uint32_t last_frames = 0;
 
@@ -1876,6 +1991,7 @@ void mcsm_skin_report(void) {
 
     last_locks = locks; last_respec = respec; last_kb = kb;
     last_mallocs = mallocs; last_frames = frames;
+#endif
 }
 
 static void patch_chore_full_update_path(void) {
@@ -1922,9 +2038,11 @@ static void patch_chore_full_update_path(void) {
         l_warn("ANIM: ChoreAgentInst::SetController symbol not found.");
     }
 
+#if !MCSM_FAST_FINAL_RUNTIME
     (void)hook_symbol_checked(&so_mod_gameengine, "_ZN9ChoreInst20UpdateChoreInstancesEv",
                               "ChoreInst::UpdateChoreInstances (probe)",
                               (uintptr_t)&hook_chore_update_all, &g_hook_chore_update_all);
+#endif
     /* Phase probes: attribute the sim time that chore+playback do NOT explain
      * (device says those are only ~4.8ms of 26-40ms). */
     /* Engine platform identity. Installed unconditionally so the hook is always in
@@ -1979,34 +2097,34 @@ static void patch_chore_full_update_path(void) {
 }
 
 static void hook_gameengine_start(void) {
-    static uint32_t count = 0;
-
-    count++;
     force_animation_runtime_flags("start-pre");
     SO_CONTINUE_VOID(g_hook_gameengine_start);
     force_animation_runtime_flags("start-post");
 }
 
 static void hook_metrics_new_frame(uint32_t min_frame_time_bits) {
-    static uint32_t count = 0;
-
-    count++;
+    MCSM_DIAG_COUNTER(count);
 
     typedef void (*metrics_new_frame_raw_fn)(uint32_t);
-    kuKernelCpuUnrestrictedMemcpy((void *)g_hook_metrics_new_frame.addr,
-                                  g_hook_metrics_new_frame.orig_instr,
-                                  sizeof(g_hook_metrics_new_frame.orig_instr));
-    kuKernelFlushCaches((void *)g_hook_metrics_new_frame.addr,
-                        sizeof(g_hook_metrics_new_frame.orig_instr));
-    metrics_new_frame_raw_fn fn = g_hook_metrics_new_frame.thumb_addr
-        ? (metrics_new_frame_raw_fn)g_hook_metrics_new_frame.thumb_addr
-        : (metrics_new_frame_raw_fn)g_hook_metrics_new_frame.addr;
-    fn(min_frame_time_bits);
-    kuKernelCpuUnrestrictedMemcpy((void *)g_hook_metrics_new_frame.addr,
-                                  g_hook_metrics_new_frame.patch_instr,
-                                  sizeof(g_hook_metrics_new_frame.patch_instr));
-    kuKernelFlushCaches((void *)g_hook_metrics_new_frame.addr,
-                        sizeof(g_hook_metrics_new_frame.patch_instr));
+    if (g_metrics_new_frame_tramp) {
+        ((metrics_new_frame_raw_fn)g_metrics_new_frame_tramp)(min_frame_time_bits);
+    } else {
+        /* Exact-prologue validation failed: retain the old, slower correctness path. */
+        kuKernelCpuUnrestrictedMemcpy((void *)g_hook_metrics_new_frame.addr,
+                                      g_hook_metrics_new_frame.orig_instr,
+                                      sizeof(g_hook_metrics_new_frame.orig_instr));
+        kuKernelFlushCaches((void *)g_hook_metrics_new_frame.addr,
+                            sizeof(g_hook_metrics_new_frame.orig_instr));
+        metrics_new_frame_raw_fn fn = g_hook_metrics_new_frame.thumb_addr
+            ? (metrics_new_frame_raw_fn)g_hook_metrics_new_frame.thumb_addr
+            : (metrics_new_frame_raw_fn)g_hook_metrics_new_frame.addr;
+        fn(min_frame_time_bits);
+        kuKernelCpuUnrestrictedMemcpy((void *)g_hook_metrics_new_frame.addr,
+                                      g_hook_metrics_new_frame.patch_instr,
+                                      sizeof(g_hook_metrics_new_frame.patch_instr));
+        kuKernelFlushCaches((void *)g_hook_metrics_new_frame.addr,
+                            sizeof(g_hook_metrics_new_frame.patch_instr));
+    }
 
     const float engine_ft = g_metrics_diag.frame_time ? *g_metrics_diag.frame_time : 0.0f;
     const float engine_aft = g_metrics_diag.actual_frame_time ? *g_metrics_diag.actual_frame_time : 0.0f;
@@ -2033,17 +2151,30 @@ static void hook_gameengine_loop(void) {
      * If the sim loop itself spikes (>22ms) the bottleneck is engine-side
      * logic/animation, not rendering. Keep this to severe spikes only; logging
      * every 20-50ms frame became part of the stutter during animation tests. */
-    const uint64_t sim_t0 = sceKernelGetSystemTimeWide();
+#if defined(DEBUG_SOLOADER) || !MCSM_FAST_FINAL_RUNTIME
+    const int measure_sim = 1;
+#else
+    /* Fixed-clock profiles never consume sim_us. Cache the latched config decision
+     * and avoid two kernel-time queries per frame; adaptive/battery keeps the exact
+     * same governor input. */
+    static int measure_sim = -1;
+    if (measure_sim < 0) measure_sim = mcsm_cfg()->clock_adaptive ? 1 : 0;
+#endif
+    const uint64_t sim_t0 = measure_sim ? sceKernelGetSystemTimeWide() : 0;
     SO_CONTINUE_VOID(g_hook_gameengine_loop);
-    const uint32_t sim_us = (uint32_t)(sceKernelGetSystemTimeWide() - sim_t0);
-    const uint32_t sim_ms = sim_us / 1000U;
+    const uint32_t sim_us = measure_sim
+                          ? (uint32_t)(sceKernelGetSystemTimeWide() - sim_t0)
+                          : 0u;
     /* Feed the pure sim-work cost to the adaptive ARM-clock governor (battery):
      * downclock when scenes are light, jump to the ceiling the moment they aren't. */
     mcsm_clock_governor_tick(sim_us);
     /* DIAG: log gameplay CPU-sim cost on dips (>20ms), throttled. Compare against
      * DIP-RENDER dt for the same frames: sim≈dt => CPU-bound; sim<<dt => GPU/VRAM-bound. */
-    { static unsigned s_simc = 0;
+#ifdef DEBUG_SOLOADER
+    { const uint32_t sim_ms = sim_us / 1000U;
+      static unsigned s_simc = 0;
       if (sim_ms > 20U && (s_simc++ & 0xFU) == 0U) l_info("DIP-SIM frame=%u work=%ums", count, sim_ms); }
+#endif
     force_application_active("loop-post");
     force_native_render_dimensions("loop-post");
     metrics_diag_tick(count, "post");
@@ -2058,9 +2189,6 @@ static void hook_gameengine_loop(void) {
 }
 
 static void hook_gameengine_render(void) {
-    static uint32_t count = 0;
-
-    count++;
     force_native_render_dimensions("render-enter");
     const uint64_t r_t0 = MCSM_PHASE_T0();
     SO_CONTINUE_VOID(g_hook_gameengine_render);
@@ -2069,37 +2197,13 @@ static void hook_gameengine_render(void) {
 }
 
 static int hook_renderdevice_begin_frame(void) {
-    static uint32_t count = 0;
-
-    count++;
-
     force_native_render_dimensions("begin-frame-pre");
     int ret = SO_CONTINUE(int, g_hook_render_begin_frame);
     force_native_render_dimensions("begin-frame-post");
     return ret;
 }
 
-static void hook_renderdevice_end_frame(void) {
-    static uint32_t count = 0;
-
-    count++;
-    SO_CONTINUE_VOID(g_hook_render_end_frame);
-}
-
-static void hook_renderdevice_present(void) {
-    static uint32_t count = 0;
-
-    count++;
-    SO_CONTINUE_VOID(g_hook_render_present);
-}
-
-static void hook_application_sdl_swap(void) {
-    static uint32_t count = 0;
-
-    count++;
-    SO_CONTINUE_VOID(g_hook_app_swap);
-}
-
+#ifdef DEBUG_SOLOADER
 static void hook_application_sdl_on_fingering(int event_type, const void *event) {
     static uint32_t count = 0;
     count++;
@@ -2213,17 +2317,14 @@ static void hook_touchscreenstate_set_legacy_pointer(void *self, const void *pos
     }
     SO_CONTINUE_VOID(g_hook_touch_set_legacy_pointer, self, position);
 }
+#endif
 
 static void hook_android_jni_poll_input_devices(void) {
-    static uint32_t count = 0;
-    count++;
     launch_state_mark_poll();
     mcsm_register_virtual_controller();
 }
 
 static void hook_android_pump_events(void) {
-    static uint32_t count = 0;
-    count++;
     launch_state_mark_poll();
 }
 
@@ -2247,91 +2348,42 @@ __attribute__((naked)) static int hook_sdl_wait_event_timeout_real(void *event, 
     );
 }
 
-static void hook_suspend_game_loop(int suspend) {
-    static int last_suspend = -1;
-    static uint32_t count = 0;
-
-    count++;
-    if (suspend != last_suspend) {   /* the should_log_diag_count() disjunct was always false */
-        last_suspend = suspend;
-    }
-    SO_CONTINUE_VOID(g_hook_suspend_game_loop, suspend);
-}
-
-static void hook_renderthread_submit_current_frame(void) {
-    static uint32_t count = 0;
-
-    count++;
-
-    SO_CONTINUE_VOID(g_hook_renderthread_submit_current_frame);
-}
-
-static void hook_renderthread_end_frame(void) {
-    static uint32_t count = 0;
-
-    count++;
-
-    SO_CONTINUE_VOID(g_hook_renderthread_end_frame);
-}
-
-static void hook_renderthread_finish_frame(void) {
-    static uint32_t count = 0;
-
-    count++;
-
-    SO_CONTINUE_VOID(g_hook_renderthread_finish_frame);
-}
-
 static int hook_renderframe_execute(void *self, void *other_frame) {
-    static uint32_t count = 0;
-    static uint32_t paired_overlay_count = 0;
-
-    count++;
-
-    const uintptr_t overlay_frame = g_overlay_render_frame;
-    const int paired_overlay_frame =
-        g_boot_scene_active &&
-        overlay_frame &&
-        (uintptr_t)other_frame == overlay_frame;
-    if (paired_overlay_frame) {
-        paired_overlay_count++;
+    int ret;
+    if (g_renderframe_execute_tramp) {
+        ret = ((int (*)(void *, void *))g_renderframe_execute_tramp)(self, other_frame);
+    } else {
+        ret = SO_CONTINUE(int, g_hook_renderframe_execute, self, other_frame);
     }
-
-    int ret = SO_CONTINUE(int, g_hook_renderframe_execute, self, other_frame);
     /* Bootstrap needs forced presents to escape the historical black-screen
      * path. After the first real scene render, leave the frame pairing exactly
      * as the engine requested; replacing the paired overlay frame with NULL
      * produced live RenderScene calls but unstable color-only output. */
     int forced = (!ret && !g_boot_scene_active) ? 1 : ret;
-    const int log_paired =
-        paired_overlay_frame &&
-        (paired_overlay_count <= 8U || (paired_overlay_count % 256U) == 0U);
-    if (/* the should_log_diag_count() disjunct was always false */
-        (!g_boot_scene_active && ret != 0) ||
-        (g_boot_scene_active && (ret == 0 || log_paired))) {
-    }
     return forced;
 }
 
 static void hook_gamerender_render_frame(void) {
-    static uint32_t count = 0;
-
-    count++;
     force_native_render_dimensions("game-render-frame");
-    SO_CONTINUE_VOID(g_hook_gamerender_render_frame);
+    if (g_gamerender_render_frame_tramp) {
+        ((void (*)(void))g_gamerender_render_frame_tramp)();
+    } else {
+        SO_CONTINUE_VOID(g_hook_gamerender_render_frame);
+    }
 }
 
 static void hook_gamerender_render_scene(void *scene_ctx, const void *params) {
-    static uint32_t count = 0;
-
-    count++;
-    if (count == 1U) {
+    if (!g_boot_scene_active) {
         /* First real scene render = assets loaded, the game is starting. */
         g_boot_scene_active = 1;
         launch_state_mark_scene_active();
     }
     force_native_render_dimensions("game-render-scene");
-    SO_CONTINUE_VOID(g_hook_gamerender_render_scene, scene_ctx, params);
+    if (g_gamerender_render_scene_tramp) {
+        ((void (*)(void *, const void *))g_gamerender_render_scene_tramp)(scene_ctx, params);
+    } else {
+        SO_CONTINUE_VOID(g_hook_gamerender_render_scene, scene_ctx, params);
+    }
 }
 
 static int playback_dt_is_usable(float value) {
@@ -2340,9 +2392,6 @@ static int playback_dt_is_usable(float value) {
 
 static void hook_playback_controller_update(uint32_t frame_time_bits,
                                             uint32_t actual_frame_time_bits) {
-    static uint32_t count = 0;
-    static uint32_t repaired = 0;
-
     /* Animation-rate throttle (opt-in anim_rate.txt): on non-Nth frames, accumulate
      * this frame's dt and SKIP the whole update (controllers don't advance); on the
      * Nth frame, run the update with the accumulated dt so wall-clock speed stays
@@ -2411,7 +2460,7 @@ static void hook_playback_controller_update(uint32_t frame_time_bits,
         }
     }
 
-    count++;
+    MCSM_DIAG_COUNTER(count);
 
     const float frame_time = float_from_bits(frame_time_bits);
     const float actual_frame_time = float_from_bits(actual_frame_time_bits);
@@ -2419,7 +2468,6 @@ static void hook_playback_controller_update(uint32_t frame_time_bits,
     uint32_t out_actual_bits = actual_frame_time_bits;
     float out_frame_time = frame_time;
     float out_actual_frame_time = actual_frame_time;
-    int did_repair = 0;
 
     if (g_boot_scene_active) {
         const float governed_dt =
@@ -2427,44 +2475,39 @@ static void hook_playback_controller_update(uint32_t frame_time_bits,
         if (abs_float_delta(out_frame_time, governed_dt) > 0.0005f) {
             out_frame_time = governed_dt;
             out_frame_bits = float_bits(out_frame_time);
-            did_repair = 1;
         }
         if (abs_float_delta(out_actual_frame_time, governed_dt) > 0.0005f) {
             out_actual_frame_time = governed_dt;
             out_actual_bits = float_bits(out_actual_frame_time);
-            did_repair = 1;
         }
         metrics_force_animation_dt(governed_dt, "playback", count);
-    }
-
-    if (did_repair) {
-        repaired++;
-    }
-    if (count <= 16U ||
-        (did_repair && (repaired <= 8U || (repaired % 512U) == 0U)) ||
-        (count % 2048U) == 0U) {
     }
 
     /* libGameEngine was built softfp, so these float arguments arrive in r0/r1.
      * Keep both hook entry and original call in integer registers and only
      * reinterpret the bits locally for validation. */
     typedef void (*playback_update_raw_fn)(uint32_t, uint32_t);
-    kuKernelCpuUnrestrictedMemcpy((void *)g_hook_playback_controller_update.addr,
-                                  g_hook_playback_controller_update.orig_instr,
-                                  sizeof(g_hook_playback_controller_update.orig_instr));
-    kuKernelFlushCaches((void *)g_hook_playback_controller_update.addr,
-                        sizeof(g_hook_playback_controller_update.orig_instr));
-    playback_update_raw_fn fn = g_hook_playback_controller_update.thumb_addr
-        ? (playback_update_raw_fn)g_hook_playback_controller_update.thumb_addr
-        : (playback_update_raw_fn)g_hook_playback_controller_update.addr;
     const uint64_t t0_pbc = MCSM_PHASE_T0();
-    fn(out_frame_bits, out_actual_bits);
+    if (g_playback_controller_update_tramp) {
+        ((playback_update_raw_fn)g_playback_controller_update_tramp)(out_frame_bits,
+                                                                     out_actual_bits);
+    } else {
+        kuKernelCpuUnrestrictedMemcpy((void *)g_hook_playback_controller_update.addr,
+                                      g_hook_playback_controller_update.orig_instr,
+                                      sizeof(g_hook_playback_controller_update.orig_instr));
+        kuKernelFlushCaches((void *)g_hook_playback_controller_update.addr,
+                            sizeof(g_hook_playback_controller_update.orig_instr));
+        playback_update_raw_fn fn = g_hook_playback_controller_update.thumb_addr
+            ? (playback_update_raw_fn)g_hook_playback_controller_update.thumb_addr
+            : (playback_update_raw_fn)g_hook_playback_controller_update.addr;
+        fn(out_frame_bits, out_actual_bits);
+        kuKernelCpuUnrestrictedMemcpy((void *)g_hook_playback_controller_update.addr,
+                                      g_hook_playback_controller_update.patch_instr,
+                                      sizeof(g_hook_playback_controller_update.patch_instr));
+        kuKernelFlushCaches((void *)g_hook_playback_controller_update.addr,
+                            sizeof(g_hook_playback_controller_update.patch_instr));
+    }
     MCSM_PHASE_ADD(g_pbc_us, g_pbc_n, t0_pbc);
-    kuKernelCpuUnrestrictedMemcpy((void *)g_hook_playback_controller_update.addr,
-                                  g_hook_playback_controller_update.patch_instr,
-                                  sizeof(g_hook_playback_controller_update.patch_instr));
-    kuKernelFlushCaches((void *)g_hook_playback_controller_update.addr,
-                        sizeof(g_hook_playback_controller_update.patch_instr));
 }
 
 __attribute__((unused))
@@ -2521,36 +2564,6 @@ static void *hook_renderframe_push_view(void *self, void *frame_scene, const voi
     return view;
 }
 
-static void *hook_renderobject_viewport_prepare_view(void *self, void *frame_scene, void *target_ctx) {
-    static uint32_t count = 0;
-
-    count++;
-
-    if (!self || !frame_scene) {
-        return NULL;
-    }
-
-    void *view = SO_CONTINUE(void *, g_hook_viewport_prepare_view, self, frame_scene, target_ctx);
-    /* The throttled block here only unpacked scene_ptr/camera_slot for a
-     * discarded diagnostic string; removed with it. */
-
-    return view;
-}
-
-static void hook_rendertexture_prepare_view(void *self, void *frame_scene, void *target_ctx,
-                                            void *render_scene_ctx, int index) {
-    static uint32_t count = 0;
-
-    count++;
-
-    if (!self || !frame_scene) {
-        return;
-    }
-
-
-    SO_CONTINUE_VOID(g_hook_rendertexture_prepare_view, self, frame_scene, target_ctx, render_scene_ctx, index);
-}
-
 /* 2026-07-02 (3rd pass, part 2): SAVETRACE proved the Lua-level save chain
  * (SaveLoadPreSave/Create/Save/SaveLoadPostSave) all ENTER+RETURN cleanly,
  * yet the whole session produced ZERO filesystem writes -- not even routine
@@ -2561,6 +2574,7 @@ static void hook_rendertexture_prepare_view(void *self, void *frame_scene, void 
  * operation (`Meta::MetaOperation_Save`). This hook logs that pointer on
  * every call to confirm/refute the theory that resources created under the
  * `<User>` logical location never get a real disk location bound. */
+#ifdef DEBUG_SOLOADER
 static so_hook g_hook_handleobjectinfo_quicksave;
 static int hook_handleobjectinfo_quicksave(void *self) {
     static uint32_t count = 0;
@@ -2652,15 +2666,7 @@ static void *hook_platform_android_get_base_user_directory(void *out_str, void *
     }
     return ret;
 }
-
-static void hook_switch_default_render_target(const void *clear) {
-    static uint32_t count = 0;
-
-    count++;
-
-
-    SO_CONTINUE_VOID(g_hook_switch_default_render_target, clear);
-}
+#endif /* DEBUG_SOLOADER */
 
 typedef int (*allocate_gl_buffer_fn)(unsigned int buffer,
                                      unsigned int target,
@@ -2731,7 +2737,9 @@ static VbCpuSlot g_vb_cpu[VB_SLOTS];
 typedef struct { unsigned int name; uint32_t size; } VbSizeSlot;
 static VbSizeSlot g_vb_size[VB_SLOTS];
 static SceUID g_vb_owner_tid = -1;
+#ifdef DEBUG_SOLOADER
 static uint32_t g_vb_foreign = 0;
+#endif
 /* Consecutive locks by a thread that is NOT the current table owner. Reset to 0 the
  * moment the owner locks again, so this only climbs while the owner is truly idle. */
 static uint32_t g_vb_steal_run = 0;
@@ -2782,7 +2790,7 @@ static VbCpuSlot *vb_cpu_slot(void *key) {
     if (freeslot) { freeslot->key = key; freeslot->cpu = NULL; freeslot->cap = 0; return freeslot; }
     /* Evict. Freeing here is safe: the slot is not the live lock (that one matched
      * above), and unlock only frees a pointer the table does not own. */
-    if (victim->cpu) { free_soloader(victim->cpu); g_vb_evict++; }
+    if (victim->cpu) { free_soloader(victim->cpu); MCSM_VB_DIAG(g_vb_evict++); }
     victim->key = key; victim->cpu = NULL; victim->cap = 0;
     return victim;
 }
@@ -2898,7 +2906,9 @@ static int vb_thread_claim(void) {
     if (g_vb_owner_tid == -1) { g_vb_owner_tid = me; return 1; }
     if (g_vb_owner_tid == me) { g_vb_steal_run = 0; return 1; }
 
+#ifdef DEBUG_SOLOADER
     g_vb_foreign++;
+#endif
     if (++g_vb_steal_run >= VB_STEAL_AFTER) {
         /* The incumbent has not locked once in VB_STEAL_AFTER consecutive locks.
          * Take the tables and LEAVE THE EXISTING ENTRIES ALONE.
@@ -2923,9 +2933,11 @@ static int vb_thread_claim(void) {
         g_vb_steal_run = 0;
         return 1;
     }
+#ifdef DEBUG_SOLOADER
     if ((g_vb_foreign & 0xFFu) == 0u)
         l_warn("VBOPT: lock from foreign tid 0x%08X (owner 0x%08X) — using the "
                "malloc path for it (#%u)", (unsigned)me, (unsigned)g_vb_owner_tid, g_vb_foreign);
+#endif
     return 0;
 }
 
@@ -2948,6 +2960,7 @@ static int upload_cpu_buffer(unsigned int buffer,
         return 0;
     }
 
+#ifdef DEBUG_SOLOADER
     static uint32_t s_upload_count = 0;
     s_upload_count++;
     g_vb_kb += (uint32_t)(size / 1024u);
@@ -2959,6 +2972,7 @@ static int upload_cpu_buffer(unsigned int buffer,
      * Device log 2026-07-31 showed exactly that next to a perfectly healthy run. */
     if (s_upload_count == 1u || (s_upload_count & 0xFFu) == 0u)
         g_vb_tid = (uint32_t)sceKernelGetThreadId();
+#endif
 
     /* ★ glBufferSubData WHEN THE SIZE HAS NOT CHANGED (2026-07-30).
      *
@@ -2995,12 +3009,16 @@ static int upload_cpu_buffer(unsigned int buffer,
     if (ss && ss->size == (uint32_t)size && size > 0) {
         glBindBuffer(target, buffer);
         glBufferSubData(target, 0, (GLsizeiptr)size, data);
-        g_vb_subdata++;
+        MCSM_VB_DIAG(g_vb_subdata++);
         return 1;
     }
 
-    g_vb_respec++;
+    MCSM_VB_DIAG(g_vb_respec++);
+#ifdef DEBUG_SOLOADER
     GLenum pre_err = patch_drain_gl_errors();
+#else
+    (void)patch_drain_gl_errors();
+#endif
     int ret = alloc(buffer, target, (unsigned int)size, data, GL_STREAM_DRAW);
     GLenum err = glGetError();
     /* ☠ RECORD THE SIZE ONLY IF THE ALLOCATION ACTUALLY HAPPENED, and that means
@@ -3015,6 +3033,7 @@ static int upload_cpu_buffer(unsigned int buffer,
      * an allocation we watched succeed. Being wrong in the conservative direction just
      * costs one extra respecify. */
     if (ss && ret && err == GL_NO_ERROR) ss->size = (uint32_t)size;
+#ifdef DEBUG_SOLOADER
     if (s_upload_count <= 32U || err != GL_NO_ERROR || pre_err != GL_NO_ERROR) {
         l_info("Patch: %s AllocateGLBuffer #%u buffer=%u target=0x%X size=%u data=%p ret=%d pre=0x%X err=0x%X",
                label,
@@ -3027,7 +3046,8 @@ static int upload_cpu_buffer(unsigned int buffer,
                (unsigned)pre_err,
                (unsigned)err);
     }
-    return 1;
+#endif
+    return ret && err == GL_NO_ERROR;
 }
 
 static int hook_vertexbuffer_platform_lock(void *self, int read_only) {
@@ -3036,7 +3056,7 @@ static int hook_vertexbuffer_platform_lock(void *self, int read_only) {
         return 0;
     }
 
-    g_vb_locks++;
+    MCSM_VB_DIAG(g_vb_locks++);
     uint32_t *u32 = (uint32_t *)self;
     uint32_t elem_count = u32[0xc0 / 4];
     uint32_t mode = u32[0xd4 / 4];
@@ -3085,9 +3105,9 @@ static int hook_vertexbuffer_platform_lock(void *self, int read_only) {
                     return 0;
                 }
                 slot->cpu = grown; slot->cap = (uint32_t)bytes;
-                g_vb_mallocs++;              /* counts only real allocations now */
+                MCSM_VB_DIAG(g_vb_mallocs++); /* counts only real allocations now */
             } else {
-                g_vb_reuse++;
+                MCSM_VB_DIAG(g_vb_reuse++);
             }
             ptr = slot->cpu;
         } else {
@@ -3096,14 +3116,16 @@ static int hook_vertexbuffer_platform_lock(void *self, int read_only) {
                 l_error("Patch: T3VertexBuffer::PlatformLock fallback malloc failed (%u bytes).", (unsigned)bytes);
                 return 0;
             }
-            g_vb_mallocs++;
+            MCSM_VB_DIAG(g_vb_mallocs++);
         }
         u32[0xd0 / 4] = (uint32_t)(uintptr_t)ptr;
         /* Throttled: this fired 7420x/run (the #1 log-spam line) — synchronous
          * file writes that pile up during the already-slow scene loads. */
+#ifdef DEBUG_SOLOADER
         static unsigned int s_vb_log = 0;
         if (s_vb_log++ < 16u)
             l_info("Patch: T3VertexBuffer::PlatformLock allocated CPU vertex buffer (%u bytes).", (unsigned)bytes);
+#endif
     }
 
     u32[0xe0 / 4] = 1;
@@ -3140,6 +3162,9 @@ static int hook_indexbuffer_platform_lock(void *self, int read_only) {
         ptr = malloc_soloader(bytes);
         u32[0x3c / 4] = (uint32_t)(uintptr_t)ptr;
         if (!ptr) {
+            /* Do not leave a phantom nested lock: the next call must retry the
+             * allocation instead of succeeding with a NULL staging pointer. */
+            u32[0x24 / 4] = 0;
             l_error("Patch: T3IndexBuffer::PlatformLock fallback malloc failed (%u bytes).", (unsigned)bytes);
             return 0;
         }
@@ -3166,14 +3191,12 @@ static int hook_vertexbuffer_platform_unlock(void *self) {
         return lock_count == 0;
     }
 
-    glBindBuffer(GL_ARRAY_BUFFER, u32[0x20 / 4]);
-
     void *ptr = (void *)(uintptr_t)u32[0xd0 / 4];
     const size_t bytes = (size_t)u32[0xc0 / 4] * (size_t)u32[0xc4 / 4];
-    if (!upload_cpu_buffer(u32[0x20 / 4], GL_ARRAY_BUFFER, bytes, ptr, "T3VertexBuffer")) {
-        glBindBuffer(GL_ARRAY_BUFFER, 0);
-        return 0;
-    }
+    /* upload_cpu_buffer binds for glBufferSubData; the engine allocator binds for
+     * glBufferData. Binding here as well duplicated the same driver call on every
+     * upload (~525/frame in the measured scene). */
+    const int ok = upload_cpu_buffer(u32[0x20 / 4], GL_ARRAY_BUFFER, bytes, ptr, "T3VertexBuffer");
 
     /* Only free when the allocation is NOT owned by the reuse table. Asked as a plain
      * table lookup rather than "am I the owner thread?": ownership can move between a
@@ -3188,7 +3211,7 @@ static int hook_vertexbuffer_platform_unlock(void *self) {
     u32[0xd0 / 4] = 0;
     u32[0xe0 / 4] = 0;
     glBindBuffer(GL_ARRAY_BUFFER, 0);
-    return 1;
+    return ok ? 1 : 0;
 }
 
 static int hook_indexbuffer_platform_unlock(void *self) {
@@ -3215,8 +3238,6 @@ static int hook_indexbuffer_platform_unlock(void *self) {
     if (lock_count > 0 || u32[0x20 / 4] == 0) {
         return 0;
     }
-
-    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, u32[0x20 / 4]);
 
     const void *ptr = (const void *)(uintptr_t)u32[0x3c / 4];
     const size_t bytes = (size_t)u32[0x2c / 4] * (size_t)u32[0x30 / 4];
@@ -3269,6 +3290,17 @@ static void patch_indexbuffer_platform_unlock(void) {
                               &hook);
 }
 
+static void enable_validated_hot_trampoline(const char *label,
+                                            so_hook *hook,
+                                            uintptr_t *trampoline) {
+    *trampoline = mcsm_build_tramp(hook);
+    if (!*trampoline) {
+        /* Correctness fallback: the handler remains installed and uses the original
+         * SO_CONTINUE path if the exact runtime binary fails relocation validation. */
+        l_warn("TRAMP: %s using guarded SO_CONTINUE fallback", label);
+    }
+}
+
 static void patch_engine_diag_hooks(void) {
     init_metrics_diag();
     init_render_gate_diag();
@@ -3276,11 +3308,17 @@ static void patch_engine_diag_hooks(void) {
     force_animation_runtime_flags("patch");
     patch_chore_full_update_path();
 
-    (void)hook_symbol_checked(&so_mod_gameengine,
-                              "_ZN7Metrics8NewFrameEf",
-                              "Metrics::NewFrame",
-                              (uintptr_t)&hook_metrics_new_frame,
-                              &g_hook_metrics_new_frame);
+    if (hook_symbol_checked(&so_mod_gameengine,
+                            "_ZN7Metrics8NewFrameEf",
+                            "Metrics::NewFrame",
+                            (uintptr_t)&hook_metrics_new_frame,
+                            &g_hook_metrics_new_frame)) {
+        g_metrics_new_frame_tramp =
+            mcsm_build_metrics_new_frame_tramp(&g_hook_metrics_new_frame);
+        if (!g_metrics_new_frame_tramp) {
+            l_warn("TRAMP: Metrics::NewFrame using guarded SO_CONTINUE fallback");
+        }
+    }
 
     g_renderframe_push_view_addr =
         so_symbol(&so_mod_gameengine, "_ZN11RenderFrame8PushViewER16RenderFrameSceneRK16RenderViewParams");
@@ -3315,71 +3353,45 @@ static void patch_engine_diag_hooks(void) {
                               (uintptr_t)&hook_renderdevice_begin_frame,
                               &g_hook_render_begin_frame);
 
-    (void)hook_symbol_checked(&so_mod_gameengine,
-                              "_ZN12RenderDevice8EndFrameEv",
-                              "RenderDevice::EndFrame",
-                              (uintptr_t)&hook_renderdevice_end_frame,
-                              &g_hook_render_end_frame);
+    if (hook_symbol_checked(&so_mod_gameengine,
+                            "_ZN18PlaybackController25UpdatePlaybackControllersEff",
+                            "PlaybackController::UpdatePlaybackControllers",
+                            (uintptr_t)&hook_playback_controller_update,
+                            &g_hook_playback_controller_update)) {
+        enable_validated_hot_trampoline("PlaybackController::UpdatePlaybackControllers",
+                                        &g_hook_playback_controller_update,
+                                        &g_playback_controller_update_tramp);
+    }
 
-    (void)hook_symbol_checked(&so_mod_gameengine,
-                              "_ZN12RenderDevice7PresentEv",
-                              "RenderDevice::Present",
-                              (uintptr_t)&hook_renderdevice_present,
-                              &g_hook_render_present);
+    if (hook_symbol_checked(&so_mod_gameengine,
+                            "_ZN10GameRender11RenderFrameEv",
+                            "GameRender::RenderFrame",
+                            (uintptr_t)&hook_gamerender_render_frame,
+                            &g_hook_gamerender_render_frame)) {
+        enable_validated_hot_trampoline("GameRender::RenderFrame",
+                                        &g_hook_gamerender_render_frame,
+                                        &g_gamerender_render_frame_tramp);
+    }
 
-    (void)hook_symbol_checked(&so_mod_gameengine,
-                              "_ZN15Application_SDL4SwapEv",
-                              "Application_SDL::Swap",
-                              (uintptr_t)&hook_application_sdl_swap,
-                              &g_hook_app_swap);
+    if (hook_symbol_checked(&so_mod_gameengine,
+                            "_ZN10GameRender11RenderSceneER18RenderSceneContextRK16RenderParameters",
+                            "GameRender::RenderScene",
+                            (uintptr_t)&hook_gamerender_render_scene,
+                            &g_hook_gamerender_render_scene)) {
+        enable_validated_hot_trampoline("GameRender::RenderScene",
+                                        &g_hook_gamerender_render_scene,
+                                        &g_gamerender_render_scene_tramp);
+    }
 
-    (void)hook_symbol_checked(&so_mod_gameengine,
-                              "_ZN10GameEngine18SetSuspendGameLoopEb",
-                              "GameEngine::SetSuspendGameLoop",
-                              (uintptr_t)&hook_suspend_game_loop,
-                              &g_hook_suspend_game_loop);
-
-    (void)hook_symbol_checked(&so_mod_gameengine,
-                              "_ZN18PlaybackController25UpdatePlaybackControllersEff",
-                              "PlaybackController::UpdatePlaybackControllers",
-                              (uintptr_t)&hook_playback_controller_update,
-                              &g_hook_playback_controller_update);
-
-    (void)hook_symbol_checked(&so_mod_gameengine,
-                              "_ZN10GameRender11RenderFrameEv",
-                              "GameRender::RenderFrame",
-                              (uintptr_t)&hook_gamerender_render_frame,
-                              &g_hook_gamerender_render_frame);
-
-    (void)hook_symbol_checked(&so_mod_gameengine,
-                              "_ZN10GameRender11RenderSceneER18RenderSceneContextRK16RenderParameters",
-                              "GameRender::RenderScene",
-                              (uintptr_t)&hook_gamerender_render_scene,
-                              &g_hook_gamerender_render_scene);
-
-    (void)hook_symbol_checked(&so_mod_gameengine,
-                              "_ZN12RenderThread18SubmitCurrentFrameEv",
-                              "RenderThread::SubmitCurrentFrame",
-                              (uintptr_t)&hook_renderthread_submit_current_frame,
-                              &g_hook_renderthread_submit_current_frame);
-
-    (void)hook_symbol_checked(&so_mod_gameengine,
-                              "_ZN12RenderThread8EndFrameEv",
-                              "RenderThread::EndFrame",
-                              (uintptr_t)&hook_renderthread_end_frame,
-                              &g_hook_renderthread_end_frame);
-
-    (void)hook_symbol_checked(&so_mod_gameengine,
-                              "_ZN12RenderThread11FinishFrameEv",
-                              "RenderThread::FinishFrame",
-                              (uintptr_t)&hook_renderthread_finish_frame,
-                              &g_hook_renderthread_finish_frame);
-
-    (void)hook_symbol_checked(&so_mod_gameengine,
-                              "_ZN11RenderFrame7ExecuteEPS_",
-                              "RenderFrame::Execute",
-                              (uintptr_t)&hook_renderframe_execute,
-                              &g_hook_renderframe_execute);
+    if (hook_symbol_checked(&so_mod_gameengine,
+                            "_ZN11RenderFrame7ExecuteEPS_",
+                            "RenderFrame::Execute",
+                            (uintptr_t)&hook_renderframe_execute,
+                            &g_hook_renderframe_execute)) {
+        enable_validated_hot_trampoline("RenderFrame::Execute",
+                                        &g_hook_renderframe_execute,
+                                        &g_renderframe_execute_tramp);
+    }
 
 #if ENABLE_HOT_RENDER_VIEW_DIAG_HOOKS
     (void)hook_symbol_checked(&so_mod_gameengine,
@@ -3397,18 +3409,7 @@ static void patch_engine_diag_hooks(void) {
     l_info("Patch: skipped hot RenderFrame view diagnostics; latest core pointed at this render path.");
 #endif
 
-    (void)hook_symbol_checked(&so_mod_gameengine,
-                              "_ZN21RenderObject_Viewport11PrepareViewER16RenderFrameSceneR21T3RenderTargetContext",
-                              "RenderObject_Viewport::PrepareView",
-                              (uintptr_t)&hook_renderobject_viewport_prepare_view,
-                              &g_hook_viewport_prepare_view);
-
-    (void)hook_symbol_checked(&so_mod_gameengine,
-                              "_ZN13RenderTexture11PrepareViewER16RenderFrameSceneR21T3RenderTargetContextP18RenderSceneContexti",
-                              "RenderTexture::PrepareView",
-                              (uintptr_t)&hook_rendertexture_prepare_view,
-                              &g_hook_rendertexture_prepare_view);
-
+#ifdef DEBUG_SOLOADER
     (void)hook_symbol_checked(&so_mod_gameengine,
                               "_ZN16HandleObjectInfo9QuickSaveEv",
                               "HandleObjectInfo::QuickSave",
@@ -3419,12 +3420,7 @@ static void patch_engine_diag_hooks(void) {
                               "Platform_Android::GetBaseUserDirectory",
                               (uintptr_t)&hook_platform_android_get_base_user_directory,
                               &g_hook_platform_android_get_base_user_directory);
-
-    (void)hook_symbol_checked(&so_mod_gameengine,
-                              "_ZN12RenderDevice25SwitchDefaultRenderTargetERK13T3RenderClear",
-                              "RenderDevice::SwitchDefaultRenderTarget",
-                              (uintptr_t)&hook_switch_default_render_target,
-                              &g_hook_switch_default_render_target);
+#endif
 
     /* RenderOverlay::UpdateRenderThread has float/bool/float tail args.
      * The engine .so was compiled with softfp (Android NDK armeabi-v7a
@@ -3443,10 +3439,19 @@ static void patch_engine_diag_hooks(void) {
  * on Android). On Vita that's a JNI stub = nothing appears. Intercept it and raise
  * the Vita IME so ANY text field (save rename, etc.) gets a keyboard. */
 static so_hook g_hook_sdl_show_text_input;
+/* ☠ LOG-ONLY. This used to raise the IME itself, which is now a hazard rather than a
+ * fallback: the engine's REAL text entry is the JNI generic-text-dialog contract
+ * (openGenericTextDialog / ...Finished / ...Cancelled / ...Value, see java.c), and
+ * only ONE common dialog can exist at a time. An IME raised from here is one nothing
+ * is polling -- its result has nowhere to go, and worse, it makes the genuine
+ * openGenericTextDialog fail because a dialog is already up.
+ * Neither this nor luaPlatformShowKeyboard has ever been observed firing on device
+ * (both were traced empty across several sessions), so the log line is kept purely to
+ * catch it if one ever does -- at which point wire it to mcsm_ime_begin_vkbd() with a
+ * matching result path, not to a bare IME. */
 static void hook_sdl_show_text_input(void *inputRect) {
-    extern void mcsm_ime_begin(const char *initial);
-    l_info("KEYBOARD: Android_JNI_ShowTextInput -> Vita IME");
-    mcsm_ime_begin("");
+    l_info("KEYBOARD: Android_JNI_ShowTextInput fired (not raising an IME — the JNI "
+           "text-dialog path owns text entry)");
     (void)inputRect;
 }
 
@@ -3481,6 +3486,7 @@ static void patch_sdl_android_runtime_hooks(void) {
                               &g_hook_sdl_show_text_input);
 }
 
+#ifdef DEBUG_SOLOADER
 static void patch_input_diag_hooks(void) {
     (void)hook_symbol_checked(&so_mod_gameengine,
                               "_ZN15Application_SDL11OnFingeringEN11InputMapper9EventTypeERK20SDL_TouchFingerEvent",
@@ -3518,7 +3524,9 @@ static void patch_input_diag_hooks(void) {
                               (uintptr_t)&hook_touchscreenstate_set_legacy_pointer,
                               &g_hook_touch_set_legacy_pointer);
 }
+#endif
 
+#ifdef DEBUG_SOLOADER
 // ---- Boot / resource / job-system diagnostic hooks ----
 // These trace the post-init boot path (Lua, resource descriptions, async job
 // scheduler) to localize where the boot->menu transition stalls on Vita.
@@ -3574,6 +3582,7 @@ BOOT_LUA_TRACER(hook_lua_preloadasync, "luaPreloadAsync", g_hook_lua_preloadasyn
 BOOT_LUA_TRACER(hook_lua_rset_create, "luaResourceSetCreate", g_hook_lua_rset_create)
 BOOT_LUA_TRACER(hook_lua_rset_enable, "luaResourceSetEnable", g_hook_lua_rset_enable)
 BOOT_LUA_TRACER(hook_lua_rset_loadingcall, "luaResourceSetLoadingCall", g_hook_lua_rset_loadingcall)
+#endif /* DEBUG_SOLOADER */
 
 // Forward declaration: LOGIN_BYPASS macros below use lua_push_forced_bool
 // which is defined later (after the ChorePlay/scene tracers that need
@@ -3590,17 +3599,23 @@ static int lua_push_forced_integer(void *L, int value, const char *label);
 // does NOT need a password or a remote credential — it can proceed with a
 // local-offline user.  Bypass the originals entirely: return 0 Lua values
 // immediately.  All are low-frequency main-thread Lua calls.
+#ifdef DEBUG_SOLOADER
+#define LOGIN_BYPASS_DIAG(label) do {                                   \
+        static uint32_t count = 0;                                      \
+        count++;                                                        \
+        launch_state_mark_progress();                                   \
+        if (count <= 8U || (count & 0x3FU) == 0U) {                    \
+            l_info("Login bypass: %s -> true (offline) count=%u",      \
+                   label, count);                                       \
+        }                                                               \
+    } while (0)
+#else
+#define LOGIN_BYPASS_DIAG(label) do { (void)(label); } while (0)
+#endif
 #define LOGIN_BYPASS(fn_name, label, hook_var)                          \
     static so_hook hook_var;                                            \
     static int fn_name(void *L) {                                       \
-        (void)L;                                                        \
-        static uint32_t count = 0;                                      \
-        count++;                                                         \
-        launch_state_mark_progress();                                   \
-        if (count <= 8U || (count & 0x3FU) == 0U) {                     \
-            l_info("Login bypass: %s -> 0 values (offline) count=%u",   \
-                   label, count);                                       \
-        }                                                               \
+        LOGIN_BYPASS_DIAG(label);                                       \
         return lua_push_forced_bool(L, 1, label) >= 0 ? 1 : 0;         \
     }
 
@@ -3615,9 +3630,11 @@ LOGIN_BYPASS(hook_lua_get_password_box_results, "luaGetPasswordBoxResults", g_ho
  * the dead auth server. */
 static so_hook g_hook_lua_network_get_credential;
 static int hook_lua_network_get_credential(void *L) {
+#ifdef DEBUG_SOLOADER
     static uint32_t count = 0;
     launch_state_mark_progress();
     if (++count <= 8U) l_info("FIX: luaNetworkAPIGetCredential -> stored credential (signed-in) count=%u", count);
+#endif
     int ret = lua_push_forced_string(L, "mcsm_local_ttg_cred", "NetworkAPIGetCredential");
     return ret >= 0 ? ret : SO_CONTINUE(int, g_hook_lua_network_get_credential, L);
 }
@@ -3708,17 +3725,17 @@ static const char *trace_arg_str(void *L, int idx) {
 
 static so_hook g_hook_lua_choreplay;
 static int hook_lua_choreplay(void *L) {
-    static uint32_t count = 0;
-    count++;
+#ifdef DEBUG_SOLOADER
+    MCSM_DIAG_COUNTER(count);
     launch_state_mark_progress();
+#endif
+    const char *nm = trace_arg_str(L, 1);
+#ifdef DEBUG_SOLOADER
     if (count <= 24U || (count & 0x3FU) == 0U) {
-        const char *nm = trace_arg_str(L, 1);
         l_info("Diag: luaChorePlay #%u chore='%s'", count, nm ? nm : "(non-string)");
-        mark_character_select_license_window("chore", nm);
-    } else {
-        const char *nm = trace_arg_str(L, 1);
-        mark_character_select_license_window("chore", nm);
     }
+#endif
+    mark_character_select_license_window("chore", nm);
     return SO_CONTINUE(int, g_hook_lua_choreplay, L);
 }
 
@@ -3842,11 +3859,13 @@ static int redirect_logical_user_to_temp(void *L, int idx) {
     }
     char newpath[256];
     sceClibSnprintf(newpath, sizeof(newpath), "logical:<Temp>/%s", suffix);
+#ifdef DEBUG_SOLOADER
     static uint32_t redirect_count = 0;
     redirect_count++;
     if (redirect_count <= 48U) {
         l_info("SAVEFIX2: redirecting '%s' -> '%s' (#%u)", s, newpath, redirect_count);
     }
+#endif
     s_pushstring(L, newpath);
     s_replace(L, idx);
     return 1;
@@ -3861,6 +3880,7 @@ static int redirect_logical_user_to_temp(void *L, int idx) {
  * (SaveLoadPreSave -> SaveBundle_Create/Save -> SaveGameToBundle -> Save ->
  * SaveLoadPostSave, all in SaveBundles.lua/SaveLoad.lua) stops. All of these
  * are low-frequency main-thread Lua C calls -- safe to SO_CONTINUE trace. */
+#ifdef DEBUG_SOLOADER
 #define SAVE_TRACE_HOOK(fn_name, label, hook_var)                       \
     static so_hook hook_var;                                           \
     static int fn_name(void *L) {                                      \
@@ -3876,14 +3896,18 @@ SAVE_TRACE_HOOK(hook_lua_saveload_presave, "SaveLoadPreSave", g_hook_lua_saveloa
 SAVE_TRACE_HOOK(hook_lua_saveload_postsave, "SaveLoadPostSave", g_hook_lua_saveload_postsave)
 SAVE_TRACE_HOOK(hook_lua_save_game_to_bundle, "SaveGameToBundle", g_hook_lua_save_game_to_bundle)
 SAVE_TRACE_HOOK(hook_lua_set_save_finished_cb, "SetSaveFinishedCallback", g_hook_lua_set_save_finished_cb)
+#endif /* DEBUG_SOLOADER */
 
 /* Save()/Create() are also called constantly for non-save resources (props,
  * configs) at boot -- trace only the ones whose arg string looks save-shaped
  * so this doesn't flood the log. */
 static so_hook g_hook_lua_save;
 static int hook_lua_save(void *L) {
+#ifdef DEBUG_SOLOADER
     static uint32_t count = 0;
+#endif
     redirect_logical_user_to_temp(L, 1);
+#ifdef DEBUG_SOLOADER
     const char *nm = trace_arg_str(L, 1);
     int is_save_shaped = nm && (strstr(nm, "bundle") || strstr(nm, "saveSlot") ||
                                  strstr(nm, "saveslot") || strstr(nm, "_saveslot") ||
@@ -3892,17 +3916,23 @@ static int hook_lua_save(void *L) {
         count++;
         l_info("SAVETRACE: Save('%s') ENTER #%u", nm ? nm : "?", count);
     }
+#endif
     int ret = SO_CONTINUE(int, g_hook_lua_save, L);
+#ifdef DEBUG_SOLOADER
     if (is_save_shaped) {
         l_info("SAVETRACE: Save('%s') RETURN #%u", nm ? nm : "?", count);
     }
+#endif
     return ret;
 }
 
 static so_hook g_hook_lua_create;
 static int hook_lua_create(void *L) {
+#ifdef DEBUG_SOLOADER
     static uint32_t count = 0;
+#endif
     redirect_logical_user_to_temp(L, 1);
+#ifdef DEBUG_SOLOADER
     const char *nm = trace_arg_str(L, 1);
     int is_save_shaped = nm && (strstr(nm, "bundle") || strstr(nm, "saveSlot") ||
                                  strstr(nm, "saveslot") || strstr(nm, "_saveslot") ||
@@ -3911,10 +3941,13 @@ static int hook_lua_create(void *L) {
         count++;
         l_info("SAVETRACE: Create('%s') ENTER #%u", nm ? nm : "?", count);
     }
+#endif
     int ret = SO_CONTINUE(int, g_hook_lua_create, L);
+#ifdef DEBUG_SOLOADER
     if (is_save_shaped) {
         l_info("SAVETRACE: Create('%s') RETURN #%u", nm ? nm : "?", count);
     }
+#endif
     return ret;
 }
 
@@ -3979,11 +4012,13 @@ REDIRECT_ARG1_HOOK(hook_lua_resource_delete, g_hook_lua_resource_delete)
  * empty on a fresh launch. */
 static so_hook g_hook_lua_query_event_log;
 static int hook_lua_query_event_log(void *L) {
+#ifdef DEBUG_SOLOADER
     static uint32_t count = 0;
     const char *a1 = trace_arg_str(L, 1);
     if (++count <= 24U) {
         l_info("EVENTLOG: QueryEventLog #%u arg1='%s'", count, a1 ? a1 : "(?)");
     }
+#endif
     redirect_logical_user_to_temp(L, 1);
     return SO_CONTINUE(int, g_hook_lua_query_event_log, L);
 }
@@ -4024,6 +4059,7 @@ REDIRECT_ARG1_HOOK(hook_lua_property_clearkeys,  g_hook_lua_property_clearkeys)
  * silent today. Log the whole lifecycle so one test session identifies which. */
 static so_hook g_hook_lua_delete_all_events_after;
 static int hook_lua_delete_all_events_after(void *L) {
+#ifdef DEBUG_SOLOADER
     static uint32_t count = 0;
     const char *a1 = trace_arg_str(L, 1);
     const char *a2 = trace_arg_str(L, 2);
@@ -4031,12 +4067,14 @@ static int hook_lua_delete_all_events_after(void *L) {
         l_info("EVENTLOG: DeleteAllEventsAfterEvent #%u log='%s' afterEvent='%s'",
                count, a1 ? a1 : "(?)", a2 ? a2 : "(?)");
     }
+#endif
     redirect_logical_user_to_temp(L, 1);
     return SO_CONTINUE(int, g_hook_lua_delete_all_events_after, L);
 }
 
 static so_hook g_hook_lua_event_log_create;
 static int hook_lua_event_log_create(void *L) {
+#ifdef DEBUG_SOLOADER
     static uint32_t count = 0;
     const char *name = trace_arg_str(L, 1);
     const char *res  = trace_arg_str(L, 3);
@@ -4044,11 +4082,14 @@ static int hook_lua_event_log_create(void *L) {
         l_info("EVENTLOG: EventLogCreate #%u name='%s' resource='%s'",
                count, name ? name : "(?)", res ? res : "(?)");
     }
+#endif
     redirect_logical_user_to_temp(L, 3); /* the backing-resource path arg */
     int ret = SO_CONTINUE(int, g_hook_lua_event_log_create, L);
+#ifdef DEBUG_SOLOADER
     if (count <= 24U) {
         l_info("EVENTLOG: EventLogCreate #%u RETURN ret=%d", count, ret);
     }
+#endif
     return ret;
 }
 
@@ -4066,9 +4107,11 @@ static int hook_lua_event_log_create(void *L) {
  * arg won't match the logical:<User>/ prefix, so redirecting both is safe.) */
 static so_hook g_hook_lua_save_downloaded_doc_as_propset;
 static int hook_lua_save_downloaded_doc_as_propset(void *L) {
+#ifdef DEBUG_SOLOADER
     const char *a1 = trace_arg_str(L, 1);
     const char *a2 = trace_arg_str(L, 2);
     l_info("CHOICEIO: SaveDownloadedDoc arg1='%s' arg2='%s'", a1 ? a1 : "?", a2 ? a2 : "?");
+#endif
     redirect_logical_user_to_temp(L, 1);
     /* The output path. Two callers, two spellings -- StatChoicesHandler.lua passes
      * "logical:<User>/choice.prop" and menu_stats.lua passes
@@ -4084,12 +4127,15 @@ static int hook_lua_save_downloaded_doc_as_propset(void *L) {
  * placed choice.prop is served) to see EXACTLY where the offline read stops. */
 static so_hook g_hook_lua_download_doc_retrieve;
 static int hook_lua_download_doc_retrieve(void *L) {
+#ifdef DEBUG_SOLOADER
     const char *a1 = trace_arg_str(L, 1);
     l_info("CHOICEIO: DownloadDocumentRetrieve arg1='%s'", a1 ? a1 : "?");
+#endif
     redirect_logical_user_to_temp(L, 1);
     redirect_logical_user_to_temp(L, 2);
     return SO_CONTINUE(int, g_hook_lua_download_doc_retrieve, L);
 }
+#ifdef DEBUG_SOLOADER
 static so_hook g_hook_lua_download_docs_from_server;
 static int hook_lua_download_docs_from_server(void *L) {
     const char *a1 = trace_arg_str(L, 1);
@@ -4113,11 +4159,15 @@ static int hook_lua_save_prefs(void *L) {
     l_info("SAVETRACE: SavePrefs RETURN #%u", count);
     return ret;
 }
+#endif /* DEBUG_SOLOADER */
 
 static so_hook g_hook_lua_resource_exists_redirect;
 static int hook_lua_resource_exists_redirect(void *L) {
+#ifdef DEBUG_SOLOADER
     static uint32_t count = 0;
+#endif
     redirect_logical_user_to_temp(L, 1);
+#ifdef DEBUG_SOLOADER
     const char *nm = trace_arg_str(L, 1);
     int is_save_shaped = nm && (strstr(nm, "bundle") || strstr(nm, "saveSlot") ||
                                  strstr(nm, "saveslot") || strstr(nm, "_saveslot") ||
@@ -4126,13 +4176,17 @@ static int hook_lua_resource_exists_redirect(void *L) {
         count++;
         l_info("SAVETRACE: ResourceExists('%s') ENTER #%u", nm ? nm : "?", count);
     }
+#endif
     int ret = SO_CONTINUE(int, g_hook_lua_resource_exists_redirect, L);
+#ifdef DEBUG_SOLOADER
     if (is_save_shaped) {
         l_info("SAVETRACE: ResourceExists('%s') RETURN #%u", nm ? nm : "?", count);
     }
+#endif
     return ret;
 }
 
+#ifdef DEBUG_SOLOADER
 static so_hook g_hook_lua_sceneopen;
 static int hook_lua_sceneopen(void *L) {
     static uint32_t count = 0;
@@ -4149,6 +4203,7 @@ static int hook_lua_sceneopen(void *L) {
      * rather than left as a lie in the source. */
     return SO_CONTINUE(int, g_hook_lua_sceneopen, L);
 }
+#endif /* DEBUG_SOLOADER */
 
 /* DIAGNOSTIC (2026-06-21): the menu reached its scripts but parks in
  * Menu_Main's startup BEFORE opening its scene, while Load()-ing the menu
@@ -4167,6 +4222,7 @@ static int hook_lua_load(void *L) {
     redirect_logical_user_to_temp(L, 1);
     return SO_CONTINUE(int, g_hook_lua_load, L);
 }
+#ifdef DEBUG_SOLOADER
 static so_hook g_hook_lua_resource_is_loaded;
 static int hook_lua_resource_is_loaded(void *L) {
     static uint32_t count = 0;
@@ -4177,6 +4233,7 @@ static int hook_lua_resource_is_loaded(void *L) {
     }
     return SO_CONTINUE(int, g_hook_lua_resource_is_loaded, L);
 }
+#endif /* DEBUG_SOLOADER */
 
 /* STREAMING FIX (2026-06-21): On Android ScenePreload returns immediately
  * after queuing async work; the main game loop pumps AdvancePreloadBatch
@@ -4192,7 +4249,9 @@ static int hook_lua_resource_is_loaded(void *L) {
  * resident in VRAM, exactly as the Android build does. */
 static void    *g_preload_lua_state = NULL;
 static volatile int g_preload_pending   = 0;
+#ifdef DEBUG_SOLOADER
 static volatile int g_preload_log_once  = 0;
+#endif
 /* Direct function pointer to luaResourceAdvancePreloadBatch so we can
  * pump it from the C++ game loop without round-tripping through Lua. */
 typedef int (*AdvancePreloadBatchFn)(void *L);
@@ -4203,10 +4262,12 @@ static int stream_resolve_preload_api(void) {
         uintptr_t addr = so_symbol(&so_mod_gameengine,
                           "_Z30luaResourceAdvancePreloadBatchP9lua_State");
         if (!addr) {
+#ifdef DEBUG_SOLOADER
             if (!g_preload_log_once) {
                 l_warn("STREAM: cannot resolve AdvancePreloadBatch symbol");
                 g_preload_log_once = 1;
             }
+#endif
             return 0;
         }
         g_advance_preload_fn = (AdvancePreloadBatchFn)addr;
@@ -4222,14 +4283,20 @@ static void stream_pump_preload(void) {
         return;
     }
 
+#ifdef DEBUG_SOLOADER
     int pumped = 0;
+#endif
     const uint64_t pump_t0 = sceKernelGetSystemTimeWide();
     for (int i = 0; i < 2 && g_preload_pending; ++i) {
         int ret = g_advance_preload_fn(g_preload_lua_state);
+#ifdef DEBUG_SOLOADER
         pumped++;
+#endif
         if (ret <= 0) {
             g_preload_pending = 0;
+#ifdef DEBUG_SOLOADER
             l_info("STREAM: preload pump complete after %d calls", pumped);
+#endif
             break;
         }
         const uint64_t elapsed_us = sceKernelGetSystemTimeWide() - pump_t0;
@@ -4237,6 +4304,7 @@ static void stream_pump_preload(void) {
             break;
         }
     }
+#ifdef DEBUG_SOLOADER
     if (pumped && g_preload_pending && !g_preload_log_once) {
         g_preload_log_once = 1;
         l_info("STREAM: preload pump still pending after %d calls", pumped);
@@ -4245,13 +4313,16 @@ static void stream_pump_preload(void) {
     if (pump_ms > 25U) {
         l_info("STREAM: preload pump budget overrun calls=%d work=%ums", pumped, pump_ms);
     }
+#endif
 }
 
 static so_hook g_hook_lua_scene_preload;
 static int hook_lua_scene_preload(void *L) {
+#ifdef DEBUG_SOLOADER
     static uint32_t count = 0;
     count++;
     const char *nm = trace_arg_str(L, 1);
+#endif
     /* 2026-06-21 (revised): SKIPPING ScenePreload makes the PRESENT hang — across
      * runs the render thread's eglSwapBuffers wedges only when ScenePreload is
      * skipped (logs 185908, 233044), whereas with the real ScenePreload running
@@ -4260,19 +4331,26 @@ static int hook_lua_scene_preload(void *L) {
      * uploads OOM'd and never finished — which the GL-layer LRU eviction cap
      * (glutil.c) now prevents. So run the REAL ScenePreload (keeps present alive)
      * and let the cap bound its uploads so FinishFrame completes and it returns. */
-    l_info("STREAM: luaScenePreload #%u scene='%s' (real preload; LRU cap bounds uploads)",
+#ifdef DEBUG_SOLOADER
+    l_info("STREAM: luaScenePreload #%u scene='%s' (real preload)",
            count, nm ? nm : "(?)");
+#endif
     g_preload_lua_state = L;
     g_preload_pending   = 1;
+#ifdef DEBUG_SOLOADER
     g_preload_log_once  = 0;
+#endif
     int ret = SO_CONTINUE(int, g_hook_lua_scene_preload, L);
+#ifdef DEBUG_SOLOADER
     l_info("STREAM: luaScenePreload #%u returned %d", count, ret);
+#endif
     if (ret == 0) {
         g_preload_pending = 0;
     }
     return ret;
 }
 
+#ifdef DEBUG_SOLOADER
 static so_hook g_hook_lua_advance_preload;
 static int hook_lua_advance_preload(void *L) {
     static uint32_t count = 0;
@@ -4291,6 +4369,7 @@ static int hook_lua_wait_for_callbacks(void *L) {
     }
     return SO_CONTINUE(int, g_hook_lua_wait_for_callbacks, L);
 }
+#endif /* DEBUG_SOLOADER */
 
 /* (Reverted 2026-06-21) The ui_boot_* ChorePlayAndWait boot-skip was net-
  * negative: those chores ALSO present the studio logos / legal / status text,
@@ -4363,6 +4442,7 @@ static int hook_forced_lua_bool(void *L,
                                 int value,
                                 const char *label,
                                 uint32_t *count) {
+#ifdef DEBUG_SOLOADER
     (*count)++;
     launch_state_mark_progress();
     if (*count <= 12U || ((*count) & 0x7fU) == 0U) {
@@ -4372,6 +4452,9 @@ static int hook_forced_lua_bool(void *L,
                *count,
                L);
     }
+#else
+    (void)count;
+#endif
     return lua_push_forced_bool(L, value, label);
 }
 
@@ -4524,7 +4607,9 @@ static int mcsm_episode_chapter(void *L) {
     return 0;
 }
 static int mcsm_episode_available(void *L) {
+#ifdef DEBUG_SOLOADER
     static signed char s_logged[9];                    /* log each decision once (diag) */
+#endif
     int ch = mcsm_episode_chapter(L);
     if (ch == 1) return 1;                              /* CH1 = base game, always available */
     if (!s_ch_txt_loaded) mcsm_load_chapters_txt();
@@ -4546,15 +4631,21 @@ static int mcsm_episode_available(void *L) {
             }
             vis = s_present[ch]; src = "data-present";
         }
+#ifdef DEBUG_SOLOADER
         if (!s_logged[ch]) { s_logged[ch] = 1;
             l_info("EPVIS: ch=%d -> %s (%s)", ch, vis ? "SHOW" : "hide", src); }
+#else
+        (void)src;
+#endif
         return vis;
     }
     /* ch <= 0: an episode we cannot map to chapter 1..8. This previously returned
      * 1 (show), which presented chapters with no data behind them. Default to HIDE
      * so nothing unrecognized leaks into Episode Select. CH1 is recognized above,
      * so the base game is never affected. */
+#ifdef DEBUG_SOLOADER
     if (!s_logged[0]) { s_logged[0] = 1; l_info("EPVIS: unidentified episode -> hide"); }
+#endif
     return 0;
 }
 
@@ -4631,7 +4722,10 @@ static so_hook g_hook_lua_get_user_system_language;
 static int hook_lua_get_user_system_language(void *L) {
     int orig = SO_CONTINUE(int, g_hook_lua_get_user_system_language, L);
     char forced[32]; mcsm_forced_language_name(forced, sizeof(forced));
+#ifdef DEBUG_SOLOADER
     static int logged = 0;
+#endif
+#ifdef DEBUG_SOLOADER
     if (!logged) {
         logged = 1;
         if (!g_lua_tolstring_fast) {
@@ -4641,6 +4735,7 @@ static int hook_lua_get_user_system_language(void *L) {
         l_info("LANG: GetUserSystemLanguage native=\"%s\" forced=\"%s\"",
                nat ? nat : "(null)", forced[0] ? forced : "(none)");
     }
+#endif
     if (forced[0]) {
         int r = lua_push_forced_string(L, forced, "GetUserSystemLanguage");
         if (r >= 0) return r;
@@ -4655,8 +4750,7 @@ static int hook_lua_get_demo_mode(void *L) {
 }
 
 static int hook_lua_get_demo_timeout(void *L) {
-    static uint32_t count = 0;
-    count++;
+    MCSM_DIAG_COUNTER(count);
     if (count <= 12U || (count & 0x7fU) == 0U) {
         l_info("FULLGAME: GetDemoTimeout -> 0 count=%u L=%p", count, L);
     }
@@ -4679,9 +4773,9 @@ static int hook_lua_get_demo_timeout(void *L) {
  * does anything if graphics.txt asks for it. */
 static so_hook g_hook_lua_platform_get_gpu_quality;
 static int hook_lua_platform_get_gpu_quality(void *L) {
-    static uint32_t count = 0;
+    MCSM_DIAG_COUNTER(count);
     const int tier = mcsm_cfg()->gpu_tier;
-    if (++count <= 8U) {
+    if (count <= 8U) {
         l_info("GPUTIER: PlatformGetGPUQuality -> %s (cfg gpu_tier=%d)",
                tier >= 0 ? "forced" : "engine default", tier);
     }
@@ -4693,8 +4787,7 @@ static int hook_lua_platform_get_gpu_quality(void *L) {
 }
 
 static int hook_lua_platform_get_trial_timeout(void *L) {
-    static uint32_t count = 0;
-    count++;
+    MCSM_DIAG_COUNTER(count);
     if (count <= 12U || (count & 0x7fU) == 0U) {
         l_info("FULLGAME: PlatformGetTrialTimeout -> 0 count=%u L=%p", count, L);
     }
@@ -4733,8 +4826,7 @@ static int hook_lua_save_load_has_available_space(void *L) {
 }
 
 static int hook_lua_platform_get_free_disk_space(void *L) {
-    static uint32_t count = 0;
-    count++;
+    MCSM_DIAG_COUNTER(count);
     if (count <= 12U || (count & 0x7fU) == 0U) {
         l_info("SAVEFIX: PlatformGetFreeDiskSpace -> 536870912 count=%u L=%p", count, L);
     }
@@ -4761,8 +4853,7 @@ static int hook_lua_file_is_last_error_corrupt_save_file(void *L) {
 }
 
 static int hook_gameengine_get_trial_version(void) {
-    static uint32_t count = 0;
-    count++;
+    MCSM_DIAG_COUNTER(count);
     if (count <= 12U || (count & 0x7fU) == 0U) {
         l_info("FULLGAME: GameEngine::GetTrialVersion -> false (#%u)", count);
     }
@@ -4770,8 +4861,7 @@ static int hook_gameengine_get_trial_version(void) {
 }
 
 static int hook_gameengine_get_trial_version_secure(void) {
-    static uint32_t count = 0;
-    count++;
+    MCSM_DIAG_COUNTER(count);
     if (count <= 12U || (count & 0x7fU) == 0U) {
         l_info("FULLGAME: GameEngine::GetTrialVersionSecure -> false (#%u)", count);
     }
@@ -4779,9 +4869,8 @@ static int hook_gameengine_get_trial_version_secure(void) {
 }
 
 static int hook_ttplatform_is_trial_version(void *self) {
-    static uint32_t count = 0;
+    MCSM_DIAG_COUNTER(count);
     (void)self;
-    count++;
     if (count <= 12U || (count & 0x7fU) == 0U) {
         l_info("FULLGAME: TTPlatform::IsTrialVersion -> false (#%u)", count);
     }
@@ -4789,9 +4878,8 @@ static int hook_ttplatform_is_trial_version(void *self) {
 }
 
 static int hook_ttplatform_is_user_space_available(void *self) {
-    static uint32_t count = 0;
+    MCSM_DIAG_COUNTER(count);
     (void)self;
-    count++;
     if (count <= 12U || (count & 0x7fU) == 0U) {
         l_info("SAVEFIX: TTPlatform::IsUserSpaceAvailable -> true (#%u)", count);
     }
@@ -4799,9 +4887,8 @@ static int hook_ttplatform_is_user_space_available(void *self) {
 }
 
 static int hook_platform_android_is_user_space_available(void *self) {
-    static uint32_t count = 0;
+    MCSM_DIAG_COUNTER(count);
     (void)self;
-    count++;
     if (count <= 12U || (count & 0x7fU) == 0U) {
         l_info("SAVEFIX: Platform_Android::IsUserSpaceAvailable -> true (#%u)", count);
     }
@@ -4853,6 +4940,7 @@ static const char *lua_arg_string_checked(void *L, int idx) {
     return g_lua_tolstring_fast(L, idx, NULL);
 }
 
+#ifdef DEBUG_SOLOADER
 static so_hook g_hook_lua_set_subproject;
 static int hook_lua_set_subproject(void *L) {
     static uint32_t count = 0;
@@ -4866,6 +4954,7 @@ static int hook_lua_set_subproject(void *L) {
     l_info("TRACE: SubProject_Switch -> '%s' (#%u)", name ? name : "(non-string)", count);
     return SO_CONTINUE(int, g_hook_lua_set_subproject, L);
 }
+#endif /* DEBUG_SOLOADER */
 
 /* 2026-07-02 (2nd pass): luaSetSubProject (native SubProject_Switch) is a
  * DEAD END for this window-clear -- decompiled SubProject.lua shows
@@ -4877,6 +4966,7 @@ static int hook_lua_set_subproject(void *L) {
  * cache again. Hook the REAL funnel instead. */
 static so_hook g_hook_lua_reset_game;
 static int hook_lua_reset_game(void *L) {
+#ifdef DEBUG_SOLOADER
     static uint32_t count = 0;
     count++;
     resolve_lua_str_api();
@@ -4886,6 +4976,7 @@ static int hook_lua_reset_game(void *L) {
         name = g_lua_tolstring_fast(L, 1, NULL);
     }
     l_info("TRACE: ResetGame -> '%s' (#%u)", name ? name : "(non-string)", count);
+#endif
     clear_character_select_license_window();
     return SO_CONTINUE(int, g_hook_lua_reset_game, L);
 }
@@ -4893,6 +4984,7 @@ static int hook_lua_reset_game(void *L) {
 /* Trace which resource sets get enabled -- on a successful episode launch the
  * episode's set (e.g. Android_KP_101 / Minecraft101 / JC101) is enabled here.
  * Confirms whether the chapter load is actually reached after the Licensed flip. */
+#ifdef DEBUG_SOLOADER
 static so_hook g_hook_lua_resource_set_enable;
 static int hook_lua_resource_set_enable(void *L) {
     static uint32_t count = 0;
@@ -4906,6 +4998,7 @@ static int hook_lua_resource_set_enable(void *L) {
     l_info("TRACE: ResourceSetEnable('%s') #%u", name ? name : "(non-string)", count);
     return SO_CONTINUE(int, g_hook_lua_resource_set_enable, L);
 }
+#endif /* DEBUG_SOLOADER */
 
 /* 2026-07-03 STUTTER FIX — the "impossible" 4-5 SECOND freezes. Log proof:
  * MCSM_android-pvr_JesseMale101_all.ttarch2 (30MB) was re-OPENED 25 times and
@@ -4968,7 +5061,8 @@ static int keep_resident_opt_in(void) {
 }
 
 static int resource_set_should_stay_resident(const char *name) {
-    return name && keep_resident_opt_in() &&
+    /* This hook is installed only when keep_resident_opt_in() was latched true. */
+    return name &&
         (strstr(name, "JesseMale") != NULL ||
          strstr(name, "JesseFemale") != NULL);
 }
@@ -4976,12 +5070,14 @@ static so_hook g_hook_lua_resource_set_disable;
 static int hook_lua_resource_set_disable(void *L) {
     const char *name = resource_set_arg_name(L);
     if (resource_set_should_stay_resident(name)) {
+#ifdef DEBUG_SOLOADER
         static uint32_t skipped = 0;
         skipped++;
         if (skipped <= 24U || (skipped & 0x3FU) == 0U) {
             l_info("PERF: kept '%s' resident (skipped disable -> avoids 30MB re-decode freeze) #%u",
                    name, skipped);
         }
+#endif
         return 0; /* push no Lua return values; EnableResourceSet ignores it */
     }
     return SO_CONTINUE(int, g_hook_lua_resource_set_disable, L);
@@ -5248,11 +5344,15 @@ static void redirect_user_location_arg1(void *L, const char *label) {
     if (!s_pushstring) s_pushstring = (LuaPushStringFn3)so_symbol(&so_mod_gameengine, "lua_pushstring");
     if (!s_replace) s_replace = (LuaReplaceFn3)so_symbol(&so_mod_gameengine, "lua_replace");
     if (s_pushstring && s_replace) {
+#ifdef DEBUG_SOLOADER
         static uint32_t count = 0;
         count++;
         if (count <= 32U) {
             l_info("SAVEFIX2: redirecting %s location '<User>' -> '<Temp>' (#%u)", label, count);
         }
+#else
+        (void)label;
+#endif
         s_pushstring(L, "<Temp>");
         s_replace(L, 1);
     }
@@ -5276,7 +5376,9 @@ static int hook_lua_resource_location_get_symbols(void *L) {
 
 static so_hook g_hook_lua_resource_set_exists;
 static int hook_lua_resource_set_exists(void *L) {
+#ifdef DEBUG_SOLOADER
     static uint32_t count = 0;
+#endif
 
     /* CH2 mount probe: answer with the engine's REAL state. */
     if (g_ch2_probe_active) {
@@ -5289,6 +5391,7 @@ static int hook_lua_resource_set_exists(void *L) {
         resource_set_name_is_other_playstation_ui(name) ||
         resource_set_name_is_xbox_ui(name)) {
         const int value = resource_set_name_is_vita_ui(name) ? 1 : 0;
+#ifdef DEBUG_SOLOADER
         count++;
         if (count <= 16U) {
             l_info("FIX: ResourceSetExists('%s') -> %s for controller glyph selection (#%u)",
@@ -5296,6 +5399,7 @@ static int hook_lua_resource_set_exists(void *L) {
                    value ? "true" : "false",
                    count);
         }
+#endif
         int ret = lua_push_forced_bool(L, value, "ResourceSetExists");
         if (ret >= 0) {
             return ret;
@@ -5312,12 +5416,14 @@ static int hook_lua_resource_set_exists(void *L) {
         if (g_ch2_mounted_ok) {
             return SO_CONTINUE(int, g_hook_lua_resource_set_exists, L);
         }
+#ifdef DEBUG_SOLOADER
         count++;
         if (count <= 32U) {
             l_info("CH2: ResourceSetExists('%s') -> true for local Episode 2 payload (#%u)",
                    name,
                    count);
         }
+#endif
         int ret = lua_push_forced_bool(L, 1, "ResourceSetExists");
         if (ret >= 0) {
             return ret;
@@ -5329,13 +5435,16 @@ static int hook_lua_resource_set_exists(void *L) {
 
 static so_hook g_hook_lua_resource_set_enabled;
 static int hook_lua_resource_set_enabled(void *L) {
+#ifdef DEBUG_SOLOADER
     static uint32_t count = 0;
+#endif
     const char *name = resource_set_arg_name(L);
 
     if (resource_set_name_is_vita_ui(name) ||
         resource_set_name_is_other_playstation_ui(name) ||
         resource_set_name_is_xbox_ui(name)) {
         const int value = resource_set_name_is_vita_ui(name) ? 1 : 0;
+#ifdef DEBUG_SOLOADER
         count++;
         if (count <= 16U) {
             l_info("FIX: ResourceSetEnabled('%s') -> %s for controller glyph selection (#%u)",
@@ -5343,6 +5452,7 @@ static int hook_lua_resource_set_enabled(void *L) {
                    value ? "true" : "false",
                    count);
         }
+#endif
         int ret = lua_push_forced_bool(L, value, "ResourceSetEnabled");
         if (ret >= 0) {
             return ret;
@@ -5354,12 +5464,14 @@ static int hook_lua_resource_set_enabled(void *L) {
             /* Content really mounted: let the engine answer. */
             return SO_CONTINUE(int, g_hook_lua_resource_set_enabled, L);
         }
+#ifdef DEBUG_SOLOADER
         count++;
         if (count <= 32U) {
             l_info("CH2: ResourceSetEnabled('%s') -> true for local Episode 2 payload (#%u)",
                    name,
                    count);
         }
+#endif
         int ret = lua_push_forced_bool(L, 1, "ResourceSetEnabled");
         if (ret >= 0) {
             return ret;
@@ -5406,8 +5518,10 @@ static int hook_lua_property_get(void *L) {
             }
             const char *s = g_lua_tolstring_fast(L, i, NULL);
             if (s && strcmp(s, "Licensed") == 0) {
+#ifdef DEBUG_SOLOADER
                 static uint32_t count = 0;
                 count++;
+#endif
                 /* 2026-07-03 CHARACTER-CHOICE FIX. Two DIFFERENT Lua calls read
                  * a "Licensed" key:
                  *   Menu_CharacterSelect_Complete: PropertyGet("user.prop","Licensed")
@@ -5438,6 +5552,7 @@ static int hook_lua_property_get(void *L) {
                     }
                 }
                 const int value = force_demo_path ? 0 : 1;
+#ifdef DEBUG_SOLOADER
                 if (count <= 24U || (count & 0x7fU) == 0U) {
                     l_info("FULLGAME: PropertyGet(\"Licensed\") -> %s%s (#%u active=%d safety=%u)",
                            value ? "true" : "false",
@@ -5446,6 +5561,7 @@ static int hook_lua_property_get(void *L) {
                            g_character_select_license_active,
                            g_character_select_license_safety);
                 }
+#endif
                 /* Bytecode of Menu_CharacterSelect_Complete (Lua 5.2 disasm):
                  *   r1 = PropertyGet("user.prop","Licensed")
                  *   TEST r1, 1 ; JMP ->menu   -- if r1 TRUE  -> SubProject_Switch("Menu_Main")
@@ -5477,16 +5593,14 @@ static int hook_lua_property_get(void *L) {
  * derailed boot to a black loading screen.) */
 static so_hook g_hook_lua_platform_is_user_signed_in;
 static int hook_lua_platform_is_user_signed_in(void *L) {
-    static uint32_t count = 0;
-    count++;
+    MCSM_DIAG_COUNTER(count);
     if (count <= 8U) l_info("FIX: luaPlatformIsUserSignedIn -> true (#%u)", count);
     int ret = lua_push_forced_bool(L, 1, "PlatformIsUserSignedIn");
     return ret >= 0 ? ret : SO_CONTINUE(int, g_hook_lua_platform_is_user_signed_in, L);
 }
 static so_hook g_hook_lua_is_user_signed_in;
 static int hook_lua_is_user_signed_in(void *L) {
-    static uint32_t count = 0;
-    count++;
+    MCSM_DIAG_COUNTER(count);
     if (count <= 8U) l_info("FIX: luaIsUserSignedIn -> true (#%u)", count);
     int ret = lua_push_forced_bool(L, 1, "IsUserSignedIn");
     return ret >= 0 ? ret : SO_CONTINUE(int, g_hook_lua_is_user_signed_in, L);
@@ -5495,8 +5609,7 @@ static int hook_lua_is_user_signed_in(void *L) {
  * immediately instead of waiting for a sign-in UI that never completes. */
 static so_hook g_hook_lua_platform_request_sign_in;
 static int hook_lua_platform_request_sign_in(void *L) {
-    static uint32_t count = 0;
-    count++;
+    MCSM_DIAG_COUNTER(count);
     if (count <= 8U) l_info("FIX: luaPlatformRequestSignIn -> true (#%u)", count);
     int ret = lua_push_forced_bool(L, 1, "PlatformRequestSignIn");
     return ret >= 0 ? ret : SO_CONTINUE(int, g_hook_lua_platform_request_sign_in, L);
@@ -5511,22 +5624,22 @@ static int hook_lua_platform_request_sign_in(void *L) {
  * CloudSync return immediately), so nothing tries to actually reach the server. */
 static so_hook g_hook_lua_is_registered;
 static int hook_lua_is_registered(void *L) {
-    static uint32_t count = 0;
-    if (++count <= 8U) l_info("FIX: luaIsRegistered -> true (#%u)", count);
+    MCSM_DIAG_COUNTER(count);
+    if (count <= 8U) l_info("FIX: luaIsRegistered -> true (#%u)", count);
     int ret = lua_push_forced_bool(L, 1, "IsRegistered");
     return ret >= 0 ? ret : SO_CONTINUE(int, g_hook_lua_is_registered, L);
 }
 static so_hook g_hook_lua_platform_is_registered;
 static int hook_lua_platform_is_registered(void *L) {
-    static uint32_t count = 0;
-    if (++count <= 8U) l_info("FIX: luaPlatformIsRegistered -> true (#%u)", count);
+    MCSM_DIAG_COUNTER(count);
+    if (count <= 8U) l_info("FIX: luaPlatformIsRegistered -> true (#%u)", count);
     int ret = lua_push_forced_bool(L, 1, "PlatformIsRegistered");
     return ret >= 0 ? ret : SO_CONTINUE(int, g_hook_lua_platform_is_registered, L);
 }
 static so_hook g_hook_lua_is_user_online;
 static int hook_lua_is_user_online(void *L) {
-    static uint32_t count = 0;
-    if (++count <= 8U) l_info("FIX: luaIsUserOnline -> true (#%u)", count);
+    MCSM_DIAG_COUNTER(count);
+    if (count <= 8U) l_info("FIX: luaIsUserOnline -> true (#%u)", count);
     int ret = lua_push_forced_bool(L, 1, "IsUserOnline");
     return ret >= 0 ? ret : SO_CONTINUE(int, g_hook_lua_is_user_online, L);
 }
@@ -5537,8 +5650,7 @@ static int hook_lua_is_user_online(void *L) {
  * enum, which still controls Android resource loading. */
 static so_hook g_hook_lua_is_engine_vita;
 static int hook_lua_is_engine_vita(void *L) {
-    static uint32_t count = 0;
-    count++;
+    MCSM_DIAG_COUNTER(count);
     if (count <= 12U) l_info("FIX: luaIsEngineVita -> true (#%u)", count);
     int ret = lua_push_forced_bool(L, 1, "IsEngineVita");
     return ret >= 0 ? ret : SO_CONTINUE(int, g_hook_lua_is_engine_vita, L);
@@ -5546,8 +5658,7 @@ static int hook_lua_is_engine_vita(void *L) {
 
 static so_hook g_hook_lua_is_joystick_xbox;
 static int hook_lua_is_joystick_xbox(void *L) {
-    static uint32_t count = 0;
-    count++;
+    MCSM_DIAG_COUNTER(count);
     if (count <= 12U) l_info("FIX: luaIsJoystickXbox -> false (#%u)", count);
     int ret = lua_push_forced_bool(L, 0, "IsJoystickXbox");
     return ret >= 0 ? ret : SO_CONTINUE(int, g_hook_lua_is_joystick_xbox, L);
@@ -5555,8 +5666,7 @@ static int hook_lua_is_joystick_xbox(void *L) {
 
 static so_hook g_hook_lua_is_engine_xbox360;
 static int hook_lua_is_engine_xbox360(void *L) {
-    static uint32_t count = 0;
-    count++;
+    MCSM_DIAG_COUNTER(count);
     if (count <= 12U) l_info("FIX: luaIsEngineXbox360 -> false (#%u)", count);
     int ret = lua_push_forced_bool(L, 0, "IsEngineXbox360");
     return ret >= 0 ? ret : SO_CONTINUE(int, g_hook_lua_is_engine_xbox360, L);
@@ -5564,8 +5674,7 @@ static int hook_lua_is_engine_xbox360(void *L) {
 
 static so_hook g_hook_lua_is_engine_xbone;
 static int hook_lua_is_engine_xbone(void *L) {
-    static uint32_t count = 0;
-    count++;
+    MCSM_DIAG_COUNTER(count);
     if (count <= 12U) l_info("FIX: luaIsEngineXBOne -> false (#%u)", count);
     int ret = lua_push_forced_bool(L, 0, "IsEngineXBOne");
     return ret >= 0 ? ret : SO_CONTINUE(int, g_hook_lua_is_engine_xbone, L);
@@ -5573,8 +5682,7 @@ static int hook_lua_is_engine_xbone(void *L) {
 
 static so_hook g_hook_lua_is_engine_ps3;
 static int hook_lua_is_engine_ps3(void *L) {
-    static uint32_t count = 0;
-    count++;
+    MCSM_DIAG_COUNTER(count);
     if (count <= 12U) l_info("FIX: luaIsEnginePS3 -> false (Vita-only device identity) (#%u)", count);
     int ret = lua_push_forced_bool(L, 0, "IsEnginePS3");
     return ret >= 0 ? ret : SO_CONTINUE(int, g_hook_lua_is_engine_ps3, L);
@@ -5582,8 +5690,7 @@ static int hook_lua_is_engine_ps3(void *L) {
 
 static so_hook g_hook_lua_is_engine_ps4;
 static int hook_lua_is_engine_ps4(void *L) {
-    static uint32_t count = 0;
-    count++;
+    MCSM_DIAG_COUNTER(count);
     if (count <= 12U) l_info("FIX: luaIsEnginePS4 -> false (Vita-only device identity) (#%u)", count);
     int ret = lua_push_forced_bool(L, 0, "IsEnginePS4");
     return ret >= 0 ? ret : SO_CONTINUE(int, g_hook_lua_is_engine_ps4, L);
@@ -5591,8 +5698,7 @@ static int hook_lua_is_engine_ps4(void *L) {
 
 static so_hook g_hook_lua_input_has_joystick;
 static int hook_lua_input_has_joystick(void *L) {
-    static uint32_t count = 0;
-    count++;
+    MCSM_DIAG_COUNTER(count);
     if (count <= 12U) l_info("FIX: luaInputHasJoystick -> true (#%u)", count);
     int ret = lua_push_forced_bool(L, 1, "InputHasJoystick");
     return ret >= 0 ? ret : SO_CONTINUE(int, g_hook_lua_input_has_joystick, L);
@@ -5600,8 +5706,7 @@ static int hook_lua_input_has_joystick(void *L) {
 
 static so_hook g_hook_lua_input_supports_joystick;
 static int hook_lua_input_supports_joystick(void *L) {
-    static uint32_t count = 0;
-    count++;
+    MCSM_DIAG_COUNTER(count);
     if (count <= 12U) l_info("FIX: luaInputSupportsJoystick -> true (#%u)", count);
     int ret = lua_push_forced_bool(L, 1, "InputSupportsJoystick");
     return ret >= 0 ? ret : SO_CONTINUE(int, g_hook_lua_input_supports_joystick, L);
@@ -5609,8 +5714,7 @@ static int hook_lua_input_supports_joystick(void *L) {
 
 static so_hook g_hook_lua_input_is_joystick_enabled;
 static int hook_lua_input_is_joystick_enabled(void *L) {
-    static uint32_t count = 0;
-    count++;
+    MCSM_DIAG_COUNTER(count);
     if (count <= 12U) l_info("FIX: luaInputIsJoystickEnabled -> true (#%u)", count);
     int ret = lua_push_forced_bool(L, 1, "InputIsJoystickEnabled");
     return ret >= 0 ? ret : SO_CONTINUE(int, g_hook_lua_input_is_joystick_enabled, L);
@@ -5618,8 +5722,7 @@ static int hook_lua_input_is_joystick_enabled(void *L) {
 
 static so_hook g_hook_lua_input_has_touch;
 static int hook_lua_input_has_touch(void *L) {
-    static uint32_t count = 0;
-    count++;
+    MCSM_DIAG_COUNTER(count);
     if (count <= 8U) l_info("FIX: luaInputHasTouch -> true while controller is active (#%u)", count);
     int ret = lua_push_forced_bool(L, 1, "InputHasTouch");
     return ret >= 0 ? ret : SO_CONTINUE(int, g_hook_lua_input_has_touch, L);
@@ -5627,8 +5730,7 @@ static int hook_lua_input_has_touch(void *L) {
 
 static so_hook g_hook_lua_input_supports_touch;
 static int hook_lua_input_supports_touch(void *L) {
-    static uint32_t count = 0;
-    count++;
+    MCSM_DIAG_COUNTER(count);
     if (count <= 8U) l_info("FIX: luaInputSupportsTouch -> true while controller is active (#%u)", count);
     int ret = lua_push_forced_bool(L, 1, "InputSupportsTouch");
     return ret >= 0 ? ret : SO_CONTINUE(int, g_hook_lua_input_supports_touch, L);
@@ -5641,6 +5743,7 @@ static int hook_lua_input_supports_touch(void *L) {
  * ENTER/RETURN on each so the log shows EXACTLY which one never returns (the
  * blocker). Pure logging via SO_CONTINUE — no behaviour change. ret is logged so
  * polled status queries reveal what value they keep returning. */
+#ifdef DEBUG_SOLOADER
 #define CONNECT_TRACE_HOOK(fn)                                                  \
     static so_hook g_hook_##fn;                                                 \
     static int hook_##fn(void *L) {                                             \
@@ -5744,6 +5847,7 @@ static int hook_job_init(void) {
     launch_state_mark_progress();
     return SO_CONTINUE(int, g_hook_job_init);
 }
+#endif /* DEBUG_SOLOADER */
 
 
 /* ---- SHADOW DISABLE (perf) --------------------------------------------------
@@ -5756,13 +5860,13 @@ static int hook_job_init(void) {
 static int shadows_disabled(void) { return !mcsm_cfg()->shadows; }
 static so_hook g_hook_is_shadow_light;
 static int hook_is_shadow_light(void *self) {
-    if (shadows_disabled()) return 0;
-    return SO_CONTINUE(int, g_hook_is_shadow_light, self);
+    (void)self;
+    return 0; /* installed only when shadows_disabled() was latched true */
 }
 static so_hook g_hook_is_contributing_shadow;
 static int hook_is_contributing_shadow(void *self) {
-    if (shadows_disabled()) return 0;
-    return SO_CONTINUE(int, g_hook_is_contributing_shadow, self);
+    (void)self;
+    return 0; /* installed only when shadows_disabled() was latched true */
 }
 
 /* POST-PROCESS AUDIT (2026-07-29). libGameEngine exports a full post-effect chain
@@ -5874,6 +5978,7 @@ static void patch_boot_diag_hooks(void) {
 #else
     l_info("Patch: skipped hot archive diag hooks (unsafe with concurrent resource/render threads).");
 #endif
+#ifdef DEBUG_SOLOADER
     (void)hook_symbol_checked(&so_mod_gameengine, "_ZN13ScriptManager10InitializeEbb",
                               "ScriptManager::Initialize",
                               (uintptr_t)&hook_scriptmgr_init, &g_hook_scriptmgr_init);
@@ -5898,10 +6003,14 @@ static void patch_boot_diag_hooks(void) {
     (void)hook_symbol_checked(&so_mod_gameengine, "_Z20luaResourceSetEnableP9lua_State",
                               "luaResourceSetEnable",
                               (uintptr_t)&hook_lua_rset_enable, &g_hook_lua_rset_enable);
-    (void)hook_symbol_checked(&so_mod_gameengine, "_Z21luaResourceSetDisableP9lua_State",
+#endif
+    if (keep_resident_opt_in()) {
+        (void)hook_symbol_checked(&so_mod_gameengine, "_Z21luaResourceSetDisableP9lua_State",
                               "luaResourceSetDisable",
                               (uintptr_t)&hook_lua_resource_set_disable,
                               &g_hook_lua_resource_set_disable);
+    }
+#ifdef DEBUG_SOLOADER
     (void)hook_symbol_checked(&so_mod_gameengine, "_Z25luaResourceSetLoadingCallP9lua_State",
                               "luaResourceSetLoadingCall",
                               (uintptr_t)&hook_lua_rset_loadingcall, &g_hook_lua_rset_loadingcall);
@@ -5917,6 +6026,7 @@ static void patch_boot_diag_hooks(void) {
     (void)hook_symbol_checked(&so_mod_gameengine, "_ZN13ScriptManager12LoadResourceEP9lua_StatePKc",
                               "ScriptManager::LoadResource",
                               (uintptr_t)&hook_sm_loadresource, &g_hook_sm_loadresource);
+#endif
 }
 
 /* SAVE-RENAME KEYBOARD (2026-07-18): the game calls luaPlatformShowKeyboard when
@@ -5924,10 +6034,10 @@ static void patch_boot_diag_hooks(void) {
  * on Vita it did nothing. Hook it to raise the Vita IME (dialog.c mcsm_ime_begin);
  * gl_swap pumps it and feeds the typed name back to the engine. */
 static so_hook g_hook_lua_platform_show_keyboard;
+/* Log-only for the same reason as hook_sdl_show_text_input above. */
 static int hook_lua_platform_show_keyboard(void *L) {
-    extern void mcsm_ime_begin(const char *initial);
-    l_info("KEYBOARD: luaPlatformShowKeyboard -> Vita IME");
-    mcsm_ime_begin("");
+    l_info("KEYBOARD: luaPlatformShowKeyboard fired (not raising an IME — the JNI "
+           "text-dialog path owns text entry)");
     return SO_CONTINUE(int, g_hook_lua_platform_show_keyboard, L);
 }
 
@@ -5936,7 +6046,7 @@ static int hook_lua_platform_show_keyboard(void *L) {
  * confirmed via the TTPlatform vtables in libGameEngine .data.rel.ro), so the engine's
  * rename flow instantly "finished" with an empty name. Replace them with a bridge to
  * the real Vita IME (dialog.c). We DON'T call the originals (they do nothing). */
-extern void mcsm_ime_begin_vkbd(const char *initial);
+extern void mcsm_ime_begin_vkbd(const char *title, const char *initial);
 extern int mcsm_vkbd_finished(void);
 extern const char *mcsm_vkbd_result(int *cancelled);
 extern void mcsm_vkbd_reset(void);
@@ -5947,12 +6057,25 @@ static so_hook g_hook_open_vkbd, g_hook_is_vkbd_finished, g_hook_get_vkbd_result
  * an empty IME. Return 1 in case the caller checks a success bool. */
 static int hook_open_virtual_keyboard(void) {
     l_info("KEYBOARD: TTPlatform::OpenVirtualKeyboard -> Vita IME");
-    mcsm_ime_begin_vkbd("");
+    mcsm_ime_begin_vkbd(NULL, "");
     return 1;
 }
 /* IsVirtualKeyboardFinished() -> 0 while the IME is up, 1 when the user confirms/
  * cancels (the stub always returned 1 so the engine never waited for input). */
 static int hook_is_virtual_keyboard_finished(void) {
+    /* ONE-SHOT PROBE. If the rename screen polls this but never calls Open, the engine
+     * uses the vkbd interface but enters it somewhere we have not hooked. If NEITHER
+     * ever fires, the rename does not use this interface at all and the whole vtable
+     * bridge is aimed at the wrong thing -- which is the difference between "nearly
+     * working" and "wrong tree", and no other line distinguishes them. */
+#ifdef DEBUG_SOLOADER
+    static int s_logged = 0;
+    if (!s_logged) {
+        s_logged = 1;
+        l_info("KEYBOARD: engine polled IsVirtualKeyboardFinished (vkbd interface IS "
+                "in use; finished=%d)", mcsm_vkbd_finished());
+    }
+#endif
     return mcsm_vkbd_finished();
 }
 /* GetVirtualKeyboardResult(String& out, bool& cancelled). Write the typed name into
@@ -5975,6 +6098,66 @@ static void hook_get_virtual_keyboard_result(void *self, void *out_string, unsig
     l_info("KEYBOARD: GetVirtualKeyboardResult -> '%s' cancelled=%d", name ? name : "", cancel);
     mcsm_vkbd_reset();
 }
+/* ★★ INSTALL THE VKBD BRIDGE BY PATCHING THE VTABLES, NOT BY HOOKING THE FUNCTIONS.
+ *
+ * The inline hooks below CANNOT install for two of the three. hook_symbol_checked()
+ * refuses any function smaller than INLINE_HOOK_BYTES (8), because an inline hook
+ * writes 8 bytes and a shorter function would have its successor clobbered. Measured
+ * in the shipped libGameEngine.so:
+ *     OpenVirtualKeyboard        @0x56df2c  4 bytes  (bx lr)              -> SKIPPED
+ *     IsVirtualKeyboardFinished  @0x56df30  8 bytes  (mov r0,#1; bx lr)   -> hooked
+ *     GetVirtualKeyboardResult   @0x56df38  4 bytes  (bx lr)              -> SKIPPED
+ * and the device log said so plainly every boot:
+ *     [WARN] Patch: skipping hook for TTPlatform::OpenVirtualKeyboard ... too small
+ * So the bridge has never actually been installed -- only its middle third was, which
+ * is worse than none (see mcsm_vkbd_finished()). Every previous "rename still does
+ * nothing" report is explained by this line.
+ *
+ * These stubs are reached through a VTABLE, so the fix is to replace the vtable slots
+ * instead: no code is written, no size limit applies, and neighbouring functions
+ * cannot be clobbered. Both TTPlatform vtables in .data.rel.ro hold the three stubs in
+ * consecutive slots. Static vaddrs (file offset + 0x1000, per the section headers):
+ *     vtable A: 0xff0f60   vtable B: 0xff1360     <- address of the Open slot
+ *
+ * Verify-before-write, the same discipline patch_u32() uses: if all three slots do not
+ * still hold the exact stub addresses, the binary is not the one this was measured
+ * against and we leave it alone rather than corrupt a vtable. */
+static void install_vkbd_vtable_bridge(void) {
+    const uintptr_t base = so_mod_gameengine.text_base;
+    const uintptr_t expect[3] = { base + 0x56df2cu,   /* Open      */
+                                  base + 0x56df30u,   /* IsFinished*/
+                                  base + 0x56df38u }; /* GetResult */
+    const uintptr_t repl[3]   = { (uintptr_t)&hook_open_virtual_keyboard,
+                                  (uintptr_t)&hook_is_virtual_keyboard_finished,
+                                  (uintptr_t)&hook_get_virtual_keyboard_result };
+    static const uint32_t kVtabOpenSlot[] = { 0x00ff0f60u, 0x00ff1360u };
+
+    int patched = 0;
+    for (unsigned i = 0; i < sizeof(kVtabOpenSlot) / sizeof(kVtabOpenSlot[0]); i++) {
+        const uintptr_t slot = base + kVtabOpenSlot[i];
+        const volatile uintptr_t *cur = (const volatile uintptr_t *)slot;
+        if (cur[0] != expect[0] || cur[1] != expect[1] || cur[2] != expect[2]) {
+            l_warn("KEYBOARD: vtable %u at %p does not hold the expected vkbd stubs "
+                   "(%08X %08X %08X, wanted %08X %08X %08X) — not patching.",
+                   i, (void *)slot,
+                   (unsigned)cur[0], (unsigned)cur[1], (unsigned)cur[2],
+                   (unsigned)expect[0], (unsigned)expect[1], (unsigned)expect[2]);
+            continue;
+        }
+        kuKernelCpuUnrestrictedMemcpy((void *)slot, repl, sizeof(repl));
+        kuKernelFlushCaches((void *)slot, sizeof(repl));
+        patched++;
+        l_info("KEYBOARD: vkbd vtable %u at %p -> bridge installed.", i, (void *)slot);
+    }
+    if (!patched) {
+        l_warn("KEYBOARD: NO vkbd vtable was patched — save rename will not open the "
+               "IME. Check the stub addresses against this libGameEngine.so.");
+    } else {
+        l_info("KEYBOARD: vkbd bridge live in %d vtable(s); rename should raise the "
+               "Vita IME.", patched);
+    }
+}
+
 /* The Vita has no HW keyboard, so luaInputSupportsKeyboard/HasKeyboard return
  * FALSE and the engine never offers text entry (rename) -> ShowKeyboard is never
  * called. Force them TRUE so the engine routes text entry through the keyboard,
@@ -5996,17 +6179,21 @@ static int hook_lua_input_has_keyboard(void *L) {
  * so trace the CONFIRMED rename setter to see if the rename flow is even reached.
  * If this fires when you rename, the flow works up to the setter (so text got in
  * somehow) — and I can hook whatever raised the text field. Log-only. */
+#ifdef DEBUG_SOLOADER
 static so_hook g_hook_lua_saveload_set_display_name;
 static int hook_lua_saveload_set_display_name(void *L) {
     return SO_CONTINUE(int, g_hook_lua_saveload_set_display_name, L);
 }
+#endif /* DEBUG_SOLOADER */
 
 static void patch_dlc_fast_path_hooks(void) {
+#ifdef DEBUG_SOLOADER
     (void)hook_symbol_checked(&so_mod_gameengine,
                               "_Z29luaSaveLoadSetSaveDisplayNameP9lua_State",
                               "luaSaveLoadSetSaveDisplayName",
                               (uintptr_t)&hook_lua_saveload_set_display_name,
                               &g_hook_lua_saveload_set_display_name);
+#endif
     (void)hook_symbol_checked(&so_mod_gameengine,
                               "_Z24luaInputSupportsKeyboardP9lua_State",
                               "luaInputSupportsKeyboard",
@@ -6036,11 +6223,22 @@ static void patch_dlc_fast_path_hooks(void) {
                               "_ZN10TTPlatform24GetVirtualKeyboardResultER6StringRb",
                               "TTPlatform::GetVirtualKeyboardResult",
                               (uintptr_t)&hook_get_virtual_keyboard_result, &g_hook_get_vkbd_result);
-    (void)hook_symbol_checked(&so_mod_gameengine,
-                              "_Z24luaPlatformGetGPUQualityP9lua_State",
-                              "luaPlatformGetGPUQuality",
-                              (uintptr_t)&hook_lua_platform_get_gpu_quality,
-                              &g_hook_lua_platform_get_gpu_quality);
+    /* The three calls above are kept for any DIRECT (non-virtual) call site, but two
+     * of them cannot install -- the functions are 4 bytes. The vtable patch is what
+     * actually makes the bridge live; see install_vkbd_vtable_bridge(). */
+    install_vkbd_vtable_bridge();
+#ifdef DEBUG_SOLOADER
+    const int install_gpu_quality_hook = 1;
+#else
+    const int install_gpu_quality_hook = mcsm_cfg()->gpu_tier >= 0;
+#endif
+    if (install_gpu_quality_hook) {
+        (void)hook_symbol_checked(&so_mod_gameengine,
+                                  "_Z24luaPlatformGetGPUQualityP9lua_State",
+                                  "luaPlatformGetGPUQuality",
+                                  (uintptr_t)&hook_lua_platform_get_gpu_quality,
+                                  &g_hook_lua_platform_get_gpu_quality);
+    }
     (void)hook_symbol_checked(&so_mod_gameengine,
                               "_Z32luaPlatformIsConnectedToInternetP9lua_State",
                               "luaPlatformIsConnectedToInternet",
@@ -6086,11 +6284,18 @@ static void patch_dlc_fast_path_hooks(void) {
                               "luaIsEpisodeUnlicensed",
                               (uintptr_t)&hook_lua_is_episode_unlicensed,
                               &g_hook_lua_is_episode_unlicensed);
-    (void)hook_symbol_checked(&so_mod_gameengine,
-                              "_Z24luaGetUserSystemLanguageP9lua_State",
-                              "luaGetUserSystemLanguage",
-                              (uintptr_t)&hook_lua_get_user_system_language,
-                              &g_hook_lua_get_user_system_language);
+#ifdef DEBUG_SOLOADER
+    const int install_language_hook = 1;
+#else
+    const int install_language_hook = mcsm_game()->language[0] != '\0';
+#endif
+    if (install_language_hook) {
+        (void)hook_symbol_checked(&so_mod_gameengine,
+                                  "_Z24luaGetUserSystemLanguageP9lua_State",
+                                  "luaGetUserSystemLanguage",
+                                  (uintptr_t)&hook_lua_get_user_system_language,
+                                  &g_hook_lua_get_user_system_language);
+    }
     (void)hook_symbol_checked(&so_mod_gameengine,
                               "_Z14luaGetDemoModeP9lua_State",
                               "luaGetDemoMode",
@@ -6199,16 +6404,19 @@ static void patch_dlc_fast_path_hooks(void) {
                               "luaPropertyExists",
                               (uintptr_t)&hook_lua_property_exists,
                               &g_hook_lua_property_exists);
+#ifdef DEBUG_SOLOADER
     (void)hook_symbol_checked(&so_mod_gameengine,
                               "_Z16luaSetSubProjectP9lua_State",
                               "luaSetSubProject",
                               (uintptr_t)&hook_lua_set_subproject,
                               &g_hook_lua_set_subproject);
+#endif
     (void)hook_symbol_checked(&so_mod_gameengine,
                               "_Z12luaResetGameP9lua_State",
                               "luaResetGame",
                               (uintptr_t)&hook_lua_reset_game,
                               &g_hook_lua_reset_game);
+#ifdef DEBUG_SOLOADER
     (void)hook_symbol_checked(&so_mod_gameengine,
                               "_Z18luaSaveLoadPreSaveP9lua_State",
                               "luaSaveLoadPreSave",
@@ -6229,6 +6437,7 @@ static void patch_dlc_fast_path_hooks(void) {
                               "luaSetSaveFinishedCallback",
                               (uintptr_t)&hook_lua_set_save_finished_cb,
                               &g_hook_lua_set_save_finished_cb);
+#endif
     (void)hook_symbol_checked(&so_mod_gameengine,
                               "_Z7luaSaveP9lua_State",
                               "luaSave",
@@ -6319,6 +6528,7 @@ static void patch_dlc_fast_path_hooks(void) {
                               "luaDownloadDocumentRetrieve",
                               (uintptr_t)&hook_lua_download_doc_retrieve,
                               &g_hook_lua_download_doc_retrieve);
+#ifdef DEBUG_SOLOADER
     (void)hook_symbol_checked(&so_mod_gameengine,
                               "_Z30luaDownloadDocumentsFromServerP9lua_State",
                               "luaDownloadDocumentsFromServer",
@@ -6339,6 +6549,7 @@ static void patch_dlc_fast_path_hooks(void) {
                               "luaResourceSetEnable",
                               (uintptr_t)&hook_lua_resource_set_enable,
                               &g_hook_lua_resource_set_enable);
+#endif
     /* SAVEFIX spoof hooks (ResourceLocationGetNames/ResourceGetNames/
      * ResourceExists forcing fake "saveSlot1.bundle" answers) are DISARMED
      * (2026-07-02). With the character-select Licensed window narrowed to a
@@ -6442,6 +6653,7 @@ static void patch_dlc_fast_path_hooks(void) {
                               (uintptr_t)&hook_lua_input_supports_touch,
                               &g_hook_lua_input_supports_touch);
 
+#ifdef DEBUG_SOLOADER
     /* CONNECT-FLOW trace hooks (find the "Connecting" blocker). */
     #define REG_CONNECT_TRACE(fn, mangled)                                      \
         (void)hook_symbol_checked(&so_mod_gameengine, mangled, #fn,             \
@@ -6461,6 +6673,7 @@ static void patch_dlc_fast_path_hooks(void) {
     REG_CONNECT_TRACE(luaInstallEpisode,               "_Z17luaInstallEpisodeP9lua_State");
     REG_CONNECT_TRACE(luaMountAllEpisodes,             "_Z19luaMountAllEpisodesP9lua_State");
     #undef REG_CONNECT_TRACE
+#endif
 }
 
 // DIAGNOSTIC: trace the bootTitle login/connect/cloud-sync native primitives so
@@ -6493,24 +6706,30 @@ static void patch_login_diag_hooks(void) {
     (void)hook_symbol_checked(&so_mod_gameengine, "_Z12luaChorePlayP9lua_State",
                               "luaChorePlay",
                               (uintptr_t)&hook_lua_choreplay, &g_hook_lua_choreplay);
+#ifdef DEBUG_SOLOADER
     (void)hook_symbol_checked(&so_mod_gameengine, "_Z12luaSceneOpenP9lua_State",
                               "luaSceneOpen",
                               (uintptr_t)&hook_lua_sceneopen, &g_hook_lua_sceneopen);
+#endif
     (void)hook_symbol_checked(&so_mod_gameengine, "_Z7luaLoadP9lua_State",
                               "luaLoad",
                               (uintptr_t)&hook_lua_load, &g_hook_lua_load);
+#ifdef DEBUG_SOLOADER
     (void)hook_symbol_checked(&so_mod_gameengine, "_Z19luaResourceIsLoadedP9lua_State",
                               "luaResourceIsLoaded",
                               (uintptr_t)&hook_lua_resource_is_loaded, &g_hook_lua_resource_is_loaded);
+#endif
     (void)hook_symbol_checked(&so_mod_gameengine, "_Z15luaScenePreloadP9lua_State",
                               "luaScenePreload",
                               (uintptr_t)&hook_lua_scene_preload, &g_hook_lua_scene_preload);
+#ifdef DEBUG_SOLOADER
     (void)hook_symbol_checked(&so_mod_gameengine, "_Z30luaResourceAdvancePreloadBatchP9lua_State",
                               "luaResourceAdvancePreloadBatch",
                               (uintptr_t)&hook_lua_advance_preload, &g_hook_lua_advance_preload);
     (void)hook_symbol_checked(&so_mod_gameengine, "_Z19luaWaitForCallbacksP9lua_State",
                               "luaWaitForCallbacks",
                               (uintptr_t)&hook_lua_wait_for_callbacks, &g_hook_lua_wait_for_callbacks);
+#endif
 }
 
 /* RENDER-QUALITY + OUTLINE draw-reduction levers (2026-07-20, opt-in) ---------
@@ -6544,18 +6763,26 @@ static int render_quality_override(void) {
 }
 static so_hook g_hook_set_render_quality;
 static void hook_set_render_quality(void *self, int quality) {
-    static unsigned n = 0;
     const int ov = render_quality_override();
+#ifdef DEBUG_SOLOADER
+    static unsigned n = 0;
     if (n++ < 8U) l_info("RQUAL: RenderConfiguration::SetQuality(q=%d) override=%d", quality, ov);
+#endif
     if (ov >= 0) quality = ov;
     SO_CONTINUE_VOID(g_hook_set_render_quality, self, quality);
 }
 
 static int outlines_disabled(void) { return !mcsm_cfg()->outlines; }
 static so_hook g_hook_set_toon_outline;
+static uintptr_t g_set_toon_outline_tramp;
 static void hook_set_toon_outline(void *self, int on) {
-    if (outlines_disabled()) on = 0;
-    SO_CONTINUE_VOID(g_hook_set_toon_outline, self, on);
+    (void)on;
+    /* Installed only for outlines=off, so avoid a cached-config read per mesh. */
+    if (g_set_toon_outline_tramp) {
+        ((void (*)(void *, int))g_set_toon_outline_tramp)(self, 0);
+    } else {
+        SO_CONTINUE_VOID(g_hook_set_toon_outline, self, 0);
+    }
 }
 
 /* GEOMETRY/LOD lever (2026-07-20): Scene::SetBrushNear/FarDetail(float) is the
@@ -6651,6 +6878,47 @@ static int unsafe_render_hooks_enabled(void) {
  * these needed their own path rather than SO_CONTINUE (which corrupts floats). */
 /* so_util.c defines this but does not export it in the header. */
 extern uintptr_t so_alloc_arena(so_module *so, uintptr_t range, uintptr_t dst, size_t sz);
+
+/* Metrics::NewFrame's shipped prologue is almost relocatable, but its second
+ * instruction is a PC-relative literal load:
+ *   e92d43f0  push {r4-r9,lr}
+ *   e59f43d8  ldr  r4,[pc,#0x3d8]
+ * A blind cave copy would load from the cave's PC and corrupt the GOT base used by
+ * the rest of the function. Build an exact-prologue trampoline that embeds the
+ * original literal beside the resume address and rewrites only that load. Any
+ * binary drift falls back to the slower live-unpatch path in the handler. */
+static uintptr_t mcsm_build_metrics_new_frame_tramp(so_hook *h) {
+    if (!h || !h->addr || h->thumb_addr ||
+        h->orig_instr[0] != 0xE92D43F0u ||
+        h->orig_instr[1] != 0xE59F43D8u) {
+        return 0;
+    }
+
+    /* The LDR is the second instruction: ARM PC = instruction address + 8. */
+    const uintptr_t literal_addr = h->addr + 12u + 0x3D8u;
+    uint32_t literal_value = 0;
+    kuKernelCpuUnrestrictedMemcpy(&literal_value,
+                                  (const void *)literal_addr,
+                                  sizeof(literal_value));
+
+    uintptr_t t = so_alloc_arena(&so_mod_gameengine, 0, h->addr, 20);
+    if (!t) {
+        return 0;
+    }
+    const uint32_t code[5] = {
+        0xE92D43F0u,              /* original push */
+        0xE59F4004u,              /* ldr r4,[pc,#4] -> embedded literal below */
+        0xE51FF004u,              /* ldr pc,[pc,#-4] -> resume word */
+        (uint32_t)(h->addr + 8u),
+        literal_value
+    };
+    kuKernelCpuUnrestrictedMemcpy((void *)t, code, sizeof(code));
+    kuKernelFlushCaches((void *)t, sizeof(code));
+    l_info("TRAMP: Metrics::NewFrame @0x%08X -> literal-safe cave 0x%08X",
+           (unsigned)h->addr, (unsigned)t);
+    return t;
+}
+
 /* Is this ARM instruction safe to EXECUTE FROM A DIFFERENT ADDRESS?
  *
  * mcsm_build_tramp copies the two stolen instructions into a code cave and runs
@@ -6698,6 +6966,14 @@ static int mcsm_insn_is_relocatable(uint32_t insn) {
 
 static uintptr_t mcsm_build_tramp(so_hook *h) {
     if (!h || !h->addr) return 0;
+    /* The cave sequence below copies two 32-bit ARM instructions. Thumb targets
+     * need instruction-width decoding and a Thumb-state resume branch; fall back
+     * to SO_CONTINUE instead of pretending this ARM-only builder can handle them. */
+    if (h->thumb_addr) {
+        l_error("TRAMP: REFUSING Thumb hook @0x%08X (ARM cave builder only)",
+                (unsigned)h->addr);
+        return 0;
+    }
     /* Refuse rather than relocate something position-dependent. The caller must
      * then leave the function UNHOOKED -- swallowing the call would be worse. */
     for (int i = 0; i < 2; ++i) {
@@ -6751,14 +7027,20 @@ static int mcsm_install_tramp_hook(const char *symbol, const char *label,
 
 #define MCSM_DETAIL_TRAMPOLINE(H, SELF, V) do {     uintptr_t t_ = (H##_tramp);     if (t_) ((void (*)(void *, float))t_)((SELF), (V)); } while (0)
 static void hook_scene_far_detail(void *self, float v) {
-    static unsigned n = 0; const float s = detail_scale();
+    const float s = detail_scale();
+#ifdef DEBUG_SOLOADER
+    static unsigned n = 0;
     if (n++ < 8U) l_info("DETAIL: Scene::SetBrushFarDetail=%d/1000 scale=%d/1000", (int)(v * 1000.0f), (int)(s * 1000.0f));
+#endif
     if (s > 0.0f) v *= s;
     MCSM_DETAIL_TRAMPOLINE(g_hook_scene_far_detail, self, v);
 }
 static void hook_scene_near_detail(void *self, float v) {
-    static unsigned n = 0; const float s = detail_scale();
+    const float s = detail_scale();
+#ifdef DEBUG_SOLOADER
+    static unsigned n = 0;
     if (n++ < 8U) l_info("DETAIL: Scene::SetBrushNearDetail=%d/1000 scale=%d/1000", (int)(v * 1000.0f), (int)(s * 1000.0f));
+#endif
     if (s > 0.0f) v *= s;
     MCSM_DETAIL_TRAMPOLINE(g_hook_scene_near_detail, self, v);
 }
@@ -6778,28 +7060,42 @@ static float far_clip_cap(void) {
 static so_hook g_hook_camera_far_clip;
 static uintptr_t g_hook_camera_far_clip_tramp;
 static void hook_camera_far_clip(void *self, float v) {
-    static unsigned n = 0; const float cap = far_clip_cap();
+    const float cap = far_clip_cap();
+#ifdef DEBUG_SOLOADER
+    static unsigned n = 0;
     if (n++ < 8U) l_info("FARCLIP: Camera::SetFarClip=%d cap=%d", (int)v, (int)cap);
+#endif
     if (cap > 0.0f && v > cap) v = cap;   /* clamp the far plane IN; never push it out */
     MCSM_DETAIL_TRAMPOLINE(g_hook_camera_far_clip, self, v);
 }
 
 static void patch_render_perf_hooks(void) {
-    /* Install the quality hook ALWAYS: it logs the engine's natural quality values
-     * (so we can learn the enum from a diagnostic loader.log) and forwards unchanged
-     * unless render_quality.txt is set, so it is behaviour-neutral by default. */
-    (void)hook_symbol_checked(&so_mod_gameengine,
-                              "_ZN19RenderConfiguration10SetQualityE17RenderQualityType",
-                              "RenderConfiguration::SetQuality",
-                              (uintptr_t)&hook_set_render_quality, &g_hook_set_render_quality);
-    if (render_quality_override() >= 0) {
-        l_info("PERF: render quality OVERRIDE -> %d (render_quality.txt)", render_quality_override());
+    const int quality_override = render_quality_override();
+    /* A production hook is useful only when it changes quality. The logging build
+     * still installs it unconditionally so natural engine values remain observable. */
+#ifdef DEBUG_SOLOADER
+    const int install_quality_hook = 1;
+#else
+    const int install_quality_hook = quality_override >= 0;
+#endif
+    if (install_quality_hook) {
+        (void)hook_symbol_checked(&so_mod_gameengine,
+                                  "_ZN19RenderConfiguration10SetQualityE17RenderQualityType",
+                                  "RenderConfiguration::SetQuality",
+                                  (uintptr_t)&hook_set_render_quality, &g_hook_set_render_quality);
+    }
+    if (quality_override >= 0) {
+        l_info("PERF: render quality OVERRIDE -> %d (graphics.txt)", quality_override);
     }
     if (outlines_disabled()) {
-        (void)hook_symbol_checked(&so_mod_gameengine,
-                                  "_ZN17RenderObject_Mesh20SetRenderToonOutlineEb",
-                                  "RenderObject_Mesh::SetRenderToonOutline",
-                                  (uintptr_t)&hook_set_toon_outline, &g_hook_set_toon_outline);
+        if (hook_symbol_checked(&so_mod_gameengine,
+                                "_ZN17RenderObject_Mesh20SetRenderToonOutlineEb",
+                                "RenderObject_Mesh::SetRenderToonOutline",
+                                (uintptr_t)&hook_set_toon_outline, &g_hook_set_toon_outline)) {
+            enable_validated_hot_trampoline("RenderObject_Mesh::SetRenderToonOutline",
+                                            &g_hook_set_toon_outline,
+                                            &g_set_toon_outline_tramp);
+        }
         l_info("PERF: toon outlines DISABLED (graphics.txt outlines=off) — outline submit skipped.");
     }
     if (detail_scale() > 0.0f) {
@@ -6828,7 +7124,9 @@ void so_patch(void) {
     patch_fmod_audio_hooks();
     patch_engine_diag_hooks();
     patch_sdl_android_runtime_hooks();
+#ifdef DEBUG_SOLOADER
     patch_input_diag_hooks();
+#endif
     patch_dlc_fast_path_hooks();
     patch_login_diag_hooks();
     patch_boot_diag_hooks();

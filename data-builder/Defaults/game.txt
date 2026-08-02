@@ -1,0 +1,53 @@
+# ============================================================================
+#   MINECRAFT: STORY MODE / PS VITA                  LANGUAGE + EPISODES
+# ============================================================================
+#
+#   Edit the two values below, save this file, then restart the game.
+
+language = en
+chapters = auto
+
+#   LANGUAGE CODES
+#   ------------------------------------------------------------------------
+#   en  English       fr  French          de  German
+#   es  Spanish       pt  Portuguese      ru  Russian
+#   zh  Chinese
+#
+#   Text follows this setting. Voices remain English.
+#
+#   EPISODE MODES
+#   ------------------------------------------------------------------------
+#   auto       Show every episode whose files are installed (recommended)
+#   all        Force all eight episodes to appear
+#   1          Show only Episode 1
+#   1,2,3      Show only Episodes 1, 2, and 3
+#
+#   Example:  chapters = 1,2,3,4
+#   Forcing an episode visible does not install its missing game files.
+#
+# ============================================================================
+#   INDIVIDUAL EPISODE CONTROL                         OPTIONAL / ADVANCED
+# ============================================================================
+#
+#   auto   Show it only when its files are installed (recommended)
+#   on     Always show it in Episode Select
+#   off    Always hide it
+#
+#   These lines override `chapters =` one episode at a time.
+
+chapter1 = auto    # The Order of the Stone
+chapter2 = auto    # Assembly Required
+chapter3 = auto    # The Last Place You Look
+chapter4 = auto    # A Block and a Hard Place
+chapter5 = auto    # Order Up!
+chapter6 = auto    # A Portal to Mystery
+chapter7 = auto    # Access Denied
+chapter8 = auto    # A Journey's End?
+
+# ============================================================================
+#   RESET
+# ============================================================================
+#
+#   Restore `language = en`, `chapters = auto`, and every chapter to auto.
+#
+# ============================================================================

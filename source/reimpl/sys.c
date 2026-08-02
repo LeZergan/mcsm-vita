@@ -286,6 +286,7 @@ ssize_t pread_soloader(int fd, void *buf, size_t count, off_t offset) {
     /* newlib pread -> a single sceIoPread, instead of the old
      * lseek(save)+lseek(set)+read+lseek(restore) 4-syscall emulation. */
     ssize_t read_bytes = pread(fd, buf, count, offset);
+#ifdef DEBUG_SOLOADER
     if (obb_is_fd(fd)) {
         static int n = 0;
         if (count > 64 || offset > 8192 || n++ < 100) {
@@ -293,6 +294,7 @@ ssize_t pread_soloader(int fd, void *buf, size_t count, off_t offset) {
                    fd, (long long)offset, (unsigned)count, (int)read_bytes);
         }
     }
+#endif
     return read_bytes;
 }
 

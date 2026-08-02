@@ -1,0 +1,90 @@
+# ============================================================================
+#   MINECRAFT: STORY MODE / PS VITA                       GRAPHICS SETUP
+# ============================================================================
+#
+#   NORMAL SETUP: change ONE word, save, then restart the game.
+
+profile = performance
+
+#   performance = fastest and recommended
+#   balanced    = sharper picture with extra visual effects
+#   quality     = best picture; demanding scenes may run slower
+#   battery     = lower power use
+#   custom      = use Easy or Advanced Custom below
+#
+# ============================================================================
+#   CUSTOM MODE SWITCH
+# ============================================================================
+#
+#   To customize: set profile = custom above, then pick easy or advanced.
+
+custom_mode = easy              # easy | advanced
+
+#   Both blocks stay editable. Only the selected block is used.
+#
+# ============================================================================
+#   EASY CUSTOM - SIX SIMPLE CHOICES
+# ============================================================================
+
+custom_picture = sharp          # low | battery | fast | sharp | quality | native
+custom_motion  = smooth         # low | steady | smooth
+custom_gpu     = fastest        # fastest | fast | medium | quality | original
+custom_effects = outlines       # minimal | outlines | full
+custom_world   = balanced       # fast | balanced | detailed | unlimited
+custom_power   = performance    # battery | performance
+
+#   Use this block when custom_mode = easy.
+#
+# ============================================================================
+#   ADVANCED CUSTOM - CHANGE ANY EXACT VALUE
+# ============================================================================
+#
+#   Use this block when custom_mode = advanced.
+
+advanced_resolution      = 720x408   # 960x544 | 800x452 | 720x408 | 640x362 | 576x326 | 480x272
+advanced_fps_cap         = 30        # 60 | 30 | 20 | 15
+advanced_gpu             = sgx540    # sgx540 | sgx541 | sgx542 | sgx543 | sgx543mp
+advanced_outlines        = on        # on | off
+advanced_shadows         = off       # on | off
+advanced_detail          = 800       # 100 to 1000
+advanced_draw_distance   = 3500      # 2500 to 6000; 0 = unlimited
+advanced_clock           = 444       # 444 | adaptive
+advanced_upscale         = linear    # linear | nearest
+advanced_vsync           = on        # on | off
+advanced_nearest_filter  = off       # on fixes thin white block seams
+advanced_fbfetch_zero    = off       # on fixes solid-white glass/lights
+
+# ============================================================================
+#   QUICK VALUE GUIDE
+# ============================================================================
+#
+# PICTURE: low=480x272 | battery=576x326 | fast=640x362
+#          sharp=720x408 | quality=800x452 | native=960x544
+#
+# MOTION:  smooth=30 fps | steady=20 fps | low=15 fps
+#
+# ADVANCED 60 FPS
+#   Set advanced_fps_cap = 60 for the highest possible frame-rate target.
+#   This is a cap, not a guaranteed lock. Crowded scenes with many characters
+#   can still fall to around 20 fps because the game becomes CPU-heavy.
+#
+# GPU:     fastest/sgx540 = PowerVR SGX 540
+#          fast/sgx541    = PowerVR SGX 541
+#          medium/sgx542  = PowerVR SGX 542
+#          quality/sgx543 = PowerVR SGX 543
+#          original       = PowerVR SGX 543MP
+#
+# EFFECTS: minimal=no outlines/shadows | outlines=outlines only | full=both
+#
+# WORLD:   fast=600 detail/2500 distance | balanced=800/3500
+#          detailed=1000/5000 | unlimited=1000/unlimited
+#
+# POWER:   performance=444 MHz | battery=adaptive clock
+#
+# ============================================================================
+#   RESET
+# ============================================================================
+#
+#   Set profile = performance. Both Custom blocks are then ignored.
+#
+# ============================================================================

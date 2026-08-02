@@ -101,7 +101,7 @@ void telemetry_stamp(const char *line) {
     }
 }
 
-void telemetry_log(const char *tag, const char *fmt, ...) {
+void telemetry_log_impl(const char *tag, const char *fmt, ...) {
 #ifndef DEBUG_SOLOADER
     /* Production: telemetry logging (the [WATCH] watchdog to loader.log) fully OFF
      * — no sceIoOpen/Write per tick. Compiled out with ENABLE_TELEMETRY_LOGGING=OFF. */

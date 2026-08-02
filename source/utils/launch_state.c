@@ -20,7 +20,7 @@ static atomic_ullong g_last_poll_ms = ATOMIC_VAR_INIT(0);
 static atomic_uint g_progress_count = ATOMIC_VAR_INIT(0);
 static atomic_ullong g_last_progress_ms = ATOMIC_VAR_INIT(0);
 static atomic_uint g_present_count = ATOMIC_VAR_INIT(0);
-static atomic_ullong g_last_present_ms = ATOMIC_VAR_INIT(0);
+static atomic_ullong g_last_present_us = ATOMIC_VAR_INIT(0);
 static atomic_int g_scene_active = ATOMIC_VAR_INIT(0);
 static atomic_ullong g_stage_enter_ms = ATOMIC_VAR_INIT(0);
 static atomic_ullong g_start_ms = ATOMIC_VAR_INIT(0);
@@ -124,6 +124,14 @@ uint64_t launch_state_uptime_ms(void) {
 }
 
 void launch_state_mark_poll(void) {
+#ifndef DEBUG_SOLOADER
+    /* After the first successful present the watchdog never consults the poll
+     * heartbeat (`frames == 0` is required by that branch). Avoid up to three
+     * kernel-time queries plus atomic writes per rendered frame thereafter. */
+    if (atomic_load_explicit(&g_present_count, memory_order_relaxed) != 0) {
+        return;
+    }
+#endif
     atomic_store_explicit(&g_last_poll_ms, now_ms(), memory_order_relaxed);
     atomic_fetch_add_explicit(&g_poll_count, 1, memory_order_relaxed);
 }
@@ -143,6 +151,13 @@ uint64_t launch_state_last_poll_age_ms(void) {
 }
 
 void launch_state_mark_progress(void) {
+#ifndef DEBUG_SOLOADER
+    /* Like poll heartbeat, progress is only used to classify the pre-first-frame
+     * load. Once frames != 0, the watchdog's progress branch is unreachable. */
+    if (atomic_load_explicit(&g_present_count, memory_order_relaxed) != 0) {
+        return;
+    }
+#endif
     atomic_store_explicit(&g_last_progress_ms, now_ms(), memory_order_relaxed);
     atomic_fetch_add_explicit(&g_progress_count, 1, memory_order_relaxed);
 }
@@ -161,9 +176,14 @@ uint64_t launch_state_last_progress_age_ms(void) {
     return now < last_progress_ms ? 0 : (now - last_progress_ms);
 }
 
-void launch_state_mark_present(void) {
-    atomic_store_explicit(&g_last_present_ms, now_ms(), memory_order_relaxed);
-    atomic_fetch_add_explicit(&g_present_count, 1, memory_order_relaxed);
+void launch_state_mark_present_at_us(uint64_t present_us) {
+    /* gl_swap already sampled microseconds. Store them directly so the present path
+     * avoids a 64-bit division helper every frame; the watchdog converts on read. */
+    atomic_store_explicit(&g_last_present_us, present_us, memory_order_relaxed);
+    /* Single writer (gl_swap): relaxed fetch_add's LDREX/STREX loop buys nothing. */
+    atomic_store_explicit(&g_present_count,
+                          atomic_load_explicit(&g_present_count, memory_order_relaxed) + 1u,
+                          memory_order_relaxed);
 }
 
 uint32_t launch_state_get_present_count(void) {
@@ -171,15 +191,16 @@ uint32_t launch_state_get_present_count(void) {
 }
 
 uint64_t launch_state_last_present_age_ms(void) {
-    const uint64_t last_present_ms = atomic_load_explicit(&g_last_present_ms, memory_order_relaxed);
-    if (last_present_ms == 0) {
+    const uint64_t last_present_us = atomic_load_explicit(&g_last_present_us, memory_order_relaxed);
+    if (last_present_us == 0) {
         return UINT64_MAX;
     }
 
-    const uint64_t now = now_ms();
-    return now < last_present_ms ? 0 : (now - last_present_ms);
+    const uint64_t now_us = sceKernelGetSystemTimeWide();
+    return now_us < last_present_us ? 0 : ((now_us - last_present_us) / 1000ULL);
 }
 
+#ifdef DEBUG_SOLOADER
 void launch_state_mark_gl_phase(int phase) {
     atomic_store_explicit(&g_gl_phase, phase, memory_order_relaxed);
     atomic_store_explicit(&g_gl_phase_tid, (unsigned)sceKernelGetThreadId(), memory_order_relaxed);
@@ -187,7 +208,6 @@ void launch_state_mark_gl_phase(int phase) {
 }
 
 void launch_state_mark_draw(unsigned mode, int count, unsigned type, int program) {
-#ifdef DEBUG_SOLOADER
     /* ☠ DESCRIPTIVE FIELDS ONLY EXIST WHERE THEY CAN BE READ. These four are stored on
      * EVERY draw -- ~890 a frame, ~53,000 a second -- and their only consumer is the
      * `lastdraw[...]` field of launch_state_snapshot(), which the watchdog emits once
@@ -204,9 +224,6 @@ void launch_state_mark_draw(unsigned mode, int count, unsigned type, int program
     atomic_store_explicit(&g_draw_count, count, memory_order_relaxed);
     atomic_store_explicit(&g_draw_type, type, memory_order_relaxed);
     atomic_store_explicit(&g_draw_prog, program, memory_order_relaxed);
-#else
-    (void)mode; (void)count; (void)type; (void)program;
-#endif
     /* Plain load+store, NOT atomic_fetch_add. On Cortex-A9 a relaxed fetch_add still
      * compiles to an LDREX/STREX retry loop that takes the exclusive monitor, and this
      * runs on EVERY draw -- ~890 times a frame at the measured heavy-scene load. The
@@ -225,6 +242,7 @@ void launch_state_mark_draw(unsigned mode, int count, unsigned type, int program
      * stale phase_ms + a stalled serial. Drops sceKernelGetSystemTimeWide +
      * sceKernelGetThreadId from EVERY draw (~900/frame). */
 }
+#endif /* DEBUG_SOLOADER */
 
 void launch_state_mark_scene_active(void) {
     atomic_store_explicit(&g_scene_active, 1, memory_order_relaxed);

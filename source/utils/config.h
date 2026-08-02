@@ -163,6 +163,29 @@ typedef struct {
                                * in-place writes could tear geometry; that needs
                                * a device to judge. See so_patch() for the full
                                * chain and PERF_FINDINGS_2026-07-30.md.        */
+    int  anim_engine_flags;   /* 1 = override GameEngine's own animation-correctness
+                               * flags (SetFixRecursiveAnimationContribution and the
+                               * non-skeleton chore filter). 0 = LEAVE THE ENGINE ALONE,
+                               * the default.
+                               * ☠ Forcing these caused character heads to detach from
+                               * bodies intermittently: recursive bone contribution is
+                               * how a head inherits its neck, and the loader was
+                               * stomping that global from another thread while the
+                               * engine's animation update read it. Never measured to
+                               * help. Kept only so the experiment is repeatable.   */
+    int  nearest_filter;      /* 1 = sample the COMPRESSED world atlas with GL_NEAREST.
+                               * Minecraft tile art bilinearly interpolated across atlas
+                               * edges shows bright/white seams between blocks (a BASE
+                               * level bleed, so turning mipmaps off cannot fix it). UI
+                               * and 2D stay LINEAR so fonts remain smooth. 0 = engine
+                               * default. Was a stray nearest_filter.txt.               */
+    int  fbfetch_zero;        /* framebuffer-fetch stub value. vitaGL has no
+                               * gl_LastFragData, so it is replaced by a constant: 1 =
+                               * vec4(0.0) (identity for ADDITIVE light accumulation),
+                               * 0 = vec4(1.0) (identity for MODULATE). The wrong one
+                               * turns whole surfaces solid white -- glass and other
+                               * blended surfaces are exactly where this shows. Was a
+                               * stray fbfetch_zero.txt.                                */
     /* system */
     int  clock_adaptive;      /* 0 = ARM pinned, 1 = adaptive floor (battery)    */
     int  clock_mhz;           /* ARM target MHz. 444 = stock max. Higher only has

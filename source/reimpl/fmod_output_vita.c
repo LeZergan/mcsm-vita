@@ -151,8 +151,17 @@ static int drain_thread(SceSize args, void *argp) {
         int pulled = 0;
         if (st->readfrommixer) {
             int rrc = st->readfrommixer(st, g_out.ring, chunk);
-            if (rrc == FMOD_OK_T) { g_out.n_read++; pulled = 1; }
-            else { g_out.n_readfail++; if (g_out.n_readfail <= 3u) l_warn("FMODOUT: readfrommixer rc=%d", rrc); }
+            if (rrc == FMOD_OK_T) {
+#ifdef DEBUG_SOLOADER
+                g_out.n_read++;
+#endif
+                pulled = 1;
+            } else {
+#ifdef DEBUG_SOLOADER
+                g_out.n_readfail++;
+                if (g_out.n_readfail <= 3u) l_warn("FMODOUT: readfrommixer rc=%d", rrc);
+#endif
+            }
         }
         /* Clearing in_mixer is what makes close()'s drain wait mean anything. A
          * previous edit left a second sceKernelUnlockMutex here instead -- an
@@ -161,11 +170,13 @@ static int drain_thread(SceSize args, void *argp) {
          * wait always burned its full 400ms and proved nothing. */
         g_out.in_mixer = 0;
         if (!pulled) { sceKernelDelayThread(2000); continue; }
+#ifdef DEBUG_SOLOADER
         /* Is the mixer actually giving us signal, or are we faithfully playing
-         * silence? Cheap sample of the grain we are about to hand to hardware. */
+         * silence? Diagnostic sampling is not part of the production mix path. */
         for (unsigned q = 0; q < chunk * (unsigned)g_out.channels; q += 64) {
             if (src[q]) { g_out.nz_frames++; break; }
         }
+#endif
         /* MASTER GAIN. The deleted OpenSL path fed sceAudioOut through
          * audio_output_i16_frames(), which applies audio_gain_q8() -- a 1.25x
          * default plus a 50-200%% override from audio_gain.txt. Writing the ring
@@ -186,9 +197,14 @@ static int drain_thread(SceSize args, void *argp) {
             }
         }
         int rc = sceAudioOutOutput(g_out.port, (void *)src);
+#ifdef DEBUG_SOLOADER
         g_out.last_out_rc = rc;
-        if (rc < 0) { g_out.n_outfail++; sceKernelDelayThread(2000); continue; }
+        if (rc < 0) g_out.n_outfail++;
+#endif
+        if (rc < 0) { sceKernelDelayThread(2000); continue; }
+#ifdef DEBUG_SOLOADER
         g_out.n_out++;
+#endif
         g_out.play_cursor += chunk;
     }
     g_out.thread_exited = 1;
@@ -418,7 +434,9 @@ static FMOD_RESULT_T out_close(FMOD_OUTPUT_STATE_T *s) {
  * from its own write cursor to decide how much it may safely produce. */
 static FMOD_RESULT_T out_getposition(FMOD_OUTPUT_STATE_T *s, unsigned int *pcm) {
     (void)s;
+#ifdef DEBUG_SOLOADER
     g_out.n_getpos++;
+#endif
     if (pcm) *pcm = g_out.frames ? (g_out.play_cursor % g_out.frames) : 0u;
     return FMOD_OK_T;
 }
@@ -427,7 +445,9 @@ static FMOD_RESULT_T out_lock(FMOD_OUTPUT_STATE_T *s, unsigned int offset, unsig
                               void **ptr1, void **ptr2, unsigned int *len1, unsigned int *len2) {
     (void)s;
     if (!g_out.ring || !g_out.frames) return FMOD_ERR_INTERNAL_T;
+#ifdef DEBUG_SOLOADER
     g_out.n_lock++;
+#endif
     offset %= g_out.frames;
     if (length > g_out.frames) length = g_out.frames;
     unsigned first = length;
@@ -444,17 +464,25 @@ static FMOD_RESULT_T out_lock(FMOD_OUTPUT_STATE_T *s, unsigned int offset, unsig
  * memory the mixer filled. */
 static FMOD_RESULT_T out_unlock(FMOD_OUTPUT_STATE_T *s, void *p1, void *p2, unsigned int l1, unsigned int l2) {
     (void)s; (void)p1; (void)p2;
+#ifdef DEBUG_SOLOADER
     g_out.n_unlock++;
     if (g_out.n_unlock <= 4u) l_info("FMODOUT: unlock #%u len1=%u len2=%u", g_out.n_unlock, l1, l2);
+#else
+    (void)l1; (void)l2;
+#endif
     return FMOD_OK_T;
 }
 
 void mcsm_fmod_output_report(void) {
+#ifndef DEBUG_SOLOADER
+    return;
+#else
     if (!g_out.ring && !g_out.n_read) return;   /* never initialised at all */
     l_info("FMODOUT: read=%u readfail=%u out=%u outfail=%u rc=0x%08X nonsilent=%u | lock=%u unlock=%u getpos=%u started=%d",
            g_out.n_read, g_out.n_readfail, g_out.n_out, g_out.n_outfail,
            (unsigned)g_out.last_out_rc, g_out.nz_frames,
            g_out.n_lock, g_out.n_unlock, g_out.n_getpos, g_out.started);
+#endif
 }
 
 static FMOD_OUTPUT_DESCRIPTION_T g_desc = {

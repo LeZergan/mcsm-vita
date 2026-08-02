@@ -8,9 +8,11 @@
 # ============================================================================
 
 # --- Build artifacts / output ---
-build/
-build_local/
-build_archive/
+# Glob, not a fixed list: ad-hoc build dirs (build_notrophy/, build_rel_nolog/,
+# build_v_logging/, ...) get created constantly while A/B-ing configurations, and an
+# exact-match list silently fails to cover the next one -- which then shows up as
+# untracked and rides along with a `git add -A`.
+build*/
 cmake-build-*/
 vpk/
 logs/
@@ -25,6 +27,7 @@ eboot.bin.out
 prepared_data/
 apk/
 apk_assets/
+*.apk
 *.obb
 # game native libs extracted from the APK
 libGameEngine.so
@@ -72,8 +75,18 @@ scratchpad_*.md
 CHANGES_*.md
 MEGAPASS_*.md
 PERF_FINDINGS_*.md
-tools/vita-parse-core/
+# tools/ was deliberately removed from the published repo (local helpers: trophy-pack
+# builder, TRP reader/writer, data-prep script). The files still live on disk because
+# they are needed to rebuild a trophy pack -- keep them OUT of git.
+tools/
 docs/AI_PORTING_GUIDE.md
 CODEX_HANDOFF.md
 ai_build_vpk.ps1
 tools/maintenance_legacy/
+
+# --- Data Builder local output (publish as a release artifact, not source) ---
+data-builder/bin/
+data-builder/obj/
+data-builder/dist/
+data-builder/tests/bin/
+data-builder/tests/obj/

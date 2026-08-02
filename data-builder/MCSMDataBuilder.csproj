@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AssemblyName>MCSM-Vita-Data-Builder</AssemblyName>
+    <RootNamespace>McsmVitaDataBuilder</RootNamespace>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
+    <DebugType>embedded</DebugType>
+    <DebugSymbols>false</DebugSymbols>
+    <Version>1.0.0</Version>
+    <Authors>MCSM Vita contributors</Authors>
+    <Description>Builds a ready-to-copy MCSM PS Vita data folder from user-owned Android files.</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="Defaults\*.txt" />
+    <Compile Remove="tests\**\*.cs" />
+  </ItemGroup>
+</Project>

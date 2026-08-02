@@ -599,16 +599,20 @@ int32_t eglSwapInterval(void *display, int32_t interval) {
 }
 
 int32_t eglSwapBuffers(void *display, void *surface) {
+#ifdef DEBUG_SOLOADER
     static unsigned int s_swap_counter = 0;
+#endif
     (void)display;
     (void)surface;
 
     gl_swap();
 
+#ifdef DEBUG_SOLOADER
     s_swap_counter++;
     if (s_swap_counter <= 8 || (s_swap_counter & 0x7fU) == 0U) {
         l_info("eglSwapBuffers count=%u", s_swap_counter);
     }
+#endif
 
     set_egl_last_error(EGL_SUCCESS);
     return EGL_TRUE;

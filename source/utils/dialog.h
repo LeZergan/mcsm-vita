@@ -25,12 +25,13 @@ char *get_ime_dialog_result(void);
 
 /* Save-rename keyboard: non-blocking IME driven from gl_swap (see dialog.c). */
 void mcsm_ime_begin(const char *initial);
+void mcsm_ime_begin_titled(const char *title, const char *initial);
 int mcsm_ime_is_active(void);
 int mcsm_ime_poll(char **out);
 
 /* Engine virtual-keyboard bridge (drives the SAME Vita IME, but captures the result
  * for TTPlatform::GetVirtualKeyboardResult instead of injecting keys). */
-void mcsm_ime_begin_vkbd(const char *initial);
+void mcsm_ime_begin_vkbd(const char *title, const char *initial);
 int mcsm_vkbd_finished(void);
 const char *mcsm_vkbd_result(int *cancelled);
 void mcsm_vkbd_reset(void);

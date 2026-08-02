@@ -33,6 +33,7 @@
 #include <psp2/kernel/processmgr.h>   /* sceKernelPowerTick — keep the Vita awake while the game runs */
 #include <psp2/io/stat.h>
 #include <psp2/io/fcntl.h>
+#include <psp2/display.h>            /* sceDisplayWaitVblankStartMulti — exact frame pacing */
 
 // Helpers for our handling of shaders
 GLboolean skip_next_compile = GL_FALSE;
@@ -108,11 +109,13 @@ enum {
 
 typedef struct shader_diag_entry {
     GLuint shader;
+#ifdef DEBUG_SOLOADER
     uint32_t flags;
     char stage[8];
     char sha1[48];
     char source_path[256];
     char preview[224];
+#endif
     char *owned_source;
     size_t owned_source_len;
 } shader_diag_entry;
@@ -161,6 +164,15 @@ static GLuint g_uniform_current_program = 0;
  *   - some (texlru_is_live, the 565/4444/zero-fill converters) are reachable only on
  *     the PVR backend, i.e. gated on USE_PVR_PSP2, not on this flag at all. */
 #define MCSM_DIAG_HELPER __attribute__((unused))
+
+/* A static diagnostic counter is still an observable write even when every log
+ * consuming it compiles out. Keep real counts in logging/profiling builds, but
+ * make them compile-time constants in the shipping fast path. */
+#if defined(DEBUG_SOLOADER) || !MCSM_FAST_FINAL_RUNTIME
+#define MCSM_DIAG_COUNT(name) static unsigned int name = 0; name++
+#else
+#define MCSM_DIAG_COUNT(name) enum { name = 0 }
+#endif
 
 #ifndef GL_ALREADY_SIGNALED
 #define GL_ALREADY_SIGNALED 0x911A
@@ -284,6 +296,7 @@ static shader_diag_entry *get_shader_diag_entry(GLuint shader, int create) {
     return free_slot;
 }
 
+#ifdef DEBUG_SOLOADER
 static uint32_t analyze_shader_source_flags(const char *source) {
     uint32_t flags = 0;
 
@@ -368,6 +381,7 @@ static void build_shader_preview(const char *source, char *dst, size_t dst_size)
     }
     dst[out] = '\0';
 }
+#endif
 
 static size_t get_shader_source_part_length(const GLchar *part, const GLint *_length, int index) {
     if (!part) {
@@ -394,6 +408,7 @@ static size_t get_shader_source_part_length(const GLchar *part, const GLint *_le
     return nul ? (size_t)((const char *)nul - part) : claimed;
 }
 
+#ifdef DEBUG_SOLOADER
 static int shader_file_diag_enabled(void) {
     static int initialized = 0;
     static int enabled = 0;
@@ -403,7 +418,9 @@ static int shader_file_diag_enabled(void) {
     }
     return enabled;
 }
+#endif
 
+#ifdef DEBUG_SOLOADER
 static int gl_verbose_diag_enabled(void) {
     static int initialized = 0;
     static int enabled = 0;
@@ -413,10 +430,15 @@ static int gl_verbose_diag_enabled(void) {
     }
     return enabled;
 }
+#else
+#define gl_verbose_diag_enabled() 0
+#endif
 
 static void track_shader_source(GLuint shader, const char *source, size_t length) {
     shader_diag_entry *entry;
+#ifdef DEBUG_SOLOADER
     char *sha1 = NULL;
+#endif
 
     if (!source || length == 0) {
         return;
@@ -461,6 +483,7 @@ static void track_shader_source(GLuint shader, const char *source, size_t length
         entry->owned_source_len = length;
     }
 
+#ifdef DEBUG_SOLOADER
     entry->flags = analyze_shader_source_flags(source);
     build_shader_preview(source, entry->preview, sizeof(entry->preview));
 
@@ -483,8 +506,10 @@ static void track_shader_source(GLuint shader, const char *source, size_t length
         entry->sha1[0] = '\0';
         entry->source_path[0] = '\0';
     }
+#endif
 }
 
+#ifdef DEBUG_SOLOADER
 static void log_shader_diag_context(GLuint shader, GLenum shader_type) {
     shader_diag_entry *entry = get_shader_diag_entry(shader, 0);
 
@@ -520,6 +545,7 @@ static void log_shader_diag_context(GLuint shader, GLenum shader_type) {
         l_error("glCompileShader(%u) preview: %s", shader, entry->preview);
     }
 }
+#endif
 
 static void log_relevant_extension_support(const char *extensions) {
     l_info("GL extensions: OES_mapbuffer=%d EXT_map_buffer_range=%d OES_depth_texture=%d OES_packed_depth_stencil=%d",
@@ -579,13 +605,16 @@ static void log_shader_compile_failure(GLuint shader) {
             shader,
             (unsigned)shader_type,
             (out_len > 0 && log_buf[0] != '\0') ? log_buf : "(no info log)");
+#ifdef DEBUG_SOLOADER
     log_shader_diag_context(shader, (GLenum)shader_type);
+#endif
 
     if (log_buf != stack_log) {
         free(log_buf);
     }
 }
 
+#ifdef DEBUG_SOLOADER
 static void log_shader_compile_runtime_state(GLuint shader, const char *phase, GLenum err_code) {
     EGLDisplay dpy = NULL;
     EGLContext ctx = NULL;
@@ -619,6 +648,7 @@ static void log_shader_compile_runtime_state(GLuint shader, const char *phase, G
            read,
            (unsigned)err_code);
 }
+#endif
 
 static void log_program_link_failure(GLuint program) {
     GLint status = GL_TRUE;
@@ -787,6 +817,19 @@ static int parse_telltale_register_name(const char *name, int *bank_out, int *in
     return 1;
 }
 
+/* Drop every memoised uniform-array split for `program`.
+ *
+ * ☠ THE MEMO MUST DIE WITH THE LAYOUT IT DESCRIBES. g_uniform_split_memo caches
+ * per-element uniform LOCATIONS keyed on (program, location, count), and a relink can
+ * assign completely different locations to the same names. program_cache_refresh() is
+ * the single point where a program's uniform layout is (re)established -- it is called
+ * from both arms of glLinkProgram_soloader, including the progcache-hit path -- so any
+ * cache derived from that layout has to be invalidated here or it silently outlives it.
+ * Without this the memo keeps answering with the PREVIOUS link's locations after a
+ * relink (or after a deleted program's GLuint is recycled by a new one), writing
+ * uniforms to the wrong slots: wrong-looking shading, no error, nothing logged. */
+static void uniform_split_memo_forget(GLuint program);
+
 static void program_cache_refresh(GLuint program) {
     GLint link_status = GL_FALSE;
     GLint active_uniforms = 0;
@@ -796,6 +839,9 @@ static void program_cache_refresh(GLuint program) {
     GLsizei out_len = 0;
     GLint size = 0;
     GLenum type = 0;
+
+    /* Invalidate BEFORE repopulating: the memo describes the OLD layout. */
+    uniform_split_memo_forget(program);
 
     program_uniform_cache *cache = program_cache_get(program, 1);
     if (!cache) {
@@ -840,6 +886,7 @@ static void program_cache_refresh(GLuint program) {
     }
 
     cache->valid = 1;
+#ifdef DEBUG_SOLOADER
     static unsigned s_logged = 0;
     if (s_logged++ < 64U || program == 19U) {
         l_info("glLinkProgram(%u): cached %d active uniforms (reported=%d maxName=%d)",
@@ -848,14 +895,17 @@ static void program_cache_refresh(GLuint program) {
                active_uniforms,
                max_name_len);
     }
+#endif
 }
 
 GLint glGetUniformLocation_soloader(GLuint program, const GLchar *name) {
     if (!name) {
+#ifdef DEBUG_SOLOADER
         static unsigned s_null_logged = 0;
         if (s_null_logged++ < 8U) {
             l_warn("glGetUniformLocation(%u, NULL) skipped", program);
         }
+#endif
         return -1;
     }
 
@@ -866,6 +916,87 @@ GLint glGetUniformLocation_soloader(GLuint program, const GLchar *name) {
         program_cache_add_uniform(program, norm_name, location);
     }
     return location;
+}
+
+typedef struct UniformSplitMemo {
+    GLuint prog;
+    GLint loc;
+    GLsizei cnt;
+    signed char state; /* 0 empty, 1 split, 2 no-split */
+    unsigned used;
+    GLint el[64];
+} UniformSplitMemo;
+
+static UniformSplitMemo g_uniform_split_memo[256];
+static unsigned g_uniform_split_clock = 0;
+static unsigned g_uniform_split_index[1024];
+
+/* See the note on program_cache_refresh(). Linear over 256 slots, but this runs only
+ * on a link -- a handful of times per boot -- never on the per-draw path. The direct-
+ * mapped index is cleared alongside, or a stale slot number could still be reached
+ * through it after the slot is reused for a different program. */
+static void uniform_split_memo_forget(GLuint program) {
+    for (unsigned i = 0; i < sizeof(g_uniform_split_memo) / sizeof(g_uniform_split_memo[0]); i++) {
+        if (g_uniform_split_memo[i].state && g_uniform_split_memo[i].prog == program) {
+            g_uniform_split_memo[i].state = 0;
+            g_uniform_split_memo[i].prog = 0;
+            g_uniform_split_memo[i].loc = -1;
+            g_uniform_split_memo[i].cnt = 0;
+        }
+    }
+    for (unsigned h = 0; h < sizeof(g_uniform_split_index) / sizeof(g_uniform_split_index[0]); h++) {
+        const unsigned slot1 = g_uniform_split_index[h];
+        if (slot1 && !g_uniform_split_memo[slot1 - 1].state) {
+            g_uniform_split_index[h] = 0;
+        }
+    }
+}
+
+/* Keep the large name/location scratch arrays off the ~860-call/frame cached-hit
+ * path. GCC otherwise gives every hit a ~380-byte stack frame and a wide register
+ * save merely because the first-encounter resolver lives in the same function. */
+__attribute__((noinline))
+static int gl_uniform4fv_split_resolve(GLuint program, GLint location, GLsizei count,
+                                       const GLfloat *value, unsigned hkey, int empty) {
+    const char *base_name = program_cache_name_for_location(program, location);
+    int bank = 0, base_index = 0;
+    GLint element_locations[64];
+    int splittable = parse_telltale_register_name(base_name, &bank, &base_index);
+    for (GLsizei i = 0; splittable && i < count; ++i) {
+        char element_name[PROGRAM_UNIFORM_NAME_CAP];
+        snprintf(element_name, sizeof(element_name), "U%d_%d", bank, base_index + (int)i);
+        GLint el = program_cache_location_for_name(program, element_name);
+        if (el < 0) { splittable = 0; break; }
+        element_locations[i] = el;
+    }
+
+    int slot = empty;
+    if (slot < 0) {                                          /* full -> evict LRU */
+        unsigned oldest = UINT_MAX;
+        slot = 0;
+        for (int i = 0; i < 256; ++i) {
+            if (g_uniform_split_memo[i].used < oldest) {
+                oldest = g_uniform_split_memo[i].used;
+                slot = i;
+            }
+        }
+    }
+    g_uniform_split_memo[slot].prog = program;
+    g_uniform_split_memo[slot].loc = location;
+    g_uniform_split_memo[slot].cnt = count;
+    g_uniform_split_memo[slot].used = ++g_uniform_split_clock;
+    g_uniform_split_index[hkey] = (unsigned)(slot + 1);
+    if (splittable) {
+        g_uniform_split_memo[slot].state = 1;
+        for (GLsizei i = 0; i < count; ++i) {
+            g_uniform_split_memo[slot].el[i] = element_locations[i];
+        }
+        for (GLsizei i = 0; i < count; ++i)
+            glUniform4fv(element_locations[i], 1, value + ((size_t)i * 4U));
+        return 1;
+    }
+    g_uniform_split_memo[slot].state = 2;
+    return 0;
 }
 
 static int gl_uniform4fv_split_telltale(GLint location, GLsizei count, const GLfloat *value) {
@@ -886,80 +1017,51 @@ static int gl_uniform4fv_split_telltale(GLint location, GLsizei count, const GLf
     }
 
     /* MEMOIZE (2026-07-17): the split verdict + resolved element locations are stable
-     * per (program, base location, count). Resolving them every call ran snprintf +
-     * failing GXM param scans ~860x per heavy frame (log: prog=1 U2_0 count=3 fell
-     * back to plain glUniform4fv EVERY frame, re-searching each time). Cache the
-     * verdict: SPLIT replays cached locations, NO_SPLIT returns 0 immediately, both
-     * with zero snprintf/lookup. 256-entry LRU keyed by (program, location, count). */
-    /* Capacity 256 (was 64): a full-game playthrough uses more than 64 distinct
-     * (prog,loc,count) split keys; at 64 the LRU thrashed — evicting live entries
-     * forced per-call re-resolve (snprintf + GXM param scans) on the ~860-call/frame
-     * hot path. 256 covers the live key set so steady state is pure cached replay.
-     * el[64] stays (count is capped at 64 by the guard above). ~70KB extra BSS. */
-    static struct split_memo {
-        GLuint prog; GLint loc; GLsizei cnt; signed char state; /* 0 empty, 1 split, 2 no-split */
-        unsigned used; GLint el[64];
-    } s_memo[256];
-    static unsigned s_memo_clock = 0;
-    /* Direct-mapped hash index over (prog,loc,cnt) -> slot+1 (0 = empty), turning
-     * the ~860-calls/heavy-frame lookup from an O(256) scan into ~O(1). The linear
-     * scan stays as the exact-correct fallback, and the FULL key is always
-     * re-checked before accepting a candidate, so a hash collision can never
-     * return a wrong entry — it just falls back to the scan. */
-    static unsigned s_index[1024];
-    unsigned hkey = (((unsigned)program * 2654435761u) ^
-                     ((unsigned)location * 40503u) ^ ((unsigned)count * 2246822519u)) & 1023u;
-    int hit = -1, empty = -1;
-    { int cand = (int)s_index[hkey] - 1;
-      if (cand >= 0 && s_memo[cand].state && s_memo[cand].prog == program &&
-          s_memo[cand].loc == location && s_memo[cand].cnt == count) hit = cand; }
+     * per (program, base location, count). Capacity 256 covers the measured full-game
+     * key set; a 1024-slot direct index makes steady-state lookup approximately O(1),
+     * with a full-key-checked linear fallback so collisions cannot return bad state. */
+    const unsigned hkey = (((unsigned)program * 2654435761u) ^
+                           ((unsigned)location * 40503u) ^
+                           ((unsigned)count * 2246822519u)) & 1023u;
+    int hit = -1;
+    int empty = -1;
+    {
+        const int cand = (int)g_uniform_split_index[hkey] - 1;
+        if (cand >= 0 && g_uniform_split_memo[cand].state &&
+            g_uniform_split_memo[cand].prog == program &&
+            g_uniform_split_memo[cand].loc == location &&
+            g_uniform_split_memo[cand].cnt == count) {
+            hit = cand;
+        }
+    }
     if (hit < 0) {
         for (int i = 0; i < 256; ++i) {
-            if (s_memo[i].state && s_memo[i].prog == program &&
-                s_memo[i].loc == location && s_memo[i].cnt == count) { hit = i; break; }
-            if (!s_memo[i].state && empty < 0) empty = i;
+            if (g_uniform_split_memo[i].state &&
+                g_uniform_split_memo[i].prog == program &&
+                g_uniform_split_memo[i].loc == location &&
+                g_uniform_split_memo[i].cnt == count) {
+                hit = i;
+                break;
+            }
+            if (!g_uniform_split_memo[i].state && empty < 0) {
+                empty = i;
+            }
         }
     }
     if (hit >= 0) {
-        s_index[hkey] = (unsigned)(hit + 1);
-        s_memo[hit].used = ++s_memo_clock;
-        if (s_memo[hit].state == 2) return 0;               /* cached NO_SPLIT */
-        for (GLsizei i = 0; i < count; ++i)
-            glUniform4fv(s_memo[hit].el[i], 1, value + ((size_t)i * 4U));
-        return 1;                                            /* cached SPLIT */
-    }
-
-    /* First encounter: resolve once, then cache the verdict. */
-    const char *base_name = program_cache_name_for_location(program, location);
-    int bank = 0, base_index = 0;
-    GLint element_locations[64];
-    int splittable = parse_telltale_register_name(base_name, &bank, &base_index);
-    for (GLsizei i = 0; splittable && i < count; ++i) {
-        char element_name[PROGRAM_UNIFORM_NAME_CAP];
-        snprintf(element_name, sizeof(element_name), "U%d_%d", bank, base_index + (int)i);
-        GLint el = program_cache_location_for_name(program, element_name);
-        if (el < 0) { splittable = 0; break; }
-        element_locations[i] = el;
-    }
-
-    int slot = empty;
-    if (slot < 0) {                                          /* full -> evict LRU */
-        unsigned oldest = UINT_MAX;
-        slot = 0;
-        for (int i = 0; i < 256; ++i) if (s_memo[i].used < oldest) { oldest = s_memo[i].used; slot = i; }
-    }
-    s_memo[slot].prog = program; s_memo[slot].loc = location; s_memo[slot].cnt = count;
-    s_memo[slot].used = ++s_memo_clock;
-    s_index[hkey] = (unsigned)(slot + 1);
-    if (splittable) {
-        s_memo[slot].state = 1;
-        for (GLsizei i = 0; i < count; ++i) s_memo[slot].el[i] = element_locations[i];
-        for (GLsizei i = 0; i < count; ++i)
-            glUniform4fv(element_locations[i], 1, value + ((size_t)i * 4U));
+        g_uniform_split_index[hkey] = (unsigned)(hit + 1);
+        g_uniform_split_memo[hit].used = ++g_uniform_split_clock;
+        if (g_uniform_split_memo[hit].state == 2) {
+            return 0;
+        }
+        for (GLsizei i = 0; i < count; ++i) {
+            glUniform4fv(g_uniform_split_memo[hit].el[i], 1,
+                         value + ((size_t)i * 4U));
+        }
         return 1;
     }
-    s_memo[slot].state = 2;
-    return 0;
+
+    return gl_uniform4fv_split_resolve(program, location, count, value, hkey, empty);
 }
 
 static int resolve_tex_storage_format(GLenum internalformat, GLenum *format_out, GLenum *type_out) {
@@ -1015,9 +1117,11 @@ static int resolve_tex_storage_format(GLenum internalformat, GLenum *format_out,
     return 1;
 }
 
-/* Per-frame draw stats for dip profiling; reset each gl_swap (see DIP-RENDER). */
+/* Per-frame draw stats exist only in builds that can emit DIP-RENDER. */
+#ifdef DEBUG_SOLOADER
 unsigned int g_frame_draw_calls = 0;
 unsigned long g_frame_draw_verts = 0;
+#endif
 
 #ifndef USE_PVR_PSP2
 void gl_preload() {
@@ -1060,6 +1164,7 @@ static GLboolean g_rs_active = GL_FALSE;
 static GLuint g_rs_fbo = 0, g_rs_color = 0, g_rs_depth = 0;
 static int g_rs_w = 0, g_rs_h = 0;
 static GLint g_rs_blit_filter = GL_LINEAR;   /* graphics.txt `upscale` */
+static int g_rs_blit_flip = 0;               /* immutable after config load */
 
 
 static void rs_init(int w, int h) {
@@ -1068,7 +1173,9 @@ static void rs_init(int w, int h) {
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
     /* graphics.txt `upscale`. Applied to the FBO texture AND the blit below so both
      * sampling points agree. NEAREST keeps glyph edges hard; LINEAR smears them. */
-    g_rs_blit_filter = mcsm_cfg()->upscale_nearest ? GL_NEAREST : GL_LINEAR;
+    const McsmCfg *cfg = mcsm_cfg();
+    g_rs_blit_filter = cfg->upscale_nearest ? GL_NEAREST : GL_LINEAR;
+    g_rs_blit_flip = cfg->blit_flip;
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, g_rs_blit_filter);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, g_rs_blit_filter);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
@@ -1118,6 +1225,22 @@ void glScissor_soloader(GLint x, GLint y, GLsizei width, GLsizei height) {
  * context), used by gl_swap. 0 = no lock. (Reading the file in gl_swap's hot
  * render path crashed boot — fopen there races the engine/loader I/O.) */
 static int g_present_period_us = 0;   /* whole-microsecond part of the present period */
+/* ★ Whole vblanks per presented frame, or 0 if the cap is genuinely fractional.
+ *
+ * ☠ THIS IS *NOT* DERIVABLE FROM THE MICROSECOND REMAINDER, and assuming it was is
+ * what broke 30fps. The old test asked `1000000 % fps`, i.e. "is the period a whole
+ * number of MICROSECONDS" -- a completely different question. It gets the answer wrong
+ * in BOTH directions:
+ *     fps 30: 1e6%30=10 -> "fractional"  but 33333us IS exactly 2 vblanks
+ *     fps 15: 1e6%15=10 -> "fractional"  but            4 vblanks
+ *     fps 60: 1e6%60=40 -> "fractional"  but            1 vblank
+ *     fps 40: 1e6%40=0  -> "WHOLE"       but 25000us is 1.5 vblanks -- not whole at all
+ * So every shipped profile (all capped at 30) took the fractional microsecond-timeline
+ * path and never used vblank counting, which is exactly the sleep-based guessing the
+ * counter exists to replace. Device histogram with that bug live:
+ *     vblanks 1:114 2:306 3:142 4:34   <- frames landing on one, two, three and four
+ * The right question is whether the DISPLAY can express the rate: 60 % fps == 0. */
+static int g_present_vb_whole = 0;
 static int g_present_period_rem = 0;  /* numerator of the leftover fraction (rem/den us) */
 static int g_present_period_den = 0;  /* denominator; 0 = no fractional part */
 
@@ -1208,41 +1331,11 @@ void gl_init() {
     vglSetupGarbageCollector(160, gc_mask);
     l_info("gl_init: cached-mem + GC affinity=0x%05X (%s)", (unsigned)gc_mask,
            (gc_mask & 0x00080000) ? "core3 via capUnlocker" : "user cores (no capUnlocker)");
-    /* ★ SCRATCH / CIRCULAR VERTEX POOL (megapass 2026-07-30) — the single biggest
-     * per-draw win found in this pass, and it needed a vitaGL REBUILD to exist.
-     *
-     * EVIDENCE. Disassembling _glDrawElements_CustomShadersIMPL in the libvitaGL.a
-     * that was installed showed, per draw:
-     *     2 x gpu_alloc_mapped_aligned   + 2 x sceClibMemcpy
-     * i.e. TWO general GPU allocations on every draw call. Device logs put heavy
-     * scenes at ~890 draws/frame, so that is ~1780 allocator round-trips per frame,
-     * on top of the 263 GL_STREAM_DRAW buffer respecifies SKINPROBE measured. It is
-     * also the mechanism behind free VRAM collapsing 80912KB -> 75KB, since every
-     * one of those allocations pushes its predecessor onto a deferred-free list.
-     *
-     * vitaGL already ships the cure -- a circular vertex pool with scratch memory,
-     * where those become bump-pointer reservations. It was NOT compiled in:
-     * vglSetupScratchMemory in the installed lib was literally `bx lr`, an empty
-     * stub, because the build lacked CIRCULAR_VERTEX_POOL / USE_SCRATCH_MEMORY.
-     * (Symbol presence is not proof a feature exists -- the stub had a symbol.)
-     *
-     * Rebuilt with CIRCULAR_VERTEX_POOL=2 (the FAILSAFE variant, so pool exhaustion
-     * degrades instead of corrupting) + USE_SCRATCH_MEMORY=1, keeping every previous
-     * flag. Verified after the rebuild:
-     *     per draw: 2 x vgl_reserve_data_pool + 2 x vgl_guarded_memcpy
-     *     symbols: 683 -> 686, only setup_combiner_pass (NO_TEX_COMBINER, dead code
-     *     for a shader-only game) and gpu_alloc_mapped_aligned itself were dropped.
-     *
-     * scratch_for_stream is the one that matters here: the loader creates every
-     * skinned-mesh vertex buffer with GL_STREAM_DRAW, which is exactly the usage
-     * class this routes into the pool. dynamic is enabled too since the engine also
-     * uses GL_DYNAMIC_* for UI/particle geometry and the same argument applies.
-     * MUST precede vglInit*. Pool size is left at vitaGL's documented 32MB default
-     * deliberately: it is the most-tested value, and a too-small circular pool can
-     * wrap while the GPU is still reading it. */
-    vglSetupScratchMemory(GL_TRUE /* dynamic */, GL_TRUE /* stream */);
-    l_info("gl_init: scratch memory ON for STREAM+DYNAMIC vertex buffers "
-           "(per-draw gpu_alloc -> circular-pool reservation)");
+    /* The device-tested vitaGL rollback intentionally has vglSetupScratchMemory as
+     * a `bx lr` stub. Later pool-enabled archives regressed orientation, UI alpha,
+     * and textures, so do not claim or enable that path in the shipping build. The
+     * configure step prints the linked archive hash for unambiguous provenance. */
+    l_info("gl_init: vitaGL scratch pool DISABLED (known-good compatibility rollback)");
 
     vglInitExtended(0, RS_NATIVE_W, RS_NATIVE_H, ram_reserve_mb * 1024 * 1024, SCE_GXM_MULTISAMPLE_NONE);
     /* vsync ON (helps a little) + a steady 30fps pacing cap in the game loop
@@ -1359,6 +1452,7 @@ void gl_init() {
                 g_present_period_us  = 1000000 / fps;
                 g_present_period_rem = 1000000 % fps;   /* exact period = whole + rem/fps */
                 g_present_period_den = fps;
+                g_present_vb_whole   = (fps > 0 && fps <= 60 && (60 % fps) == 0) ? (60 / fps) : 0;
         }
         /* DE-STACK PACING opt-in (2026-07-17, ux0:data/mcsm/no_present_lock.txt):
          * with vsync ON there are THREE period gates at the same rate but
@@ -1372,9 +1466,13 @@ void gl_init() {
         { FILE *npl = mcsm_open_setting("no_present_lock.txt", "r");
           if (npl) { fclose(npl); g_present_period_us = 0; g_present_period_rem = 0; g_present_period_den = 0;
                      l_info("present frame-lock DISABLED (no_present_lock.txt) — vsync+sim-pace only"); } }
-        l_info("present frame-lock = %d+%d/%d us per frame (exact timeline; %s)", g_present_period_us,
-               g_present_period_rem, g_present_period_den ? g_present_period_den : 1,
-               (g_present_period_den && g_present_period_rem) ? "fractional vblank cadence e.g. 3:2 pulldown" : "whole vblanks");
+        if (g_present_vb_whole > 0)
+            l_info("present frame-lock = %d vblanks/frame (%d fps, EXACT — paced by vblank count)",
+                   g_present_vb_whole, 60 / g_present_vb_whole);
+        else
+            l_info("present frame-lock = %d+%d/%d us per frame (fractional cadence — not a whole "
+                   "number of vblanks, so it rides a pulldown)", g_present_period_us,
+                   g_present_period_rem, g_present_period_den ? g_present_period_den : 1);
     }
 
     /* TROPHIES — must be here, and only here. sceNpTrophy's one-time setup dialog is
@@ -1406,19 +1504,29 @@ void gl_init() {
 }
 
 void gl_swap() {
+#ifdef DEBUG_SOLOADER
     static unsigned int s_swap_counter = 0;
+#endif
+    static unsigned char s_power_tick_countdown = 0;
     /* SAVE-RENAME KEYBOARD pump (2026-07-18): the Vita IME renders itself during
      * vglSwapBuffers; harvest the entered name when the user finishes + feed it
      * back to the engine as key events. Runs every present, near-free when idle. */
     { extern int mcsm_ime_poll(char **out); extern void mcsm_ime_deliver(const char *);
       char *ime_text = NULL;
       if (mcsm_ime_poll(&ime_text) && ime_text) mcsm_ime_deliver(ime_text); }
+    /* First-boot trophy setup is a common dialog too, so it advances only while frames
+     * are presented -- exactly like the IME above. Driving it here instead of a blocking
+     * loop inside mcsm_trophies_init() is what keeps the first boot from stalling. */
+    { extern int mcsm_trophies_setup_poll(void); (void)mcsm_trophies_setup_poll(); }
     /* Keep the Vita awake while the game runs. The idle/suspend timer has
      * second-level granularity, so ticking it ~1x/sec (every 30th present) fully
      * prevents auto-suspend/screen-blank while avoiding a wasted per-frame syscall
      * on the hottest path — a small but free battery win. */
-    if ((s_swap_counter % 30u) == 0u) {
+    if (s_power_tick_countdown == 0u) {
         sceKernelPowerTick(SCE_KERNEL_POWER_TICK_DEFAULT);
+        s_power_tick_countdown = 29u;
+    } else {
+        s_power_tick_countdown--;
     }
     if (g_rs_active) {
         /* Bilinear-upscale the low-res render into the native display, THEN present.
@@ -1440,7 +1548,7 @@ void gl_swap() {
          * whichever lib this build links. */
         glBindFramebuffer(GL_READ_FRAMEBUFFER, g_rs_fbo);
         glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
-        if (mcsm_cfg()->blit_flip)
+        if (g_rs_blit_flip)
             glBlitFramebuffer(0, 0, g_rs_w, g_rs_h, 0, RS_NATIVE_H, RS_NATIVE_W, 0,
                               GL_COLOR_BUFFER_BIT, g_rs_blit_filter);
         else
@@ -1454,56 +1562,117 @@ void gl_swap() {
      * pace alone can't fix this — it doesn't gate the present). Enforce a steady
      * minimum present interval so the display rate is consistent (no beating).
      * Period = 1/fps_cap.txt (e.g. 30 -> 33.3ms). fps_cap 0/absent = off. */
-    if (g_present_period_us > 0) {
-        /* Advance the ideal timeline by the EXACT period (whole + rem/den us) and
-         * sleep until just before it, so vsync snaps the frame onto the correct
-         * vblank. Carrying the remainder is what makes non-60/N rates like 24fps
-         * reachable, and it keeps whole-vblank rates drift-free over a session. */
+    if (g_present_period_us > 0 && g_present_vb_whole > 0) {
+        /* ★★★ EXACT PACING BY VBLANK COUNT. This is the whole fix.
+         *
+         * Every rate this port ships is a whole number of vblanks, so the frame's
+         * present slot is a COUNT, not a deadline in microseconds. sceDisplayGetVcount()
+         * is that count, straight from the display hardware, so scheduling against it
+         * cannot drift and cannot land on the wrong side of a boundary the way a sleep
+         * can.
+         *
+         * The subtlety that matters: vglSwapBuffers ALREADY waits one vblank (vsync is
+         * on). So to present on vblank N we must wake at N-1 and let the swap consume
+         * the last one. Waiting a fixed (target-1) here would be wrong whenever
+         * rendering has already eaten vblanks -- it would ADD to an over-budget frame
+         * and turn a 2-vblank cap into 3. Waiting `remaining-1`, computed from the live
+         * counter, is right in every case: a frame that is already late waits zero.
+         *
+         * Missed frames resync instead of accumulating debt, so a slow patch can never
+         * produce a catch-up burst afterwards. */
+        static unsigned s_next_vc = 0;
+        static int s_extra_vb = 0, s_miss = 0, s_hit = 0;
+
+        const unsigned vc = (unsigned)sceDisplayGetVcount();
+        const int vb = g_present_vb_whole + s_extra_vb;
+        if (!s_next_vc) s_next_vc = vc + (unsigned)vb;
+
+        const int remaining = (int)(s_next_vc - vc);   /* signed: survives wraparound */
+
+        /* HYSTERESIS. If frames keep arriving after their slot, widen the cadence by a
+         * whole vblank and HOLD -- a steady 20 reads far better than a 30 that keeps
+         * dropping to 20. Drop fast (4 misses) so judder ends quickly; recover slowly
+         * (90 clean frames) so a brief lull cannot restart the oscillation. */
+        if (remaining <= 0) { s_miss++; s_hit = 0; } else { s_hit++; s_miss = 0; }
+        if (s_miss >= 4 && s_extra_vb < 2) {
+            s_extra_vb++; s_miss = 0;
+            l_info("PACING: frames arriving late — widening to %d vblanks (%d fps) and holding",
+                   g_present_vb_whole + s_extra_vb, 60 / (g_present_vb_whole + s_extra_vb));
+        } else if (s_hit >= 90 && s_extra_vb > 0) {
+            s_extra_vb--; s_hit = 0;
+            l_info("PACING: sustained headroom — narrowing to %d vblanks (%d fps)",
+                   g_present_vb_whole + s_extra_vb, 60 / (g_present_vb_whole + s_extra_vb));
+        }
+
+        if (remaining > 1) {
+            sceDisplayWaitVblankStartMulti((unsigned int)(remaining - 1));
+        }
+        /* Schedule the next slot. Late frames present at vc+1 (the swap's own wait), so
+         * the next slot is measured from there rather than from a target we already
+         * missed -- that is what stops debt accumulating. */
+        s_next_vc = (remaining > 0 ? s_next_vc : vc + 1u) + (unsigned)(g_present_vb_whole + s_extra_vb);
+    } else if (g_present_period_us > 0) {
+        /* FRACTIONAL cap (24, 40, ...): no single vblank count expresses it, so keep the
+         * exact microsecond timeline with its remainder carry. Reachable only by hand
+         * from graphics.txt -- every shipped profile is a whole-vblank rate. */
         static uint64_t s_target_us = 0;
         static int      s_rem_acc   = 0;
         uint64_t pnow = sceKernelGetSystemTimeWide();
         if (!s_target_us) s_target_us = pnow;
-
         s_target_us += (uint64_t)g_present_period_us;
         if (g_present_period_den) {
             s_rem_acc += g_present_period_rem;
             if (s_rem_acc >= g_present_period_den) { s_rem_acc -= g_present_period_den; s_target_us++; }
         }
-
-        /* A heavy scene can push us past the target. Without a clamp the pacer
-         * would then present several frames back-to-back trying to catch up, which
-         * looks worse than the dropped frame did. Resync instead. */
-        if (pnow > s_target_us + 4ULL * (uint64_t)g_present_period_us) {
-            s_target_us = pnow;
-            s_rem_acc = 0;
-        }
-
-        /* Undershoot so the frame is ready BEFORE its vblank and vsync catches it
-         * cleanly rather than slipping to the next one (the original 2.5ms rule). */
+        if (pnow > s_target_us + (uint64_t)g_present_period_us) { s_target_us = pnow; s_rem_acc = 0; }
         const uint64_t undershoot = 2500;
         uint64_t wake = (s_target_us > undershoot) ? s_target_us - undershoot : 0;
         if (pnow < wake) sceKernelDelayThread((SceUInt)(wake - pnow));
     }
     launch_state_mark_gl_phase(1);   /* in vglSwapBuffers (present) */
-    vglSwapBuffers(GL_FALSE);
+    /* ★★★ has_commondialog MUST be GL_TRUE WHILE THE IME IS UP, OR IT IS INVISIBLE.
+     *
+     * This was hardcoded GL_FALSE, and that alone defeated every save-rename attempt
+     * ever made -- through the Lua hook, the JNI hook, the SELECT button and the vkbd
+     * vtable bridge alike. A Vita common dialog does not draw itself: it is composited
+     * by the presenter, and ONLY when the presenter is told one is up. So
+     * sceImeDialogInit succeeded, the dialog genuinely existed, mcsm_ime_poll polled
+     * it every frame -- and nothing was ever put on screen. "The keyboard doesn't show
+     * up" was literally true, and no amount of hunting for a better TRIGGER could have
+     * fixed it, because the trigger was never the broken part.
+     *
+     * The tell was in plain sight: dialog.c's own blocking helper presents with
+     * GL_TRUE (which is why fatal-error dialogs DO appear), and the trophy setup
+     * dialog only advanced because its loop passed 1 explicitly. This path never did.
+     *
+     * Cost is one global read per present. Kept as a live check rather than a latch
+     * because the dialog can end on any frame. */
+    { extern int mcsm_ime_needs_compositing(void);
+      extern int mcsm_trophies_setup_active(void);
+      const int dlg = mcsm_ime_needs_compositing() || mcsm_trophies_setup_active();
+      vglSwapBuffers(dlg ? GL_TRUE : GL_FALSE); }
     launch_state_mark_gl_phase(0);   /* present returned */
     if (g_rs_active) {
         glBindFramebuffer(GL_FRAMEBUFFER, g_rs_fbo); /* next frame renders into the FBO again */
     }
+#ifdef DEBUG_SOLOADER
     s_swap_counter++;
+#endif
 
     /* DIP PROFILER: log only severe render stalls with the draw-call /
      * vertex load that frame, so a sustained stutter shows whether it's
      * draw/GPU-bound (high draws) or stalling elsewhere (low draws). Cheap:
      * fires only on dips, and the logger is buffered. */
+    const uint64_t present_now_us = sceKernelGetSystemTimeWide();
     {
         static uint64_t s_last_us = 0;
-        uint64_t now_us = sceKernelGetSystemTimeWide();
+        const uint64_t now_us = present_now_us;
         if (s_last_us) {
             uint64_t dt_us = now_us - s_last_us;
             /* Publish the true present cadence for the clock governor (every frame,
              * all builds — NOT gated by logging). */
             g_mcsm_present_dt_us = (dt_us > 0xFFFFFFFFULL) ? 0xFFFFFFFFu : (uint32_t)dt_us;
+#ifdef DEBUG_SOLOADER
             uint32_t dt_ms = (uint32_t)(dt_us / 1000ULL);
             /* DIAG: log gameplay DIPS (>40ms = <25fps), throttled 1-in-16 to avoid
              * self-slowing, WITH draws/verts + VRAM so we can read CPU-vs-GPU-vs-VRAM. */
@@ -1513,14 +1682,61 @@ void gl_swap() {
                        s_swap_counter, dt_ms, g_frame_draw_calls, g_frame_draw_verts,
                        (unsigned)(vglMemFree(VGL_MEM_VRAM) / 1024u), (unsigned)(vglMemFree(VGL_MEM_RAM) / 1024u));
             }
+
+            /* ★ PACING HISTOGRAM -- what the frame rate FEELS like, not what it
+             * averages to.
+             *
+             * An average is the wrong statistic for smoothness and actively misleads
+             * here. fps_cap 24 on a 60Hz panel cannot be even: 60/24 = 2.5 vblanks,
+             * so a perfectly-paced 24 is a 3:2 pulldown alternating 33ms and 50ms.
+             * Any counter averaging over a second reports a truthful "24" while the
+             * motion carries the 50ms frames -- which is why 24 can measure right and
+             * feel like 20 or worse. A burst after a heavy frame does the same thing
+             * in reverse: some 16ms frames and some 80ms ones still average to 24.
+             *
+             * So bucket the actual present intervals by the vblank they landed on and
+             * dump the distribution periodically. p50/p95/max plus the bucket spread
+             * say immediately whether a rate is EVEN (one or two adjacent buckets) or
+             * merely correct-on-average (spread across many), and no other line in
+             * this log can tell those apart. Costs one compare chain per frame. */
+            {
+                static uint32_t s_bucket[8];   /* 1..7 vblanks, [0] = over 7 */
+                static uint32_t s_n, s_max_ms, s_sum_ms;
+                const uint32_t vb = (dt_ms + 8U) / 17U;   /* nearest whole vblank */
+                s_bucket[(vb >= 1U && vb <= 7U) ? vb : 0U]++;
+                s_n++; s_sum_ms += dt_ms;
+                if (dt_ms > s_max_ms) s_max_ms = dt_ms;
+                if (s_n >= 600U) {           /* ~10-25s depending on rate */
+                    /* p50/p95 straight from the buckets, in vblank units. */
+                    uint32_t acc = 0, p50 = 0, p95 = 0;
+                    for (uint32_t i = 1; i <= 7U; i++) {
+                        acc += s_bucket[i];
+                        if (!p50 && acc * 2U >= s_n)   p50 = i;
+                        if (!p95 && acc * 20U >= s_n * 19U) { p95 = i; break; }
+                    }
+                    l_info("PACING n=%u avg=%ufps p50=%uvb(%ufps) p95=%uvb(%ufps) max=%ums | "
+                           "vblanks 1:%u 2:%u 3:%u 4:%u 5:%u 6:%u 7:%u 7+:%u",
+                           s_n, s_sum_ms ? (1000U * s_n / s_sum_ms) : 0U,
+                           p50, p50 ? 60U / p50 : 0U,
+                           p95, p95 ? 60U / p95 : 0U, s_max_ms,
+                           s_bucket[1], s_bucket[2], s_bucket[3], s_bucket[4],
+                           s_bucket[5], s_bucket[6], s_bucket[7], s_bucket[0]);
+                    for (uint32_t i = 0; i < 8U; i++) s_bucket[i] = 0;
+                    s_n = 0; s_max_ms = 0; s_sum_ms = 0;
+                }
+            }
+#endif /* DEBUG_SOLOADER */
         }
         s_last_us = now_us;
+#ifdef DEBUG_SOLOADER
         g_frame_draw_calls = 0;
         g_frame_draw_verts = 0;
+#endif
     }
     // Record a real frame-present heartbeat so telemetry/watchdog can tell
     // "actually rendering" apart from "input loop ticking over a black screen".
-    launch_state_mark_present();
+    launch_state_mark_present_at_us(present_now_us);
+#ifdef DEBUG_SOLOADER
     if (s_swap_counter <= 8 || (s_swap_counter & 0x3ffU) == 0U) {
         /* Log vitaGL's per-pool FREE memory so we can see EXACTLY which GPU pool
          * exhausts when the 3D diorama loads (textures are tiny ~20MB, so the
@@ -1566,6 +1782,7 @@ void gl_swap() {
             }
         }
     }
+#endif
 }
 #endif /* !USE_PVR_PSP2 */
 
@@ -1686,7 +1903,10 @@ MCSM_DIAG_HELPER static GLint gl_get_int_for_diag(GLenum pname, GLenum *query_er
 
 #define GL_DIAG_TEX_UNIT_CAP 16
 
+#if !MCSM_FAST_FINAL_RUNTIME
 static GLenum g_diag_active_texture = GL_TEXTURE0;
+#endif
+static int g_diag_active_texture_index = 0;
 static GLuint g_diag_bound_texture_2d[GL_DIAG_TEX_UNIT_CAP];
 
 /* ★ ALL THREE REDUNDANT-CALL DEDUPS ARE NOW GONE, EACH RETIRED BY MEASUREMENT.
@@ -1757,29 +1977,29 @@ MCSM_DIAG_HELPER static int gl_sampler_diag_should_log(unsigned int count, GLenu
 }
 
 void glActiveTexture_soloader(GLenum texture) {
-    static unsigned int s_count = 0;
-    s_count++;
+    MCSM_DIAG_COUNT(s_count);
+    const int texture_index = gl_texture_unit_index(texture);
 
 #if MCSM_FAST_FINAL_RUNTIME
     glActiveTexture(texture);
-    if (gl_texture_unit_index(texture) >= 0) {
-        g_diag_active_texture = texture;
+    if (texture_index >= 0) {
+        g_diag_active_texture_index = texture_index;
     }
-    (void)s_count;
 #else
     GLenum pre_err = drain_gl_errors_limited();
     glActiveTexture(texture);
     GLenum err = glGetError();
 
-    if (err == GL_NO_ERROR && gl_texture_unit_index(texture) >= 0) {
+    if (err == GL_NO_ERROR && texture_index >= 0) {
         g_diag_active_texture = texture;
+        g_diag_active_texture_index = texture_index;
     }
 
     if (gl_sampler_diag_should_log(s_count, pre_err, err)) {
         l_info("glActiveTexture #%u unit=0x%X idx=%d pre=0x%X err=0x%X",
                s_count,
                (unsigned)texture,
-               gl_texture_unit_index(texture),
+               texture_index,
                (unsigned)pre_err,
                (unsigned)err);
     }
@@ -1801,6 +2021,14 @@ void glActiveTexture_soloader(GLenum texture) {
  * the live working set is preserved. All map mutation is confined to the one
  * GL thread (the upload thread) to stay lock-free and safe.
  * ------------------------------------------------------------------------- */
+/* The currently bound id is functional state used by texture conversion, POT/wrap,
+ * depth-texture emulation, and upload paths on both backends. */
+static GLuint s_texlru_bound = 0;
+
+/* vitaGL reclaim is deliberately disabled after three device-proven corruption
+ * failures. Do not keep paying an 8192-entry LRU hash probe on every bind for a
+ * collector that immediately returns. PVR still needs the object-count cap. */
+#ifdef USE_PVR_PSP2
 #define TEXLRU_SLOTS  8192u
 #ifdef USE_PVR_PSP2
 #define TEXLRU_BUDGET (40u * 1024u * 1024u)  /* byte backstop */
@@ -1884,8 +2112,6 @@ static uint32_t   s_texlru_evicted = 0;
  * NOTE: no thread guard — GL is single-context (serialized across threads via
  * eglMakeCurrent), so map access never truly overlaps. The old on_gl_thread
  * guard rejected the upload thread and made the whole cap a silent no-op. */
-static GLuint     s_texlru_bound = 0;
-
 /* Bounded linear probe. The unbounded version was safe only while this table was
  * dead code on vitaGL; now that every glBindTexture touches it, an unbounded probe
  * is a trap. The engine re-uploads textures under FRESH GL names constantly, so the
@@ -2120,12 +2346,20 @@ static void texlru_after_upload(GLint bound_tex, GLsizei bytes, GLenum err) {
     if (bound_tex <= 0 || err != GL_NO_ERROR) return;
     texlru_record((GLuint)bound_tex, (GLuint)(bytes > 0 ? bytes : 1));
 }
+#else
+static inline void texlru_touch(GLuint id) { (void)id; }
+static inline void texlru_before_upload(GLint bound_tex, GLsizei bytes) {
+    (void)bound_tex; (void)bytes;
+}
+static inline void texlru_after_upload(GLint bound_tex, GLsizei bytes, GLenum err) {
+    (void)bound_tex; (void)bytes; (void)err;
+}
+#endif /* USE_PVR_PSP2 */
 
 void glBindTexture_soloader(GLenum target, GLuint texture) {
-    static unsigned int s_count = 0;
-    s_count++;
+    MCSM_DIAG_COUNT(s_count);
 
-    const int active_idx = gl_texture_unit_index(g_diag_active_texture);
+    const int active_idx = g_diag_active_texture_index;
 #if MCSM_FAST_FINAL_RUNTIME
     /* ☠ REDUNDANT-BIND DEDUP REMOVED (2026-07-30) -- MEASURED DEAD, TWICE.
      * The idea was that a Telltale frame rebinds the same atlas across consecutive
@@ -2145,7 +2379,6 @@ void glBindTexture_soloader(GLenum target, GLuint texture) {
             g_diag_bound_texture_2d[active_idx] = texture;
         }
     }
-    (void)s_count;
 #else
     GLenum pre_err = drain_gl_errors_limited();
     glBindTexture(target, texture);
@@ -2174,8 +2407,7 @@ void glBindTexture_soloader(GLenum target, GLuint texture) {
 }
 
 void glUseProgram_soloader(GLuint program) {
-    static unsigned int s_count = 0;
-    s_count++;
+    MCSM_DIAG_COUNT(s_count);
 
 #if MCSM_FAST_FINAL_RUNTIME
     /* ☠ NO PROGRAM DEDUP HERE, AND THAT IS THE MEASURED ANSWER (2026-07-30).
@@ -2190,7 +2422,6 @@ void glUseProgram_soloader(GLuint program) {
      * as their split-memo key -- it is simply no longer used to skip anything. */
     glUseProgram(program);
     g_uniform_current_program = program;
-    (void)s_count;
 #else
     GLenum pre_err = drain_gl_errors_limited();
     glUseProgram(program);
@@ -2215,12 +2446,10 @@ void glUseProgram_soloader(GLuint program) {
 void glVertexAttribPointer_soloader(GLuint index, GLint size, GLenum type,
                                     GLboolean normalized, GLsizei stride,
                                     const void *pointer) {
-    static unsigned int s_count = 0;
-    s_count++;
+    MCSM_DIAG_COUNT(s_count);
 
 #if MCSM_FAST_FINAL_RUNTIME
     glVertexAttribPointer(index, size, type, normalized, stride, pointer);
-    (void)s_count;
 #else
     GLenum pre_err = drain_gl_errors_limited();
     GLenum query_err = GL_NO_ERROR;
@@ -2249,16 +2478,18 @@ void glVertexAttribPointer_soloader(GLuint index, GLint size, GLenum type,
 }
 
 void glDrawArrays_soloader(GLenum mode, GLint first, GLsizei count) {
-    static unsigned int s_count = 0;
-    s_count++;
+    MCSM_DIAG_COUNT(s_count);
+#ifdef DEBUG_SOLOADER
     g_frame_draw_calls++; g_frame_draw_verts += (unsigned long)count;
+#endif
 
 #if MCSM_FAST_FINAL_RUNTIME
+#ifdef DEBUG_SOLOADER
     launch_state_mark_draw((unsigned)mode, (int)count, 0u, (int)g_uniform_current_program);
+#endif
     glDrawArrays(mode, first, count);
     /* per-draw mark_gl_phase(0) dropped (2026-07-17): the present already refreshes
      * the watchdog phase/timestamp each frame; skip 2 syscalls/draw. */
-    (void)s_count;
 #else
     GLenum pre_err = drain_gl_errors_limited();
     GLenum query_err = GL_NO_ERROR;
@@ -2288,16 +2519,18 @@ void glDrawArrays_soloader(GLenum mode, GLint first, GLsizei count) {
 }
 
 void glDrawElements_soloader(GLenum mode, GLsizei count, GLenum type, const void *indices) {
-    static unsigned int s_count = 0;
-    s_count++;
+    MCSM_DIAG_COUNT(s_count);
+#ifdef DEBUG_SOLOADER
     g_frame_draw_calls++; g_frame_draw_verts += (unsigned long)count;
+#endif
 
 #if MCSM_FAST_FINAL_RUNTIME
+#ifdef DEBUG_SOLOADER
     launch_state_mark_draw((unsigned)mode, (int)count, (unsigned)type, (int)g_uniform_current_program);
+#endif
     glDrawElements(mode, count, type, indices);
     /* per-draw mark_gl_phase(0) dropped (2026-07-17): present refreshes the watchdog
      * phase/timestamp each frame; skip 2 syscalls/draw. */
-    (void)s_count;
 #else
     GLenum pre_err = drain_gl_errors_limited();
     GLenum query_err = GL_NO_ERROR;
@@ -2606,11 +2839,7 @@ static void log_tex_param(GLenum target, GLenum pname, GLint param, GLint applie
  * complete (menu/UI/character art don't tile; at worst an edge texel repeats
  * instead of black, which is the right trade to actually SHOW textures). */
 static GLuint gl_currently_bound_texture_2d(void) {
-    int unit = gl_texture_unit_index(g_diag_active_texture);
-    if (unit < 0) {
-        return 0;
-    }
-    return g_diag_bound_texture_2d[unit];
+    return g_diag_bound_texture_2d[g_diag_active_texture_index];
 }
 
 /* POT-AWARE 2026-06-29: clamp REPEAT->CLAMP only for NPOT (and unknown)
@@ -2705,7 +2934,9 @@ void glTexParameterxv_soloader(GLenum target, GLenum pname, const GLfixed *param
  * fonts stay smooth). Default = unchanged. */
 static int world_nearest_enabled(void) {
     static int v = -1;
-    if (v < 0) { v = 0; FILE *f = mcsm_open_setting("nearest_filter.txt", "r"); if (f) { fclose(f); v = 1; } }
+    if (v < 0) { v = mcsm_cfg()->nearest_filter ? 1 : 0;
+                 FILE *f = mcsm_open_setting("nearest_filter.txt", "r");   /* legacy override */
+                 if (f) { fclose(f); v = 1; } }
     return v;
 }
 static inline void force_complete_filter_ex(GLenum target, int allow_nearest) {
@@ -2729,8 +2960,7 @@ static inline void force_complete_filter(GLenum target) { force_complete_filter_
 void glCompressedTexImage2D_soloader(GLenum target, GLint level, GLenum internalformat,
                                      GLsizei width, GLsizei height, GLint border,
                                      GLsizei imageSize, const void *data) {
-    static unsigned int s_count = 0;
-    s_count++;
+    MCSM_DIAG_COUNT(s_count);
 
     /* (Reverted the 512 cap 2026-06-21: its single-texture tracking broke on
      * interleaved uploads -> dropped a background texture's promoted base level
@@ -2982,8 +3212,7 @@ static int mipmap_min_dim(void) {
 void glTexImage2D_soloader(GLenum target, GLint level, GLint internalformat,
                            GLsizei width, GLsizei height, GLint border,
                            GLenum format, GLenum type, const void *pixels) {
-    static unsigned int s_count = 0;
-    s_count++;
+    MCSM_DIAG_COUNT(s_count);
 
     /* Depth-stencil textures aren't supported by vitaGL -> back them with a
      * renderbuffer so the scene FBO actually gets a depth buffer (see shim note). */
@@ -3281,8 +3510,7 @@ void glTexImage2D_soloader(GLenum target, GLint level, GLint internalformat,
 void glTexSubImage2D_soloader(GLenum target, GLint level, GLint xoffset,
                               GLint yoffset, GLsizei width, GLsizei height,
                               GLenum format, GLenum type, const void *pixels) {
-    static unsigned int s_count = 0;
-    s_count++;
+    MCSM_DIAG_COUNT(s_count);
 
     /* For downsampled textures we dropped level>0 in glTexImage2D, so drop their
      * level>0 sub-image fills too (the level doesn't exist). Normal textures keep
@@ -3401,10 +3629,14 @@ static int uniform_scalar_should_skip(const char *name, GLint location) {
     if (location >= 0) {
         return 0;
     }
+#ifdef DEBUG_SOLOADER
     static unsigned s_logged = 0;
     if (s_logged++ < 16U) {
         l_info("%s skipped invalid location=%d", name, location);
     }
+#else
+    (void)name;
+#endif
     return 1;
 }
 
@@ -3412,10 +3644,14 @@ static int uniform_vector_should_skip(const char *name, GLint location, GLsizei 
     if (location >= 0 && count > 0 && value) {
         return 0;
     }
+#ifdef DEBUG_SOLOADER
     static unsigned s_logged = 0;
     if (s_logged++ < 32U) {
         l_info("%s skipped location=%d count=%d value=%p", name, location, count, value);
     }
+#else
+    (void)name;
+#endif
     return 1;
 }
 
@@ -3430,13 +3666,11 @@ void glUniform1fv_soloader(GLint location, GLsizei count, const GLfloat *value) 
 }
 
 void glUniform1i_soloader(GLint location, GLint v0) {
-    static unsigned int s_count = 0;
-    s_count++;
+    MCSM_DIAG_COUNT(s_count);
     if (uniform_scalar_should_skip("glUniform1i", location)) return;
 
 #if MCSM_FAST_FINAL_RUNTIME
     glUniform1i(location, v0);
-    (void)s_count;
 #else
     GLenum pre_err = drain_gl_errors_limited();
     GLenum query_err = GL_NO_ERROR;
@@ -3462,13 +3696,11 @@ void glUniform1i_soloader(GLint location, GLint v0) {
 }
 
 void glUniform1iv_soloader(GLint location, GLsizei count, const GLint *value) {
-    static unsigned int s_count = 0;
-    s_count++;
+    MCSM_DIAG_COUNT(s_count);
     if (uniform_vector_should_skip("glUniform1iv", location, count, value)) return;
 
 #if MCSM_FAST_FINAL_RUNTIME
     glUniform1iv(location, count, value);
-    (void)s_count;
 #else
     const GLint first_value = (value && count > 0) ? value[0] : -1;
     GLenum pre_err = drain_gl_errors_limited();
@@ -3549,6 +3781,7 @@ void glUniform4f_soloader(GLint location, GLfloat v0, GLfloat v1, GLfloat v2, GL
  *   maxdev~0 + nonId~0           -> BIND POSE (animation NOT applied) = frozen
  *   maxdev>0.1 + changes climbing -> skeleton IS animating
  *   changes==0                   -> palette static (not re-posed) */
+#ifdef DEBUG_SOLOADER
 static int mcsm_anim_pose_diag_enabled(void) {
     static int s_enabled = -1;
     if (s_enabled < 0) {
@@ -3599,10 +3832,13 @@ static void mcsm_log_anim_pose(GLint location, GLsizei count, const GLfloat *val
                s_uploads, s_changes, value[0], value[1], value[2], value[3]);
     }
 }
+#endif
 
 void glUniform4fv_soloader(GLint location, GLsizei count, const GLfloat *value) {
     if (uniform_vector_should_skip("glUniform4fv", location, count, value)) return;
+#ifdef DEBUG_SOLOADER
     mcsm_log_anim_pose(location, count, value);
+#endif
 
 #if MCSM_FAST_FINAL_RUNTIME
     int split = gl_uniform4fv_split_telltale(location, count, value);
@@ -3960,7 +4196,9 @@ static int neutralize_unsupported_glsl(char **src_io, size_t *len_io) {
          * the identity for additive — pick whichever makes the white surfaces correct.
          * Both are 9 chars < gl_LastFragData[0] (18), so glsl_replace_shorter is valid. */
         static int s_fbz = -1;
-        if (s_fbz < 0) { s_fbz = 0; FILE *fz = mcsm_open_setting("fbfetch_zero.txt", "r"); if (fz) { fclose(fz); s_fbz = 1; } }
+        if (s_fbz < 0) { s_fbz = mcsm_cfg()->fbfetch_zero ? 1 : 0;
+                         FILE *fz = mcsm_open_setting("fbfetch_zero.txt", "r");   /* legacy override */
+                         if (fz) { fclose(fz); s_fbz = 1; } }
         const char *repl = s_fbz ? "vec4(0.0)" : "vec4(1.0)";
         changed += glsl_replace_shorter(src, "gl_LastFragData[0]", repl);
         changed += glsl_replace_shorter(src, "gl_LastFragData[1]", repl);
@@ -4084,6 +4322,7 @@ void glShaderSource_soloader(GLuint shader, GLsizei count,
     str[total_length] = '\0';
 
     int precision_promotions = promote_shader_precision_for_vita(&str, &total_length);
+#ifdef DEBUG_SOLOADER
     if (precision_promotions) {
         static unsigned s_precision_logged = 0;
         if (s_precision_logged++ < 8U) {
@@ -4091,8 +4330,12 @@ void glShaderSource_soloader(GLuint shader, GLsizei count,
                    shader, precision_promotions);
         }
     }
+#else
+    (void)precision_promotions;
+#endif
 
 #ifndef USE_PVR_PSP2
+#ifdef DEBUG_SOLOADER
     if (neutralize_unsupported_glsl(&str, &total_length)) {
         static unsigned s_neutralized_logged = 0;
         if (s_neutralized_logged++ < 8U) {
@@ -4100,6 +4343,9 @@ void glShaderSource_soloader(GLuint shader, GLsizei count,
                    "(framebuffer-fetch/shadow/depth/lod) so the shader can compile.", shader);
         }
     }
+#else
+    (void)neutralize_unsupported_glsl(&str, &total_length);
+#endif
     /* FRAGMENT-SHADER highp GUARD — the real cross-Vita fix. GLSL ES guarantees
      * highp in VERTEX shaders but makes it OPTIONAL in FRAGMENT shaders; a fragment
      * shader using highp (Telltale's `uhi`/bare `highp`) must guard it or a STRICT
@@ -4112,11 +4358,15 @@ void glShaderSource_soloader(GLuint shader, GLsizei count,
         GLint stype = 0;
         glGetShaderiv(shader, GL_SHADER_TYPE, &stype);
         if (stype == GL_FRAGMENT_SHADER) {
+#ifdef DEBUG_SOLOADER
             static unsigned s_hp_logged = 0;
+#endif
             glsl_prepend_alloc(&str, &total_length,
                 "#ifndef GL_FRAGMENT_PRECISION_HIGH\n#define highp mediump\n#endif\n");
+#ifdef DEBUG_SOLOADER
             if (s_hp_logged++ < 4U)
                 l_info("glShaderSource(%u): added fragment highp compatibility guard.", shader);
+#endif
         }
     }
 #endif
@@ -4143,7 +4393,9 @@ void glShaderSource_soloader(GLuint shader, GLsizei count,
 }
 
 void glCompileShader_soloader(GLuint shader) {
+#ifdef DEBUG_SOLOADER
     static uint32_t s_compile_counter = 0;
+#endif
 
 #ifndef USE_GXP_SHADERS
     if (!skip_next_compile) {
@@ -4151,12 +4403,18 @@ void glCompileShader_soloader(GLuint shader) {
         GLenum err_before = GL_NO_ERROR;
         GLenum err_after = GL_NO_ERROR;
         shader_diag_entry *entry = get_shader_diag_entry(shader, 0);
+#ifdef DEBUG_SOLOADER
         s_compile_counter++;
+#endif
 
         err_before = glGetError();
+#ifdef DEBUG_SOLOADER
         if (s_compile_counter <= 8U) {
             log_shader_compile_runtime_state(shader, "before", err_before);
         }
+#else
+        (void)err_before;
+#endif
         if (entry && entry->owned_source) {
             const GLchar *src = entry->owned_source;
             glShaderSource(shader, 1, &src, NULL);
@@ -4164,9 +4422,13 @@ void glCompileShader_soloader(GLuint shader) {
         glCompileShader(shader);
         err_after = glGetError();
         glGetShaderiv(shader, GL_COMPILE_STATUS, &status);
+#ifdef DEBUG_SOLOADER
         if (s_compile_counter <= 8U || status != GL_TRUE || err_after != GL_NO_ERROR) {
             log_shader_compile_runtime_state(shader, "after", err_after);
         }
+#else
+        (void)err_after;
+#endif
         log_shader_compile_failure(shader);
 
         // Some game shaders use features vitaGL/ShaccCg can't translate
@@ -4260,6 +4522,7 @@ extern void glGetAttachedShaders(GLuint, GLsizei, GLsizei *, GLuint *);
 #define PROGCACHE_MAGIC_O2 0x4d435035u
 #define PROGCACHE_MAXBIN (1024u * 1024u)
 static int g_progcache_dir_ready = 0;
+#ifdef DEBUG_SOLOADER
 static unsigned g_progcache_hits = 0, g_progcache_misses = 0;
 /* SAVE DIAGNOSTIC counters (2026-07-18): the on-device cache came up EMPTY after
  * play. These pin WHY progcache_save wrote nothing, written via sceIo (reliable,
@@ -4267,6 +4530,16 @@ static unsigned g_progcache_hits = 0, g_progcache_misses = 0;
 static unsigned g_pc_links = 0, g_pc_key0 = 0, g_pc_notlinked = 0, g_pc_nobin = 0;
 static unsigned g_pc_saveok = 0, g_pc_openfail = 0, g_pc_loadfail = 0;
 static int g_pc_lastopen = 1;
+#define MCSM_PC_DIAG(code) do { code; } while (0)
+#else
+enum {
+    g_progcache_hits = 0, g_progcache_misses = 0,
+    g_pc_links = 0, g_pc_key0 = 0, g_pc_notlinked = 0, g_pc_nobin = 0,
+    g_pc_saveok = 0, g_pc_openfail = 0, g_pc_loadfail = 0,
+    g_pc_lastopen = 1
+};
+#define MCSM_PC_DIAG(code) do { } while (0)
+#endif
 
 /* FNV-1a over the attached shaders' tracked (patched) sources. 0 = unkeyable. */
 static uint64_t progcache_key_for_program(GLuint program) {
@@ -4332,7 +4605,7 @@ static int progcache_try_load(GLuint program, uint64_t key) {
          * deleted the file AND returned 1 (hit) -> the engine ran a BROKEN program
          * that session AND the key recompiled next session = the repeat-stutter
          * churn. Only the magic/length header check above is allowed to delete. */
-        g_pc_loadfail++;   /* file existed + loaded but glProgramBinary failed to restore = the load bug */
+        MCSM_PC_DIAG(g_pc_loadfail++); /* file loaded but failed to restore */
         l_warn("progcache: binary link!=TRUE (defensive) -> recompile, key kept");
         return 0;
     }
@@ -4344,15 +4617,15 @@ static void progcache_save(GLuint program, uint64_t key) {
     if (!key) return;
     GLint linked = GL_FALSE;
     glGetProgramiv(program, GL_LINK_STATUS, &linked);
-    if (linked != GL_TRUE) { g_pc_notlinked++; return; }
+    if (linked != GL_TRUE) { MCSM_PC_DIAG(g_pc_notlinked++); return; }
     GLint binlen = 0;
     glGetProgramiv(program, GL_PROGRAM_BINARY_LENGTH, &binlen);
-    if (binlen <= 0 || (unsigned)binlen > PROGCACHE_MAXBIN) { g_pc_nobin++; return; }
+    if (binlen <= 0 || (unsigned)binlen > PROGCACHE_MAXBIN) { MCSM_PC_DIAG(g_pc_nobin++); return; }
     void *bin = malloc((size_t)binlen);
     if (!bin) return;
     GLsizei len = 0; GLenum fmt = 0;
     glGetProgramBinary(program, binlen, &len, &fmt, bin);
-    if (len <= 0 || (unsigned)len > (unsigned)binlen) { free(bin); g_pc_nobin++; return; }
+    if (len <= 0 || (unsigned)len > (unsigned)binlen) { free(bin); MCSM_PC_DIAG(g_pc_nobin++); return; }
     if (!g_progcache_dir_ready) { sceIoMkdir(PROGCACHE_DIR, 0777); g_progcache_dir_ready = 1; }
     char path[160]; progcache_path(key, path, sizeof(path));
     SceUID fd = sceIoOpen(path, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
@@ -4362,21 +4635,21 @@ static void progcache_save(GLuint program, uint64_t key) {
         sceIoMkdir(PROGCACHE_DIR, 0777);
         fd = sceIoOpen(path, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
     }
-    g_pc_lastopen = (int)fd;
+    MCSM_PC_DIAG(g_pc_lastopen = (int)fd);
     if (fd >= 0) {
         uint32_t hdr[4] = { PROGCACHE_MAGIC, 1u, (uint32_t)fmt, (uint32_t)len };
         sceIoWrite(fd, hdr, sizeof(hdr));
         sceIoWrite(fd, bin, len);
         sceIoClose(fd);
-        g_pc_saveok++;
+        MCSM_PC_DIAG(g_pc_saveok++);
     } else {
-        g_pc_openfail++;
+        MCSM_PC_DIAG(g_pc_openfail++);
     }
     free(bin);
 }
 #endif /* !USE_PVR_PSP2 */
 
-#ifndef USE_PVR_PSP2
+#if !defined(USE_PVR_PSP2) && defined(DEBUG_SOLOADER)
 /* DRIFT DIAGNOSTIC (2026-07-18): on a progcache MISS, dump each attached shader's
  * tracked (patched) source. Two rejoins of the same scene each produce their MISS
  * sources under their (drifting) key names -> diffing near-identical pairs reveals
@@ -4414,11 +4687,11 @@ void glLinkProgram_soloader(GLuint program) {
      *   openfail + lastopen = sceIoOpen failure (dir/permission).
      * THE TEST: play a scene, then replay it — misses should stop growing and
      * saveok should be > 0. If saveok stays 0, the fields above say why. */
-    g_pc_links++;
+    MCSM_PC_DIAG(g_pc_links++);
     uint64_t pkey = progcache_key_for_program(program);
     if (pkey && progcache_try_load(program, pkey)) {
         /* Linked from disk — NO ShaccCg compile this run (the freeze killer). */
-        g_progcache_hits++;
+        MCSM_PC_DIAG(g_progcache_hits++);
         if (g_progcache_hits <= 80U)
             l_info("progcache HIT prog=%u key=%08X%08X (hits=%u miss=%u)", program,
                    (unsigned)(pkey >> 32), (unsigned)(pkey & 0xffffffffu),
@@ -4431,17 +4704,18 @@ void glLinkProgram_soloader(GLuint program) {
     glLinkProgram(program);
     launch_state_mark_gl_phase(0);
     if (pkey) {
+#ifdef DEBUG_SOLOADER
         g_progcache_misses++;
         dump_miss_sources(program, pkey);
+#endif
         progcache_save(program, pkey);
         if (g_progcache_misses <= 80U)
             l_info("progcache MISS prog=%u key=%08X%08X compiled+saved (hits=%u miss=%u)", program,
                    (unsigned)(pkey >> 32), (unsigned)(pkey & 0xffffffffu),
                    g_progcache_hits, g_progcache_misses);
     } else {
-        g_pc_key0++;
-        static unsigned s_uncached = 0;
-        s_uncached++;
+        MCSM_PC_DIAG(g_pc_key0++);
+        MCSM_DIAG_COUNT(s_uncached);
         if (s_uncached <= 8U || gl_verbose_diag_enabled()) {
             l_info("progcache UNCACHED prog=%u missing tracked shader source (uncached=%u hits=%u miss=%u)",
                    program, s_uncached, g_progcache_hits, g_progcache_misses);

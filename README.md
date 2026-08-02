@@ -25,9 +25,25 @@ No *Minecraft: Story Mode* code or assets are included or linked — supply your
 - `kubridge.skprx` and `fd_fix.skprx` in `ur0:tai/` (both listed under `*KERNEL` in `config.txt`), and `libshacccg.suprx` in `ur0:data/`. `fd_fix.skprx` raises the open-file limit the loader needs to stream the game archives — without it, archive reads thrash on `EMFILE`. (Don't use it alongside the rePatch plugin.)
 - Your own legally-owned game: the `com.telltalegames.minecraft100` APK + its OBB. Target **v1.37** (`40137`).
 
-## Data folder
+## Easy data setup
 
-> ⚠️ **Setup guide coming soon.** You supply your own game data (APK + OBB); none ships in this repo.
+The Windows [MCSM Vita Data Builder](data-builder/README.md) turns user-owned Android files into the exact ready-to-copy Vita folder. It does not download or contain game data.
+
+1. Open `MCSM-Vita-Data-Builder.exe`.
+2. Choose the 32-bit PowerVR APK and its main OBB.
+3. Optionally add Episode 2–8 folders or chapter ZIPs.
+4. Press **Build Data Folder**.
+5. Copy the resulting `mcsm` folder to `ux0:data/` with VitaShell.
+
+The final required path is `ux0:data/mcsm/assets`. A matching patch OBB placed beside the main OBB is detected automatically. Extra chapter `.ttarch2` and descriptor `.lua` files are detected, validated, and put in the correct shared assets folder.
+
+To build the self-contained Windows EXE from source:
+
+```powershell
+.\data-builder\build.ps1
+```
+
+The app also creates `settings/graphics.txt` and `settings/game.txt`. The recommended Performance preset is selected by default; Easy and Advanced Custom sections remain editable. Advanced mode includes a 60 FPS cap, but that is a maximum target rather than a guaranteed lock—crowded scenes with many characters can fall to around 20 FPS.
 
 ## Known issues
 
@@ -46,6 +62,8 @@ cmake --build build
 ```
 
 VPK lands in `build/`. Windows: `build_vpk.ps1`.
+
+VPKs and extracted game data are intentionally excluded from this source repository.
 
 ## Credits
 

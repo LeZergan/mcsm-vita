@@ -86,6 +86,19 @@ enum mcsm_method_ids {
     MID_ON_PURCHASE = 1063,
     MID_ON_UNLOCK_ACHIEVEMENT = 1064,
     MID_IS_SIGNED_IN = 1065,
+    /* ★ SAVE RENAME. These are the methods the engine ACTUALLY uses for text entry --
+     * found 2026-08-01 by reading the GetStaticMethodID failures in a device log:
+     *     openGenericTextDialog         (Ljava/lang/String;Ljava/lang/String;Z)Z
+     *     getGenericTextDialogFinished  ()Z
+     *     getGenericTextDialogCancelled ()Z
+     * Not the Lua keyboard fns, not SDL text input, not TTPlatform::VirtualKeyboard --
+     * all of which were hooked over several sessions on the assumption that the JNI
+     * route was empty. It was not; nothing had ever reached the rename screen with a
+     * working IME to see the lookups fail. */
+    MID_OPEN_GENERIC_TEXT_DIALOG = 1066,
+    MID_GET_GENERIC_TEXT_DIALOG_FINISHED = 1067,
+    MID_GET_GENERIC_TEXT_DIALOG_CANCELLED = 1068,
+    MID_GET_GENERIC_TEXT_DIALOG_VALUE = 1069,
 };
 
 /* Battery/perf default (2026-07-20): 720x408 = ~3/4 of native 960x544 (aspect
@@ -97,9 +110,10 @@ enum mcsm_method_ids {
  * still comfortably legible. The engine sizes its intermediate render targets
  * from this at boot, so it drives text/UI sharpness. Tunable via graphics.txt (resolution):
  * 960x544 = native (sharpest, heaviest), 800x452 = the old sharper default,
- * 640x363 = lighter still, 480x272 = max fps. Height kept EVEN (408) — GXM
- * render targets are happiest with even dims and the fb_override sanitizer forces
- * even too, so this compile-time default matches an graphics.txt (resolution) of "720x408". */
+ * 640x360 = lighter still, 480x272 = max fps. Height kept EVEN (408) — GXM render
+ * targets want even dims, and that is now the ONLY thing the fb_override sanitizer
+ * enforces, so this compile-time default really is what a graphics.txt `resolution`
+ * of "720x408" produces. (It was not: the sanitizer used to snap it to 720x404.) */
 #define MCSM_DEFAULT_RENDER_W 720
 #define MCSM_DEFAULT_RENDER_H 408
 
@@ -122,8 +136,12 @@ static int g_fb_override_loaded = 0;
 static int g_fb_override_enabled = 1;
 static int g_fb_override_width = MCSM_DEFAULT_RENDER_W;
 static int g_fb_override_height = MCSM_DEFAULT_RENDER_H;
+#ifdef DEBUG_SOLOADER
 static unsigned int g_flipbuffers_count = 0;
+#endif
+#ifdef DEBUG_SOLOADER
 static int g_request_permission_logged = 0;
+#endif
 
 enum mcsm_field_ids {
     FID_WINDOW_SERVICE = 0,
@@ -146,24 +164,29 @@ static void ensure_runtime_fields(void) {
     sync_runtime_field_objects();
 }
 
+/* Force an EVEN height, and nothing else.
+ *
+ * ☠ This used to also snap any height within 4 of a 16:9 height to exactly 16:9
+ * whenever width <= 720, and that quietly rewrote FOUR OF THE FIVE PROFILES:
+ *     default/auto 720x408 -> 720x404      performance 576x326 -> 576x324
+ *     battery      480x272 -> 480x270
+ * so the resolutions documented in graphics.txt were never the ones rendered.
+ *
+ * It was also correcting toward the WRONG aspect. This panel is 960x544, which is
+ * 1.7647 -- not 16:9 (1.7778). Snapping to 16:9 therefore introduced a 0.7-1.0%
+ * vertical stretch on the upscale in every profile it touched, i.e. the "cleanup"
+ * was the only thing making the picture geometrically wrong.
+ *
+ * It did the most damage to `battery`, whose entire stated reason for 480x272 is
+ * that it is EXACTLY half of 960x544 and so upscales by clean pixel doubling with
+ * no resampling. 480x270 is half of nothing and resamples.
+ *
+ * Even dimensions are the real GXM constraint, and every profile height (544, 408,
+ * 326, 272) is already even -- so with the 16:9 snap gone nothing is rewritten,
+ * each profile renders exactly what it advertises, and a hand-typed odd height is
+ * still corrected. */
 static void sanitize_framebuffer_override(int *w, int *h, int *sanitized) {
     if (!w || !h || !sanitized || *w <= 0 || *h <= 0) return;
-
-    if (*w <= 720) {
-        int clean_h = ((*w * 9) + 8) / 16;
-        if (clean_h & 1) {
-            clean_h--;
-        }
-        int delta = *h - clean_h;
-        if (delta < 0) {
-            delta = -delta;
-        }
-        if (clean_h > 0 && delta > 0 && delta <= 4) {
-            *h = clean_h;
-            *sanitized = 1;
-            return;
-        }
-    }
 
     if ((*h & 1) && *h > 180) {
         (*h)--;
@@ -311,7 +334,9 @@ int audio_open_port(int sample_rate, int channels, int desired_frames) {
 }
 
 void audio_output_i16_frames(const int16_t *samples, int frames, int channels) {
+#ifdef DEBUG_SOLOADER
     static unsigned log_count = 0;
+#endif
     channels = clamp_audio_channels(channels);
     if (!samples || frames <= 0) {
         static unsigned s_null = 0;
@@ -325,6 +350,7 @@ void audio_output_i16_frames(const int16_t *samples, int frames, int channels) {
         audio_write_sleep_us(frames * channels * 2);
         return;
     }
+#ifdef DEBUG_SOLOADER
     if (log_count < 4U) { l_info("AUDIO write_i16 frames=%d ch=%d first=%d,%d port=%d", frames, channels, samples[0], (channels > 1 && frames > 0) ? samples[1] : samples[0], g_audio_port); log_count++; }
     if (log_count == 2U) {
         /* AUDIO DIAG: verify FMOD is producing real audio data on first buffer */
@@ -332,6 +358,7 @@ void audio_output_i16_frames(const int16_t *samples, int frames, int channels) {
         for (int i = 0; i < frames * channels && i < 128; i++) { if (samples[i] != 0) { has_nonzero = 1; break; } }
         l_info("AUDIO first buffer has_nonzero=%d (FMOD %s producing audio)", has_nonzero, has_nonzero ? "IS" : "NOT");
     }
+#endif
     int offset_frames = 0;
     while (offset_frames < frames) {
         int chunk_frames = frames - offset_frames;
@@ -404,8 +431,11 @@ static jobject GetFilesDir(jmethodID id, va_list args) { (void)id; (void)args; r
 static jobject GetAbsolutePath(jmethodID id, va_list args) { (void)id; (void)args; return ret_string(DATA_PATH); }
 
 static void FlipBuffers(jmethodID id, va_list args) {
-    (void)id; (void)args; gl_swap(); g_flipbuffers_count++;
+    (void)id; (void)args; gl_swap();
+#ifdef DEBUG_SOLOADER
+    g_flipbuffers_count++;
     if (g_flipbuffers_count <= 8 || (g_flipbuffers_count & 0x7fU) == 0U) l_info("FlipBuffers count=%u", g_flipbuffers_count);
+#endif
 }
 
 static jint AudioInit(jmethodID id, va_list args) {
@@ -421,7 +451,9 @@ static jint AudioInit(jmethodID id, va_list args) {
 static void AudioWriteShortBuffer(jmethodID id, va_list args) {
     (void)id; jobject buffer = va_arg(args, jobject);
     int sample_count = buffer ? jni->GetArrayLength(&jni, buffer) : 0;
+#ifdef DEBUG_SOLOADER
     { static unsigned int s_aws = 0; if (s_aws++ < 4U) l_info("AUDIO writeShort #%u samples=%d (FMOD driving audio)", s_aws, sample_count); }
+#endif
     if (sample_count <= 0) sample_count = 1024;
     jshort *samples = jni->GetShortArrayElements(&jni, (jshortArray)buffer, NULL);
     if (samples) { audio_output_i16_frames(samples, sample_count / clamp_audio_channels(g_audio_channels), clamp_audio_channels(g_audio_channels)); jni->ReleaseShortArrayElements(&jni, (jshortArray)buffer, samples, 0); }
@@ -431,7 +463,9 @@ static void AudioWriteShortBuffer(jmethodID id, va_list args) {
 static void AudioWriteByteBuffer(jmethodID id, va_list args) {
     (void)id; jobject buffer = va_arg(args, jobject);
     int byte_count = buffer ? jni->GetArrayLength(&jni, buffer) : 0;
+#ifdef DEBUG_SOLOADER
     { static unsigned int s_awb = 0; if (s_awb++ < 4U) l_info("AUDIO writeByte #%u bytes=%d (FMOD driving audio)", s_awb, byte_count); }
+#endif
     if (byte_count <= 0) byte_count = 4096;
     jbyte *bytes = jni->GetByteArrayElements(&jni, (jbyteArray)buffer, NULL);
     if (bytes) { audio_output_byte_buffer(bytes, byte_count); jni->ReleaseByteArrayElements(&jni, (jbyteArray)buffer, bytes, 0); }
@@ -443,12 +477,15 @@ extern void mcsm_register_virtual_controller(void);
 static void PollInputDevices(jmethodID id, va_list args) { (void)id; (void)args; launch_state_mark_poll(); mcsm_register_virtual_controller(); }
 
 static void UpdatePurchases(jmethodID id, va_list args) {
-    static unsigned log_count = 0; (void)id; (void)args;
+    (void)id; (void)args;
+#ifdef DEBUG_SOLOADER
+    static unsigned log_count = 0;
     if (log_count < 16U) { l_info("DLC updatePurchases -> no-op"); log_count++; }
+#endif
 }
 
 static jboolean IsNetworkAvailable(jmethodID id, va_list args) {
-    static unsigned log_count = 0; (void)id; (void)args;
+    (void)id; (void)args;
     /* CROWD-CHOICE STATS (2026-07-22): the end-of-episode "how your choices
      * compare" screen shows "you are offline" when this returns false, even though
      * the crowd data is shipped as a pre-baked choice.prop and served via the
@@ -457,41 +494,62 @@ static jboolean IsNetworkAvailable(jmethodID id, va_list args) {
      * the DLC verification sequence is unchanged. The Lua internet/license checks
      * stay false regardless, so the documented DLC boot-loop can't trigger. */
     jboolean avail = launch_state_scene_active() ? JNI_TRUE : JNI_FALSE;
+#ifdef DEBUG_SOLOADER
+    static unsigned log_count = 0;
     if (log_count < 16U) {
         l_info("DLC isNetworkAvailable -> %s", avail ? "true (scene live: crowd-stats path)"
                                                      : "false (boot / offline)");
         log_count++;
     }
+#endif
     return avail;
 }
 
 static jobject GetPurchaseProvider(jmethodID id, va_list args) {
-    static unsigned log_count = 0; (void)id; (void)args;
+    (void)id; (void)args;
+#ifdef DEBUG_SOLOADER
+    static unsigned log_count = 0;
     if (log_count < 8U) { l_info("DLC getPurchaseProvider -> Amazon"); log_count++; }
+#endif
     return ret_string("Amazon");
 }
 
 static void RequestPermission(jmethodID id, va_list args) {
     (void)id; int permission_code = va_arg(args, int);
+#ifdef DEBUG_SOLOADER
     if (g_request_permission_logged < 16) { l_info("DLC requestPermission(%d) -> granted", permission_code); g_request_permission_logged++; }
+#else
+    (void)permission_code;
+#endif
 }
 
 static jboolean IsPurchased(jmethodID id, va_list args) {
-    static unsigned log_count = 0; (void)id; jobject sku = va_arg(args, jobject);
+    (void)id; jobject sku = va_arg(args, jobject);
+#ifdef DEBUG_SOLOADER
+    static unsigned log_count = 0;
     const char *sku_name = sku ? jni->GetStringUTFChars(&jni, (jstring)sku, NULL) : NULL;
     if (log_count < 16U) { l_info("DLC purchase check(\"%s\") -> true", sku_name ? sku_name : "(null)"); log_count++; }
     if (sku_name) jni->ReleaseStringUTFChars(&jni, (jstring)sku, (char *)sku_name);
+#else
+    (void)sku;
+#endif
     return JNI_TRUE;
 }
 
 static void Purchase(jmethodID id, va_list args) {
-    static unsigned log_count = 0; (void)id; (void)args;
+    (void)id; (void)args;
+#ifdef DEBUG_SOLOADER
+    static unsigned log_count = 0;
     if (log_count < 8U) { l_info("DLC purchase -> no-op, already owned locally"); log_count++; }
+#endif
 }
 
 static void OnPurchase(jmethodID id, va_list args) {
-    static unsigned log_count = 0; (void)id; (void)args;
+    (void)id; (void)args;
+#ifdef DEBUG_SOLOADER
+    static unsigned log_count = 0;
     if (log_count < 8U) { l_info("DLC onPurchase -> no-op"); log_count++; }
+#endif
 }
 
 static void OnUnlockAchievement(jmethodID id, va_list args) {
@@ -500,13 +558,18 @@ static void OnUnlockAchievement(jmethodID id, va_list args) {
 }
 
 static jobject GetPurchasedSkus(jmethodID id, va_list args) {
-    static unsigned log_count = 0; (void)id; (void)args;
+    (void)id; (void)args;
+#ifdef DEBUG_SOLOADER
+    static unsigned log_count = 0;
+#endif
     const char *skus[] = { "MCSM_Episode_101","MCSM_Episode_102","MCSM_Episode_103","MCSM_Episode_104","MCSM_Episode_105","MCSM_Episode_106","MCSM_Episode_107","MCSM_Episode_108" };
     const int num_skus = sizeof(skus)/sizeof(skus[0]);
     jobjectArray arr = jni->NewObjectArray(&jni, num_skus, NULL, NULL);
     if (!arr) return NULL;
     for (int i = 0; i < num_skus; i++) { jobject str = jni->NewStringUTF(&jni, skus[i]); jni->SetObjectArrayElement(&jni, arr, i, str); jni->DeleteLocalRef(&jni, str); }
+#ifdef DEBUG_SOLOADER
     if (log_count < 4U) { l_info("DLC getPurchasedSkus -> [%d skus]", num_skus); log_count++; }
+#endif
     return arr;
 }
 
@@ -515,28 +578,42 @@ static jobject GetPurchasedSkus(jmethodID id, va_list args) {
 // On Vita all data is pre-installed at ux0:data/mcsm/ — immediately report
 // "downloaded, not downloading, 100% progress, license valid".
 static jboolean IsDownloaded(jmethodID id, va_list args) {
-    static unsigned log_count = 0; (void)id; (void)args;
+    (void)id; (void)args;
+#ifdef DEBUG_SOLOADER
+    static unsigned log_count = 0;
     if (log_count < 8U) { l_info("DLC isDownloaded -> true"); log_count++; }
+#endif
     return JNI_TRUE;
 }
 
 static jboolean IsDownloading(jmethodID id, va_list args) {
-    static unsigned log_count = 0; (void)id; (void)args;
+    (void)id; (void)args;
+#ifdef DEBUG_SOLOADER
+    static unsigned log_count = 0;
     if (log_count < 4U) { l_info("DLC isDownloading -> false"); log_count++; }
+#endif
     return JNI_FALSE;
 }
 
 static jint GetDownloadProgress(jmethodID id, va_list args) {
-    static unsigned log_count = 0; (void)id; (void)args;
+    (void)id; (void)args;
+#ifdef DEBUG_SOLOADER
+    static unsigned log_count = 0;
     if (log_count < 4U) { l_info("DLC getDownloadProgress -> 100%%"); log_count++; }
+#endif
     return 100;
 }
 
 static jboolean CheckLicense(jmethodID id, va_list args) {
-    static unsigned log_count = 0; (void)id; jobject sku = va_arg(args, jobject);
+    (void)id; jobject sku = va_arg(args, jobject);
+#ifdef DEBUG_SOLOADER
+    static unsigned log_count = 0;
     const char *sku_name = sku ? jni->GetStringUTFChars(&jni, (jstring)sku, NULL) : NULL;
     if (log_count < 16U) { l_info("DLC checkLicense(\"%s\") -> valid", sku_name ? sku_name : "(null)"); log_count++; }
     if (sku_name) jni->ReleaseStringUTFChars(&jni, (jstring)sku, (char *)sku_name);
+#else
+    (void)sku;
+#endif
     return JNI_TRUE;
 }
 
@@ -545,20 +622,103 @@ static jobject InputGetInputDeviceIds(jmethodID id, va_list args) {
     jintArray devices = jni->NewIntArray(&jni, 1); if (!devices) return NULL;
     const jint vita_device_id = 0;
     jni->SetIntArrayRegion(&jni, devices, 0, 1, &vita_device_id);
+#ifdef DEBUG_SOLOADER
     l_info("inputGetInputDeviceIds(source=0x%08X) -> [0]", (unsigned)source_mask);
+#else
+    (void)source_mask;
+#endif
     return devices;
 }
 
 static jobject GetHardwareModel(jmethodID id, va_list args) { (void)id; (void)args; return ret_string("PlayStation Vita"); }
 static jboolean SetActivityTitle(jmethodID id, va_list args) { (void)id; (void)args; return JNI_TRUE; }
 
+/* ---- GENERIC TEXT DIALOG = save rename -------------------------------------------
+ * The Android build put up a native EditText here; we drive the Vita IME instead,
+ * reusing the vkbd state in dialog.c (mcsm_ime_poll on the render thread captures the
+ * typed name and sets the finished/cancelled flags). This is a POLLED interface --
+ * open returns immediately and the engine spins on Finished -- which is exactly what
+ * the non-blocking IME already provides. */
+extern void        mcsm_ime_begin_vkbd(const char *title, const char *initial);
+
+/* Set by open, cleared once the engine has read the value back. Keeps the
+ * Finished/Value pair honest across repeated renames. */
+static int s_text_dialog_open = 0;
+extern int         mcsm_vkbd_finished(void);
+extern const char *mcsm_vkbd_result(int *cancelled);
+
+static jboolean OpenGenericTextDialog(jmethodID id, va_list args) {
+    (void)id;
+    /* Device log shows arg0 = the CURRENT value ("Save 2") and arg1 = the PROMPT
+     * ("Enter Save Game Name"). Prefill the IME with the current name -- that is the
+     * thing being edited -- and use the prompt as the dialog title. Feeding the prompt
+     * in as the initial text (the first cut) meant the player had to clear "Enter Save
+     * Game Name" by hand before typing, and losing the existing name made "tweak the
+     * name" impossible. */
+    jobject cur_o    = va_arg(args, jobject);
+    jobject prompt_o = va_arg(args, jobject);
+    (void)va_arg(args, int);          /* trailing Z (password/multiline flag) */
+    const char *cur    = cur_o    ? jni->GetStringUTFChars(&jni, (jstring)cur_o, NULL)    : NULL;
+    const char *prompt = prompt_o ? jni->GetStringUTFChars(&jni, (jstring)prompt_o, NULL) : NULL;
+    l_info("KEYBOARD: openGenericTextDialog(current=\"%s\", prompt=\"%s\") -> Vita IME",
+           cur ? cur : "", prompt ? prompt : "");
+    s_text_dialog_open = 1;
+    mcsm_ime_begin_vkbd(prompt, cur ? cur : "");
+    if (cur)    jni->ReleaseStringUTFChars(&jni, (jstring)cur_o, (char *)cur);
+    if (prompt) jni->ReleaseStringUTFChars(&jni, (jstring)prompt_o, (char *)prompt);
+    return JNI_TRUE;
+}
+
+/* Only report "finished" for a dialog THIS interface actually opened.
+ * mcsm_vkbd_finished() answers 1 when nothing was ever raised -- correct for the
+ * TTPlatform vtable stub, which always returned 1 and would hang anything polling it,
+ * but wrong here: it would tell the engine a dialog it never opened had completed, and
+ * it would then read a stale value. */
+static jboolean GetGenericTextDialogFinished(jmethodID id, va_list args) {
+    (void)id; (void)args;
+    if (!s_text_dialog_open) return JNI_FALSE;
+    return mcsm_vkbd_finished() ? JNI_TRUE : JNI_FALSE;
+}
+
+static jboolean GetGenericTextDialogCancelled(jmethodID id, va_list args) {
+    (void)id; (void)args;
+    int cancelled = 0;
+    (void)mcsm_vkbd_result(&cancelled);
+    /* Cancel is a TERMINAL answer, so retire the dialog here too. Clearing only in
+     * ...Value() left a cancelled dialog "open" forever whenever the engine reads
+     * Cancelled and then skips Value -- and because `finished` also stays set, the next
+     * getGenericTextDialogFinished poll (before any new open) would answer TRUE
+     * immediately and hand back the previous dialog's text. A rename to a stale name,
+     * with nothing logged. */
+    if (cancelled) s_text_dialog_open = 0;
+    return cancelled ? JNI_TRUE : JNI_FALSE;
+}
+
+/* CONFIRMED FROM DEVICE 2026-08-01: the getter is getGenericTextDialogValue, signature
+ * ()Ljava/lang/String; -- an earlier guess of "...Text" was wrong and showed up as a
+ * GetStaticMethodID failure once openGenericTextDialog started succeeding. The full
+ * rename contract is therefore: open(title, initial, flag) -> poll Finished /
+ * Cancelled -> read Value. */
+static jobject GetGenericTextDialogValue(jmethodID id, va_list args) {
+    (void)id; (void)args;
+    int cancelled = 0;
+    const char *s = mcsm_vkbd_result(&cancelled);
+    l_info("KEYBOARD: getGenericTextDialogValue -> \"%s\" (cancelled=%d)", s ? s : "", cancelled);
+    s_text_dialog_open = 0;   /* consumed; the next rename must open again */
+    return ret_string(s ? s : "");
+}
+
 static jboolean HasFeature(jmethodID id, va_list args) {
     (void)id; jobject feature = va_arg(args, jobject);
+#ifdef DEBUG_SOLOADER
     const char *feature_name = feature ? jni->GetStringUTFChars(&jni, (jstring)feature, NULL) : NULL;
     const int is_low_latency = feature_name && (strstr(feature_name, "audio.low_latency") || strstr(feature_name, "FEATURE_AUDIO_LOW_LATENCY"));
     static unsigned log_count = 0;
     if (log_count < 4U) { l_info("Feature query \"%s\" -> false%s", feature_name ? feature_name : "(null)", is_low_latency ? " (low-latency disabled for FMOD output)" : ""); log_count++; }
     if (feature_name) jni->ReleaseStringUTFChars(&jni, (jstring)feature, (char *)feature_name);
+#else
+    (void)feature;
+#endif
     return JNI_FALSE;
 }
 
@@ -577,16 +737,22 @@ static jboolean IsUsingBluetooth(jmethodID id, va_list args) { (void)id; (void)a
 static jboolean CheckInit(jmethodID id, va_list args) { (void)id; (void)args; return JNI_TRUE; }
 
 static jboolean IsDataAvailable(jmethodID id, va_list args) {
-    static unsigned log_count = 0; (void)id; (void)args;
+    (void)id; (void)args;
+#ifdef DEBUG_SOLOADER
+    static unsigned log_count = 0;
     if (log_count < 16U) { l_info("DLC isDataAvailable -> true"); log_count++; }
+#endif
     return JNI_TRUE;
 }
 
 static jboolean IsTV(jmethodID id, va_list args) { (void)id; (void)args; return JNI_FALSE; }
 static jboolean SupportsLowLatency(jmethodID id, va_list args) { (void)id; (void)args; return JNI_FALSE; }
 static jboolean IsSignedIn(jmethodID id, va_list args) {
-    static unsigned log_count = 0; (void)id; (void)args;
+    (void)id; (void)args;
+#ifdef DEBUG_SOLOADER
+    static unsigned log_count = 0;
     if (log_count < 8U) { l_info("JNI isSignedIn -> true (#%u)", log_count + 1U); log_count++; }
+#endif
     return JNI_TRUE;
 }
 
@@ -727,6 +893,11 @@ NameToMethodID nameToMethodId[] = {
     { MID_GET_DOWNLOAD_PROGRESS, "getDownloadProgress", METHOD_TYPE_INT },
     { MID_CHECK_LICENSE, "checkLicense", METHOD_TYPE_BOOLEAN },
     { MID_IS_NETWORK_AVAILABLE, "isNetworkAvailable", METHOD_TYPE_BOOLEAN },
+    /* save rename -- see the MID_ block for how these were found */
+    { MID_OPEN_GENERIC_TEXT_DIALOG, "openGenericTextDialog", METHOD_TYPE_BOOLEAN },
+    { MID_GET_GENERIC_TEXT_DIALOG_FINISHED, "getGenericTextDialogFinished", METHOD_TYPE_BOOLEAN },
+    { MID_GET_GENERIC_TEXT_DIALOG_CANCELLED, "getGenericTextDialogCancelled", METHOD_TYPE_BOOLEAN },
+    { MID_GET_GENERIC_TEXT_DIALOG_VALUE, "getGenericTextDialogValue", METHOD_TYPE_OBJECT },
 };
 
 MethodsBoolean methodsBoolean[] = {
@@ -745,6 +916,9 @@ MethodsBoolean methodsBoolean[] = {
     { MID_CHECK_LICENSE, CheckLicense },
     { MID_IS_NETWORK_AVAILABLE, IsNetworkAvailable },
     { MID_IS_SIGNED_IN, IsSignedIn },
+    { MID_OPEN_GENERIC_TEXT_DIALOG, OpenGenericTextDialog },
+    { MID_GET_GENERIC_TEXT_DIALOG_FINISHED, GetGenericTextDialogFinished },
+    { MID_GET_GENERIC_TEXT_DIALOG_CANCELLED, GetGenericTextDialogCancelled },
 };
 MethodsByte methodsByte[] = {};
 MethodsChar methodsChar[] = {};
@@ -763,6 +937,7 @@ MethodsInt methodsInt[] = {
 };
 MethodsLong methodsLong[] = {};
 MethodsObject methodsObject[] = {
+    { MID_GET_GENERIC_TEXT_DIALOG_VALUE, GetGenericTextDialogValue },
     { MID_GET_EXTERNAL_STORAGE_DIRECTORY, GetExternalStorageDirectory },
     { MID_GET_PACKAGE_NAME, GetPackageName },
     { MID_GET_OBB_FILENAME, GetObbFileName },

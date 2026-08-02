@@ -9,7 +9,9 @@
 #include "java_runtime.h"
 
 #include <pthread.h>
+#include <stdbool.h>
 #include <stdint.h>
+#include <stdatomic.h>
 #include <psp2/io/fcntl.h>
 #include <psp2/kernel/clib.h>
 #include <psp2/kernel/processmgr.h>   /* sceKernelPowerTick */
@@ -176,6 +178,10 @@ static void poke_sdl_window_state(const NativeInitPokeContext *ctx, int poke_id)
 }
 
 static void emit_stall_report(const char *reason, const char *snapshot) {
+#ifndef DEBUG_SOLOADER
+    (void)reason;
+    (void)snapshot;
+#else
     char hist[1024];
     char memstats[256];
     char alog_recent[4096];
@@ -213,6 +219,7 @@ static void emit_stall_report(const char *reason, const char *snapshot) {
     telemetry_log("STALL", "recent_alog_end");
     telemetry_log("STALL", "telemetry_path=%s", telemetry_last_path() ? telemetry_last_path() : "(none)");
     telemetry_log("STALL", "END");
+#endif
 }
 
 static void call_module_jni_onload(const char *module_name, so_module *module, LaunchStage stage) {
@@ -255,12 +262,14 @@ static void *watchdog_thread(void *arg) {
         const uint64_t uptime_ms = launch_state_uptime_ms();
 
         if (uptime_ms - last_log_ms >= 5000) {
+#ifdef DEBUG_SOLOADER
             char snap[320];
             char memstats[256];
             launch_state_snapshot(snap, sizeof(snap));
             mem_stats_snapshot(memstats, sizeof(memstats));
             telemetry_log("WATCH", "%s", snap);
             telemetry_log("WATCH", "%s", memstats);
+#endif
             last_log_ms = uptime_ms;
             /* Report-only diagnostics. THROTTLED TO 30s: these are the log-heavy
              * ones, the logger is buffered onto ux0, and the throttle that used to
@@ -274,8 +283,9 @@ static void *watchdog_thread(void *arg) {
              * has not advanced, which silently suppressed the whole upload/skinning
              * probe in menus, during scene loads, and in any scene without active
              * chores -- i.e. exactly when a hang most needs describing. The two
-             * diagnostics are unrelated and must not gate each other. */
+            * diagnostics are unrelated and must not gate each other. */
             {
+#ifdef DEBUG_SOLOADER
                 static uint64_t last_fx_ms = 0;
                 /* 10s, not 30s. At 30s an 86s device session produced exactly ONE
                  * fire, and it landed on the load screen -- so the probes had a
@@ -295,6 +305,7 @@ static void *watchdog_thread(void *arg) {
                      * fire may legitimately say 'not built yet'. */
                     { extern void mcsm_report_platform_quality(void); mcsm_report_platform_quality(); }
                 }
+#endif
 
             /* CLOCK RE-ASSERT (2026-07-30). The boot-time set is not sticky. Device
              * log, with every call returning rc=0:
@@ -542,8 +553,17 @@ static void *nativeinit_poke_thread(void *arg) {
 #define INPUT_READY_PRESENT_FRAMES 60U
 
 static int input_delivery_ready(void) {
-    return launch_state_scene_active() ||
-           launch_state_get_present_count() >= INPUT_READY_PRESENT_FRAMES;
+    static atomic_bool ready = ATOMIC_VAR_INIT(false);
+    if (atomic_load_explicit(&ready, memory_order_relaxed)) {
+        return 1;
+    }
+    if (launch_state_scene_active() ||
+        launch_state_get_present_count() >= INPUT_READY_PRESENT_FRAMES) {
+        /* Both source conditions are monotonic for the lifetime of the process. */
+        atomic_store_explicit(&ready, true, memory_order_relaxed);
+        return 1;
+    }
+    return 0;
 }
 
 static void *input_poll_thread(void *arg) {
@@ -562,10 +582,13 @@ static void *input_poll_thread(void *arg) {
         telemetry_log("INPUT", "Android_JNI_SetupThread missing; using global FalsoJNI env");
     }
 
+#ifdef DEBUG_SOLOADER
     unsigned int poll_count = 0;
     unsigned int gated_count = 0;
+#endif
     while (1) {
         if (!input_delivery_ready()) {
+#ifdef DEBUG_SOLOADER
             gated_count++;
             if (gated_count <= 4U || (gated_count & 0x1fffU) == 0U) {
                 telemetry_log("INPUT", "background poll gated count=%u stage=%s scene=%d frames=%u",
@@ -574,11 +597,13 @@ static void *input_poll_thread(void *arg) {
                               launch_state_scene_active(),
                               launch_state_get_present_count());
             }
+#endif
             sceKernelDelayThread(50000);
             continue;
         }
 
         controls_poll();
+#ifdef DEBUG_SOLOADER
         poll_count++;
         if (poll_count <= 4U || (poll_count & 0x1fffU) == 0U) {
             telemetry_log("INPUT", "background poll count=%u stage=%s frames=%u",
@@ -586,6 +611,7 @@ static void *input_poll_thread(void *arg) {
                           launch_state_get_stage_name(launch_state_get_stage()),
                           launch_state_get_present_count());
         }
+#endif
         sceKernelDelayThread(16666);
     }
 
@@ -1212,7 +1238,9 @@ static int controls_emit_engine_touch(int compact_id,
                                       float nx,
                                       float ny,
                                       ControlsAction action) {
+#ifdef DEBUG_SOLOADER
     static unsigned log_count = 0;
+#endif
     const int event_type = controls_engine_event_type(action);
     const int px = rs_map_px_x(x);
     const int py = rs_map_px_y(y);
@@ -1220,8 +1248,8 @@ static int controls_emit_engine_touch(int compact_id,
     const int gamewindow_ready = gamewindow != NULL;
     int finger_sent = 0;
     int mouse_sent = 0;
-    int legacy_sent = 0;
-    int gw_rc = 0;
+    int legacy_sent __attribute__((unused)) = 0;
+    int gw_rc __attribute__((unused)) = 0;
     int gw_sent = 0;
 
     if (legacy_touch_pointer_enabled() && g_touch_set_legacy_pointer && g_touch_screen_state) {
@@ -1271,6 +1299,7 @@ static int controls_emit_engine_touch(int compact_id,
         gw_sent = 1;
     }
 
+#ifdef DEBUG_SOLOADER
     if (log_count < 64U) {
         l_info("INPUT engine action=%d slot=%d event=%d xy=%d,%d legacy=%d finger=%d mouse=%d gw=%d/%d gamewin=%p",
                action,
@@ -1286,6 +1315,7 @@ static int controls_emit_engine_touch(int compact_id,
                gamewindow);
         log_count++;
     }
+#endif
     return finger_sent || mouse_sent || gw_sent;
 }
 
@@ -1404,7 +1434,9 @@ static void controls_queue_engine_input(EngineInputQueueFn queue_fn,
                                         ControlsAction action,
                                         float x,
                                         float y) {
+#ifdef DEBUG_SOLOADER
     static unsigned log_count = 0;
+#endif
 
     if (!queue_fn || input_code == 0) {
         return;
@@ -1419,6 +1451,7 @@ static void controls_queue_engine_input(EngineInputQueueFn queue_fn,
              -1,
              &null_mapper);
 
+#ifdef DEBUG_SOLOADER
     if (log_count < 24U) {
         l_info("INPUT %s queue code=0x%04X action=%d xy=%.3f,%.3f",
                route ? route : "engine",
@@ -1428,6 +1461,9 @@ static void controls_queue_engine_input(EngineInputQueueFn queue_fn,
                y);
         log_count++;
     }
+#else
+    (void)route;
+#endif
 }
 
 /* SAVE-RENAME KEYBOARD delivery (2026-07-18): feed the IME-entered name to the
@@ -1448,7 +1484,9 @@ void mcsm_ime_deliver(const char *utf8) {
 }
 
 static int controls_emit_engine_key(int32_t keycode, ControlsAction action) {
+#ifdef DEBUG_SOLOADER
     static unsigned log_count = 0;
+#endif
     const int sdl_key = controls_sdl_key_for_android_keycode(keycode);
 
     if (!g_app_on_key_event || sdl_key == 0) {
@@ -1462,6 +1500,7 @@ static int controls_emit_engine_key(int32_t keycode, ControlsAction action) {
 
     g_app_on_key_event(controls_engine_event_type(action), &event);
 
+#ifdef DEBUG_SOLOADER
     if (log_count < 16U) {
         l_info("INPUT engine-key code=%d sdl=0x%08X action=%d",
                keycode,
@@ -1469,6 +1508,7 @@ static int controls_emit_engine_key(int32_t keycode, ControlsAction action) {
                action);
         log_count++;
     }
+#endif
     return 1;
 }
 
@@ -1508,7 +1548,9 @@ static int is_android_sdl_pad_keycode(int32_t keycode) {
  * Vita as one pad with real buttons and stick axes. */
 void mcsm_register_virtual_controller(void) {
     static int s_registered = 0;
+#ifdef DEBUG_SOLOADER
     static int s_attempts = 0;
+#endif
     if (s_registered) {
         return;
     }
@@ -1517,10 +1559,12 @@ void mcsm_register_virtual_controller(void) {
         /* Re-resolve directly in case the symbol wasn't ready at first resolve. */
         g_sdl_add_joystick = (SdlAddJoystickFn)so_symbol(&so_mod_sdl2, "Java_org_libsdl_app_SDLActivity_nativeAddJoystick");
     }
+#ifdef DEBUG_SOLOADER
     if (s_attempts < 4) {
         l_info("INPUT: register_virtual_controller attempt=%d add_joystick=%p", s_attempts, (void *)g_sdl_add_joystick);
         s_attempts++;
     }
+#endif
     if (!g_sdl_add_joystick) {
         return;
     }
@@ -1559,7 +1603,9 @@ void mcsm_register_virtual_controller(void) {
 }
 
 static int controls_emit_sdl_pad_button(int32_t keycode, ControlsAction action) {
+#ifdef DEBUG_SOLOADER
     static unsigned log_count = 0;
+#endif
 
     if ((action != CONTROLS_ACTION_DOWN && action != CONTROLS_ACTION_UP) ||
         !is_android_sdl_pad_keycode(keycode)) {
@@ -1587,6 +1633,7 @@ static int controls_emit_sdl_pad_button(int32_t keycode, ControlsAction action) 
         sent = 1;
     }
 
+#ifdef DEBUG_SOLOADER
     if (sent && log_count < 16U) {
         l_info("INPUT sdl-pad code=%d action=%d device=%d",
                keycode,
@@ -1594,6 +1641,7 @@ static int controls_emit_sdl_pad_button(int32_t keycode, ControlsAction action) 
                SDL_JOYSTICK_ID_VITA);
         log_count++;
     }
+#endif
     return sent;
 }
 
@@ -1612,9 +1660,12 @@ static int controls_emit_sdl_trigger(int32_t keycode, ControlsAction action) {
 }
 
 void controls_handler_key(int32_t keycode, ControlsAction action) {
+#ifdef DEBUG_SOLOADER
     static unsigned log_count = 0;
     static unsigned gated_log_count = 0;
+#endif
     if (!input_delivery_ready()) {
+#ifdef DEBUG_SOLOADER
         if (gated_log_count < 8U) {
             l_info("INPUT key gated before input-ready code=%d action=%d scene=%d frames=%u",
                    keycode,
@@ -1623,33 +1674,36 @@ void controls_handler_key(int32_t keycode, ControlsAction action) {
                    launch_state_get_present_count());
             gated_log_count++;
         }
+#endif
         return;
     }
     resolve_sdl_input_symbols();
     /* With native-engine-only input this is intentionally a logged no-op. */
     mcsm_register_virtual_controller();
 
-    /* SAVE-RENAME KEYBOARD (2026-07-18): MCSM never requests a soft keyboard
-     * through any path we can hook — Lua, SDL, and JNI (regular + static) were
-     * all traced and stayed empty. So repurpose the otherwise-redundant SELECT
-     * button (Circle/O already maps to ESCAPE for back/cancel) to raise the Vita
-     * IME on demand. Press SELECT on the rename screen, type, hit Enter; the
-     * result is fed to the engine from gl_swap via mcsm_ime_deliver(). */
+    /* SELECT NO LONGER RAISES THE KEYBOARD (removed 2026-08-01).
+     *
+     * It was bound here as a manual escape hatch back when the belief was that MCSM
+     * "never requests a soft keyboard through any path we can hook". That belief was
+     * wrong: the game asks for one over JNI (openGenericTextDialog /
+     * getGenericTextDialogFinished / ...Cancelled / ...Value, implemented in java.c).
+     * Nothing had ever reached the rename screen with a WORKING IME, so the lookups
+     * had never been seen to fail. Now that the real interface is wired up, the game
+     * opens the keyboard itself with the correct title and initial text, and a manual
+     * trigger is not just redundant -- it can raise an IME the engine is not waiting
+     * on, whose result then has nowhere to go.
+     *
+     * SELECT is still consumed rather than forwarded: Circle/O already maps to
+     * ESCAPE for back/cancel, so the engine has no binding for it. */
     if (keycode == AKEYCODE_BUTTON_SELECT) {
-        extern void mcsm_ime_begin(const char *);
-        extern int mcsm_ime_is_active(void);
-        if (action == CONTROLS_ACTION_DOWN && !mcsm_ime_is_active()) {
-            l_info("KEYBOARD: SELECT -> raising Vita IME");
-            mcsm_ime_begin("");
-        }
-        return;   /* consume SELECT entirely; Circle handles back/cancel */
+        return;
     }
 
     const int vita_platform_code = controls_vita_platform_code_for_keycode(keycode);
     const int generic_input_code = controls_generic_input_code_for_keycode(keycode);
     const int abstract_input_code = controls_abstract_input_code_for_keycode(keycode);
     const int sdl_pad_candidate = is_android_sdl_pad_keycode(keycode);
-    int engine_key_sent = 0;
+    int engine_key_sent __attribute__((unused)) = 0;
     int sdl_pad_sent = 0;
     /* The Vita has ONE shoulder pair -> dedicate physical L1/R1 to console L2/R2.
      * The fight ButtonMash QTE reads L2/R2 ONLY as SDL trigger axes, so route the
@@ -1736,6 +1790,7 @@ void controls_handler_key(int32_t keycode, ControlsAction action) {
         engine_key_sent = controls_emit_engine_key(keycode, action);
     }
 
+#ifdef DEBUG_SOLOADER
     if (log_count < 16U) {
         l_info("INPUT key code=%d action=%d platform=0x%04X generic=0x%04X abstract=0x%04X sdl_pad=%d engine_key=%d route=%s",
                keycode,
@@ -1748,11 +1803,14 @@ void controls_handler_key(int32_t keycode, ControlsAction action) {
                "engine");
         log_count++;
     }
+#endif
 }
 
 void controls_handler_touch(int32_t id, float x, float y, ControlsAction action) {
+#ifdef DEBUG_SOLOADER
     static unsigned log_count = 0;
     static unsigned gated_log_count = 0;
+#endif
     if (!input_delivery_ready()) {
         /* TOUCH SLOT LEAK FIX (2026-07-23): the compact slot table is only freed
          * on UP, inside android_motion_action_for_touch() below -- which this early
@@ -1764,6 +1822,7 @@ void controls_handler_touch(int32_t id, float x, float y, ControlsAction action)
         if (action == CONTROLS_ACTION_UP) {
             active_touch_remove(id);
         }
+#ifdef DEBUG_SOLOADER
         if (gated_log_count < 8U) {
             l_info("INPUT touch gated before input-ready id=%d action=%d xy=%.1f,%.1f scene=%d frames=%u",
                    id,
@@ -1774,6 +1833,7 @@ void controls_handler_touch(int32_t id, float x, float y, ControlsAction action)
                    launch_state_get_present_count());
             gated_log_count++;
         }
+#endif
         return;
     }
     resolve_sdl_input_symbols();
@@ -1789,9 +1849,9 @@ void controls_handler_touch(int32_t id, float x, float y, ControlsAction action)
 
     const float nx = clamp01(x / VITA_TOUCH_W);
     const float ny = clamp01(y / VITA_TOUCH_H);
-    int native_touch_sent = 0;
-    int direct_sdl_sent = 0;
-    int direct_engine_sent = 0;
+    int native_touch_sent __attribute__((unused)) = 0;
+    int direct_sdl_sent __attribute__((unused)) = 0;
+    int direct_engine_sent __attribute__((unused)) = 0;
 
     /* The engine-direct path (controls_emit_engine_touch) delivers correct
      * coordinates to Application_SDL::OnFingering, OnMouseEvent,
@@ -1804,6 +1864,7 @@ void controls_handler_touch(int32_t id, float x, float y, ControlsAction action)
     (void)android_action;
     direct_engine_sent = controls_emit_engine_touch(compact_id, x, y, nx, ny, action);
 
+#ifdef DEBUG_SOLOADER
     if (log_count < 32U) {
         l_info("INPUT touch id=%d slot=%d action=%d android=%d active=%u native=%d direct=%d/%d xy=%.1f,%.1f norm=%.3f,%.3f",
                id,
@@ -1820,10 +1881,13 @@ void controls_handler_touch(int32_t id, float x, float y, ControlsAction action)
                ny);
         log_count++;
     }
+#endif
 }
 
 void controls_handler_analog(ControlsStickId which, float x, float y, ControlsAction action) {
+#ifdef DEBUG_SOLOADER
     static unsigned log_count = 0;
+#endif
     if (!input_delivery_ready()) {
         return;
     }
@@ -1835,7 +1899,7 @@ void controls_handler_analog(ControlsStickId which, float x, float y, ControlsAc
     const int axis_x = (which == CONTROLS_STICK_RIGHT) ? 2 : 0;
     const int axis_y = (which == CONTROLS_STICK_RIGHT) ? 3 : 1;
     int sdljoy_sent = 0;
-    int native_engine_sent = 0;
+    int native_engine_sent __attribute__((unused)) = 0;
 
     if (g_sdl_joy) {
         g_sdl_joy(&jni, NULL, SDL_JOYSTICK_ID_VITA, axis_x, x);
@@ -1853,6 +1917,7 @@ void controls_handler_analog(ControlsStickId which, float x, float y, ControlsAc
         native_engine_sent = 1;
     }
 
+#ifdef DEBUG_SOLOADER
     if (log_count < 16U) {
         l_info("INPUT analog stick=%d action=%d code=0x%04X xy=%.3f,%.3f sdljoy=%d native_engine=%d",
                which,
@@ -1864,4 +1929,5 @@ void controls_handler_analog(ControlsStickId which, float x, float y, ControlsAc
                native_engine_sent);
         log_count++;
     }
+#endif
 }
