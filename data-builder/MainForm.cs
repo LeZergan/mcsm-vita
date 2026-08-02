@@ -56,7 +56,7 @@ public sealed class MainForm : Form
 
     public MainForm()
     {
-        Text = "MCSM Vita Data Builder  •  v1.5";
+        Text = "MCSM Vita Data Builder  •  v1.6";
         StartPosition = FormStartPosition.CenterScreen;
         MinimumSize = new Size(860, 720);
         Size = new Size(1020, 850);
@@ -150,7 +150,7 @@ public sealed class MainForm : Form
         Label localOnly = new()
         {
             AutoSize = true,
-            Text = "v1.5  •  LOCAL / OFFLINE",
+            Text = "v1.6  •  LOCAL / OFFLINE",
             Font = new Font("Segoe UI Semibold", 8f),
             ForeColor = Info,
             Location = new Point(626, 10),
@@ -172,7 +172,7 @@ public sealed class MainForm : Form
         scanFolderButton.Click += async (_, _) => await BrowseSetupFolderAsync();
         _toolTip.SetToolTip(
             scanFolderButton,
-            "Find the supported APK, both OBBs, and recognizable Episode 2–8 files inside one folder.");
+            "Find the supported APK, both base OBBs, and PowerVR episode folders/OBBs/ZIPs inside one folder.");
 
         Label apkLabel = CreateFieldLabel("POWERVR APK  ·  v1.37 ONLY", 24, 68);
         ConfigureInputState(_apkValidationLabel, 250, 66, "NOT SELECTED");
@@ -261,7 +261,7 @@ public sealed class MainForm : Form
     {
         Panel card = CreateCard(
             "Episodes and extras",
-            "Episode 1 is included. Add owned Episodes 2–8 only if needed.",
+            "Episode 1 is included. Add a folder, chapter OBB, ZIP, or full nested bundle for Episodes 2–8.",
             166);
 
         _chapterList.Location = new Point(24, 68);
@@ -273,10 +273,11 @@ public sealed class MainForm : Form
         _chapterList.IntegralHeight = false;
 
         Button addFolder = CreateSecondaryButton("Add folder", 0, 68, 104);
-        Button addZip = CreateSecondaryButton("Add ZIP", 0, 103, 104);
+        Button addZip = CreateSecondaryButton("Add package", 0, 103, 104);
         Button remove = CreateGhostButton("Remove", 24, 132, 72);
         addFolder.Click += async (_, _) => await BrowseChapterFolderAsync();
         addZip.Click += async (_, _) => await BrowseChapterZipAsync();
+        _toolTip.SetToolTip(addZip, "Accepts chapter .obb files, normal ZIPs, and large ZIPs containing nested chapter packages.");
         remove.Click += (_, _) =>
         {
             if (_chapterList.SelectedItem is not null)
@@ -329,13 +330,20 @@ public sealed class MainForm : Form
         Label profileLabel = CreateFieldLabel("GRAPHICS PROFILE", 24, 123);
         ConfigureCombo(_profileBox, 24, 142, 220);
         _profileBox.Items.AddRange([
-            new Choice("Default — recommended", "default"),
+            new Choice("Balanced — recommended", "balanced"),
             new Choice("Performance — fastest", "performance"),
-            new Choice("Balanced", "balanced"),
             new Choice("Quality", "quality"),
             new Choice("Battery", "battery"),
             new Choice("Custom — make your own", "custom")
         ]);
+
+        Button profileGuide = CreateGhostButton("View profiles", 0, 13, 104);
+        profileGuide.ForeColor = Info;
+        profileGuide.Click += (_, _) =>
+        {
+            using ProfileGuideDialog dialog = new();
+            dialog.ShowDialog(this);
+        };
 
         ConfigureSecondaryButton(_customizeProfileButton, "Make custom", 252, 140, 124);
         _customizeProfileButton.Click += (_, _) => OpenCustomProfileDialog();
@@ -364,14 +372,16 @@ public sealed class MainForm : Form
             int buttonX = card.ClientSize.Width - 128;
             _outputBox.Width = Math.Max(300, buttonX - 42);
             outputButton.Left = buttonX;
+            profileGuide.Left = buttonX;
             _customProfileSummaryLabel.Width = Math.Max(150, card.ClientSize.Width - 610);
         }
         card.SizeChanged += (_, _) => ResizeFields();
 
         _outputBox.TextChanged += (_, _) => UpdateReadyState();
         _profileBox.SelectedIndexChanged += (_, _) => UpdateCustomProfileUi();
-        _inputs.AddRange([_outputBox, outputButton, _profileBox, _customizeProfileButton, _languageBox]);
+        _inputs.AddRange([_outputBox, outputButton, _profileBox, _customizeProfileButton, _languageBox, profileGuide]);
         card.Controls.AddRange([
+            profileGuide,
             outputLabel, _outputBox, outputButton,
             profileLabel, _profileBox, _customizeProfileButton,
             languageLabel, _languageBox, _customProfileSummaryLabel
@@ -414,7 +424,7 @@ public sealed class MainForm : Form
             $"AUTO  •  VERIFIED  •  {FormatBytes(DataBuilderService.SupportedPatchObbBytes)}",
             Primary,
             "✓");
-        SelectProfile("custom");
+        SelectProfile("balanced");
         UpdateCustomProfileUi();
         UpdateBaseNote();
         UpdateOptionalSummary();
@@ -443,7 +453,14 @@ public sealed class MainForm : Form
         _customizeProfileButton.FlatAppearance.BorderColor = customSelected ? Primary : Border;
         _customProfileSummaryLabel.Text = customSelected
             ? _customProfile.Summary
-            : "Custom maker available";
+            : (_profileBox.SelectedItem as Choice)?.Value switch
+            {
+                "balanced" => "Best all-round · 720×408 · 30 FPS",
+                "performance" => "Fastest · 640×362 · 30 FPS",
+                "quality" => "Sharpest · 800×452 · 30 FPS",
+                "battery" => "Lower power · adaptive CPU",
+                _ => "Choose a profile"
+            };
         _customProfileSummaryLabel.ForeColor = customSelected ? Primary : TextSoft;
     }
 
@@ -943,9 +960,9 @@ public sealed class MainForm : Form
     {
         using OpenFileDialog dialog = new()
         {
-            Title = "Choose one or more chapter ZIPs",
-            Filter = "Chapter ZIP (*.zip)|*.zip",
-            DefaultExt = "zip",
+            Title = "Choose chapter OBBs, ZIPs, or full chapter bundles",
+            Filter = "Chapter packages (*.obb;*.zip)|*.obb;*.zip|Chapter OBB (*.obb)|*.obb|ZIP bundle (*.zip)|*.zip",
+            DefaultExt = "obb",
             AddExtension = false,
             CheckFileExists = true,
             RestoreDirectory = true,
@@ -1319,14 +1336,20 @@ public sealed class MainForm : Form
             }
             else if (File.Exists(path) && extension.Equals(".obb", StringComparison.OrdinalIgnoreCase))
             {
-                bool looksLikePatch = Path.GetFileName(path).StartsWith("patch.", StringComparison.OrdinalIgnoreCase);
-                if (looksLikePatch || PathsMatch(_validatedMainObbPath, _obbBox.Text))
+                long size = new FileInfo(path).Length;
+                bool looksLikePatch = size == DataBuilderService.SupportedPatchObbBytes;
+                bool looksLikeSupportedMain = size == DataBuilderService.SupportedMainObbBytes;
+                if (looksLikePatch)
                 {
                     await SelectPatchObbAsync(path);
                 }
-                else
+                else if (looksLikeSupportedMain)
                 {
                     await SelectMainObbAsync(path);
+                }
+                else
+                {
+                    await AddChapterSourceAsync(path);
                 }
             }
             else if (Directory.Exists(path)

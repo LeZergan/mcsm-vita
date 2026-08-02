@@ -3,7 +3,8 @@ namespace McsmVitaDataBuilder;
 public enum ChapterSourceKind
 {
     Folder,
-    ZipArchive
+    ZipArchive,
+    ObbArchive
 }
 
 public sealed record ChapterSource(
@@ -20,7 +21,7 @@ public sealed record ChapterSource(
             string episodes = Episodes.Count == 1
                 ? $"Episode {Episodes[0]}"
                 : $"Episodes {string.Join(", ", Episodes)}";
-            return $"{episodes}  ·  {FileCount} files  ·  {FormatBytes(TotalBytes)}";
+            return $"{episodes}  ·  PowerVR ✓  ·  {FileCount} files  ·  {FormatBytes(TotalBytes)}";
         }
     }
 

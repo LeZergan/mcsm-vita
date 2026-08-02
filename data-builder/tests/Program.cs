@@ -79,6 +79,13 @@ if (args.Length == 2 && args[0].Equals("--render-custom-advanced", StringCompari
     return 0;
 }
 
+if (args.Length == 2 && args[0].Equals("--render-profiles", StringComparison.OrdinalIgnoreCase))
+{
+    RenderForm(args[1], () => new ProfileGuideDialog());
+    Console.WriteLine($"Rendered graphics-profile guide preview: {args[1]}");
+    return 0;
+}
+
 string root = Path.Combine(Path.GetTempPath(), $"mcsm-data-builder-smoke-{Guid.NewGuid():N}");
 try
 {
@@ -224,6 +231,34 @@ try
         WriteEntry(zip, "nested/Net/readme.txt", "ignored");
     }
 
+    string episode4Obb = Path.Combine(inputs, "chapter-episode4-powervr.obb");
+    using (ZipArchive obb = ZipFile.Open(episode4Obb, ZipArchiveMode.Create))
+    {
+        WriteEntry(obb, "files/Net/MCSM_android_Minecraft104_data.ttarch2", "episode 4 marker");
+        WriteEntry(obb, "files/Net/_resdesc_50_Minecraft104_android-pvr.lua", "episode 4 descriptor");
+        WriteEntry(obb, "files/Net/MCSM_android_Minecraft104_mali.ttarch2", "wrong renderer ignored");
+    }
+
+    string nestedEpisode5 = Path.Combine(root, "nested-episode5.obb");
+    using (ZipArchive obb = ZipFile.Open(nestedEpisode5, ZipArchiveMode.Create))
+    {
+        WriteEntry(obb, "deep/Net/MCSM_android_Minecraft105_data.ttarch2", "episode 5 marker");
+        WriteEntry(obb, "deep/Net/_resdesc_50_Minecraft105_android-pvr.lua", "episode 5 descriptor");
+    }
+    string fullChapterZip = Path.Combine(inputs, "full-chapters.zip");
+    using (ZipArchive zip = ZipFile.Open(fullChapterZip, ZipArchiveMode.Create))
+    {
+        zip.CreateEntryFromFile(nestedEpisode5, "owned chapters/episode5.obb", CompressionLevel.NoCompression);
+        WriteEntry(zip, "notes/readme.txt", "ignored");
+    }
+
+    string maliOnlyObb = Path.Combine(inputs, "chapter-episode6-mali.obb");
+    using (ZipArchive obb = ZipFile.Open(maliOnlyObb, ZipArchiveMode.Create))
+    {
+        WriteEntry(obb, "files/Net/MCSM_android_Minecraft106_data.ttarch2", "episode 6 marker");
+        WriteEntry(obb, "files/Net/_resdesc_50_Minecraft106_android-mali.lua", "wrong renderer");
+    }
+
     string buttonFix = Path.Combine(inputs, "button-fix");
     Directory.CreateDirectory(buttonFix);
     foreach (string mesh in new[]
@@ -266,17 +301,31 @@ try
 
     ChapterSource source2 = ChapterScanner.Inspect(Path.Combine(inputs, "episode2"));
     ChapterSource source3 = ChapterScanner.Inspect(episode3Zip);
+    ChapterSource source4 = ChapterScanner.Inspect(episode4Obb);
+    ChapterSource source5 = ChapterScanner.Inspect(fullChapterZip);
     DataAddonSource addonFolder = DataAddonScanner.Inspect(Path.Combine(inputs, "folder-mod"));
     DataAddonSource addonZip = DataAddonScanner.Inspect(modZip);
     Assert(source2.Episodes.SequenceEqual([2]), "Episode 2 folder detection failed.");
     Assert(source3.Episodes.SequenceEqual([3]), "Episode 3 ZIP detection failed.");
+    Assert(source4.Kind == ChapterSourceKind.ObbArchive && source4.Episodes.SequenceEqual([4]), "Episode 4 OBB detection failed.");
+    Assert(source5.Episodes.SequenceEqual([5]), "Nested full chapter ZIP detection failed.");
+    bool maliChapterRejected = false;
+    try
+    {
+        _ = ChapterScanner.Inspect(maliOnlyObb);
+    }
+    catch (InvalidDataException)
+    {
+        maliChapterRejected = true;
+    }
+    Assert(maliChapterRejected, "A Mali-only chapter OBB was accepted as PowerVR data.");
     SetupFolderScanResult scannedFolder = SetupFolderScanner.Scan(inputs);
     Assert(scannedFolder.ApkPath is null, "Folder scan accepted an unverified synthetic APK.");
     Assert(scannedFolder.MainObbPath is null, "Folder scan accepted an unverified synthetic main OBB.");
     Assert(scannedFolder.PatchObbPath is null, "Folder scan accepted an unverified synthetic patch OBB.");
     Assert(
-        scannedFolder.Chapters.SelectMany(source => source.Episodes).Distinct().Order().SequenceEqual([2, 3]),
-        "Folder scan did not discover the optional chapter folder and ZIP.");
+        scannedFolder.Chapters.SelectMany(source => source.Episodes).Distinct().Order().SequenceEqual([2, 3, 4, 5]),
+        "Folder scan did not discover folder, ZIP, OBB, and nested chapter inputs.");
     Assert(
         ChapterScanner.DetectEpisodes([
             "MCSM_android_JesseMale105_dlog.ttarch2",
@@ -290,7 +339,7 @@ try
         mainObb,
         patchObb,
         output,
-        [source2, source3],
+        [source2, source3, source4, source5],
         "custom",
         new CustomProfileSettings
         {
@@ -337,7 +386,7 @@ try
 
     BuildResult first = await builder.BuildAsync(request);
     BundledAsset? embeddedChoiceData = DataBuilderService.InspectBundledChoiceData();
-    Assert(first.IncludedEpisodes.SequenceEqual([1, 2, 3]), "Included episode list is wrong.");
+    Assert(first.IncludedEpisodes.SequenceEqual([1, 2, 3, 4, 5]), "Included episode list is wrong.");
     Assert(first.ButtonFixFileCount == 4, "User-supplied controller fix was not installed.");
     Assert(first.ChoiceDataIncluded == (embeddedChoiceData is not null), "Offline choice-data status is wrong.");
     Assert(first.DataAddonFileCount == 4, "Experimental data add-on file count is wrong.");
@@ -348,6 +397,9 @@ try
     Assert(File.Exists(Path.Combine(output, "assets", "nested", "config.bin")), "Nested APK asset is missing.");
     Assert(File.Exists(Path.Combine(output, "assets", "MCSM_android_Minecraft102_data.ttarch2")), "Episode 2 marker is missing.");
     Assert(File.Exists(Path.Combine(output, "assets", "MCSM_android_Minecraft103_data.ttarch2")), "Episode 3 marker is missing.");
+    Assert(File.Exists(Path.Combine(output, "assets", "MCSM_android_Minecraft104_data.ttarch2")), "Episode 4 OBB marker is missing.");
+    Assert(File.Exists(Path.Combine(output, "assets", "MCSM_android_Minecraft105_data.ttarch2")), "Nested Episode 5 marker is missing.");
+    Assert(!File.Exists(Path.Combine(output, "assets", "MCSM_android_Minecraft104_mali.ttarch2")), "A Mali chapter asset was copied.");
     Assert(!File.Exists(Path.Combine(output, "assets", "do-not-copy.txt")), "Unrelated chapter file was copied.");
     Assert(File.Exists(Path.Combine(output, "assets", "ui_action_promptFacebuttonDown.d3dmesh")), "Controller fix mesh is missing.");
     if (embeddedChoiceData is not null)
@@ -384,22 +436,22 @@ try
     ButtonFixBundle? embeddedFix = DataBuilderService.InspectBundledButtonFix();
     BuildRequest embeddedRequest = request with
     {
-        GraphicsProfile = "default",
+        GraphicsProfile = "balanced",
         ButtonFixPath = null,
         DataAddons = []
     };
     BuildResult second = await builder.BuildAsync(embeddedRequest);
     Assert(second.BackupDirectory is not null && Directory.Exists(second.BackupDirectory), "Existing output was not preserved as a backup.");
     Assert(second.ButtonFixFileCount == (embeddedFix?.FileCount ?? 0), "Built-in controller fix count is wrong.");
-    string defaultGraphics = await File.ReadAllTextAsync(Path.Combine(output, "settings", "graphics.txt"));
-    Assert(defaultGraphics.Contains("profile = default"), "Recommended default profile was not written.");
+    string balancedGraphics = await File.ReadAllTextAsync(Path.Combine(output, "settings", "graphics.txt"));
+    Assert(balancedGraphics.Contains("profile = balanced"), "Recommended Balanced profile was not written.");
     if (embeddedFix is not null)
     {
         Assert(File.Exists(Path.Combine(output, "assets", embeddedFix.Assets[0].Name)), "Built-in controller fix was not extracted.");
     }
     Assert(File.Exists(Path.Combine(output, "DATA_FOLDER_READY.txt")), "Final ready marker is missing.");
 
-    Console.WriteLine("PASS: folder discovery, PowerVR/version checks, custom profiles, recommended default, OBB extraction, chapters, controller fixes, choice data, add-ons, settings, and backups.");
+    Console.WriteLine("PASS: folder discovery, PowerVR/version checks, profile defaults, chapter folders/OBBs/nested ZIPs, renderer filtering, controller fixes, choice data, add-ons, settings, and backups.");
     return 0;
 }
 catch (Exception exception)

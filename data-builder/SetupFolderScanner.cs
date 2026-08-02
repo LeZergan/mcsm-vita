@@ -78,11 +78,11 @@ public static class SetupFolderScanner
             TryAddChapter(parent, candidates);
         }
 
-        foreach (string zip in files.Where(path => HasExtension(path, ".zip")))
+        foreach (string package in files.Where(ChapterScanner.IsChapterPackage))
         {
-            if (seenPaths.Add(zip))
+            if (seenPaths.Add(package))
             {
-                TryAddChapter(zip, candidates);
+                TryAddChapter(package, candidates);
             }
         }
 

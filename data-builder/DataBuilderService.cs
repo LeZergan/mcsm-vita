@@ -192,6 +192,13 @@ public sealed class DataBuilderService
                         bytes => copiedBytes += bytes,
                         status => Report(status),
                         cancellationToken),
+                    ChapterSourceKind.ObbArchive => await CopyChapterZipAsync(
+                        source,
+                        Path.Combine(stagingDirectory, "assets"),
+                        copiedNames,
+                        bytes => copiedBytes += bytes,
+                        status => Report(status),
+                        cancellationToken),
                     _ => throw new ArgumentOutOfRangeException()
                 };
                 chapterFileCount += copied;
@@ -625,7 +632,7 @@ public sealed class DataBuilderService
         {
             throw new InvalidDataException("Choose where to create the mcsm folder.");
         }
-        if (!new[] { "default", "performance", "balanced", "quality", "battery", "custom" }
+        if (!new[] { "performance", "balanced", "quality", "battery", "custom" }
             .Contains(request.GraphicsProfile))
         {
             throw new InvalidDataException("Choose a valid graphics profile.");
@@ -690,10 +697,31 @@ public sealed class DataBuilderService
         CancellationToken cancellationToken)
     {
         int copied = 0;
-        foreach (string file in Directory.EnumerateFiles(source.Path, "*", SearchOption.AllDirectories)
-                     .Where(ChapterScanner.IsChapterFile))
+        foreach (string file in Directory.EnumerateFiles(source.Path, "*", SearchOption.AllDirectories))
         {
             cancellationToken.ThrowIfCancellationRequested();
+            if (ChapterScanner.IsChapterPackage(file))
+            {
+                try
+                {
+                    copied += await CopyChapterArchiveFileAsync(
+                        file,
+                        assetsDirectory,
+                        copiedNames,
+                        addBytes,
+                        report,
+                        cancellationToken);
+                }
+                catch (InvalidDataException)
+                {
+                    // Full setup folders may also contain the raw base OBBs.
+                }
+                continue;
+            }
+            if (!ChapterScanner.IsChapterFile(file))
+            {
+                continue;
+            }
             string fileName = Path.GetFileName(file);
             await using FileStream input = new(
                 file, FileMode.Open, FileAccess.Read, FileShare.Read, 1024 * 1024,
@@ -807,27 +835,144 @@ public sealed class DataBuilderService
         Action<string> report,
         CancellationToken cancellationToken)
     {
-        int copied = 0;
-        using ZipArchive zip = ZipFile.OpenRead(source.Path);
-        foreach (ZipArchiveEntry entry in zip.Entries
-                     .Where(entry => !string.IsNullOrEmpty(entry.Name) && ChapterScanner.IsChapterFile(entry.Name)))
+        return await CopyChapterArchiveFileAsync(
+            source.Path,
+            assetsDirectory,
+            copiedNames,
+            addBytes,
+            report,
+            cancellationToken);
+    }
+
+    private static async Task<int> CopyChapterArchiveFileAsync(
+        string archivePath,
+        string assetsDirectory,
+        IDictionary<string, string> copiedNames,
+        Action<int> addBytes,
+        Action<string> report,
+        CancellationToken cancellationToken)
+    {
+        string temporaryDirectory = Path.Combine(
+            Path.GetTempPath(),
+            $"mcsm-chapter-build-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(temporaryDirectory);
+        try
         {
-            cancellationToken.ThrowIfCancellationRequested();
-            using Stream input = entry.Open();
-            bool written = await CopyChapterStreamAsync(
-                input,
-                entry.Length,
-                entry.Name,
-                $"{source.Path}:{entry.FullName}",
+            return await CopyChapterArchiveRecursiveAsync(
+                archivePath,
+                archivePath,
+                temporaryDirectory,
+                0,
+                false,
                 assetsDirectory,
                 copiedNames,
                 addBytes,
+                report,
                 cancellationToken);
-            if (written)
+        }
+        finally
+        {
+            string fullTemporaryDirectory = Path.GetFullPath(temporaryDirectory);
+            string tempRoot = Path.GetFullPath(Path.GetTempPath());
+            if (Directory.Exists(fullTemporaryDirectory)
+                && fullTemporaryDirectory.StartsWith(tempRoot, StringComparison.OrdinalIgnoreCase)
+                && Path.GetFileName(fullTemporaryDirectory).StartsWith("mcsm-chapter-build-", StringComparison.Ordinal))
             {
-                copied++;
-                report($"Added chapter file {entry.Name}");
+                Directory.Delete(fullTemporaryDirectory, recursive: true);
             }
+        }
+    }
+
+    private static async Task<int> CopyChapterArchiveRecursiveAsync(
+        string archivePath,
+        string sourceLabel,
+        string temporaryDirectory,
+        int depth,
+        bool ignoreInvalidArchive,
+        string assetsDirectory,
+        IDictionary<string, string> copiedNames,
+        Action<int> addBytes,
+        Action<string> report,
+        CancellationToken cancellationToken)
+    {
+        if (depth > 4)
+        {
+            throw new InvalidDataException("Chapter packages may be nested no more than 4 levels deep.");
+        }
+
+        ZipArchive zip;
+        try
+        {
+            zip = ZipFile.OpenRead(archivePath);
+        }
+        catch (InvalidDataException) when (ignoreInvalidArchive)
+        {
+            return 0;
+        }
+
+        int copied = 0;
+        int nestedIndex = 0;
+        using (zip)
+        {
+        foreach (ZipArchiveEntry entry in zip.Entries.Where(entry => !string.IsNullOrEmpty(entry.Name)))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (ChapterScanner.IsChapterFile(entry.FullName))
+            {
+                using Stream input = entry.Open();
+                bool written = await CopyChapterStreamAsync(
+                    input,
+                    entry.Length,
+                    entry.Name,
+                    $"{sourceLabel}!/{entry.FullName}",
+                    assetsDirectory,
+                    copiedNames,
+                    addBytes,
+                    cancellationToken);
+                if (written)
+                {
+                    copied++;
+                    report($"Added chapter file {entry.Name}");
+                }
+                continue;
+            }
+
+            if (!ChapterScanner.IsChapterPackage(entry.Name))
+            {
+                continue;
+            }
+            if (depth >= 4)
+            {
+                throw new InvalidDataException("Chapter packages may be nested no more than 4 levels deep.");
+            }
+
+            string nestedPath = Path.Combine(
+                temporaryDirectory,
+                $"{depth:D2}-{nestedIndex++:D4}-{Guid.NewGuid():N}{Path.GetExtension(entry.Name).ToLowerInvariant()}");
+            await using (FileStream output = new(
+                             nestedPath,
+                             FileMode.CreateNew,
+                             FileAccess.Write,
+                             FileShare.None,
+                             1024 * 1024,
+                             FileOptions.Asynchronous | FileOptions.SequentialScan))
+            using (Stream input = entry.Open())
+            {
+                await input.CopyToAsync(output, 1024 * 1024, cancellationToken);
+            }
+
+            copied += await CopyChapterArchiveRecursiveAsync(
+                nestedPath,
+                $"{sourceLabel}!/{entry.FullName}",
+                temporaryDirectory,
+                depth + 1,
+                true,
+                assetsDirectory,
+                copiedNames,
+                addBytes,
+                report,
+                cancellationToken);
+        }
         }
         return copied;
     }

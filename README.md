@@ -30,9 +30,9 @@ No *Minecraft: Story Mode* code or assets are included or linked — supply your
 The Windows [MCSM Vita Data Builder](data-builder/README.md) turns user-owned Android files into the exact ready-to-copy Vita folder. It does not download or contain game data.
 
 1. Open `MCSM-Vita-Data-Builder.exe`.
-2. Press **Scan folder** and choose the folder containing your Android files. The builder finds the exact PowerVR v1.37 APK, both matching OBBs, and recognizable Episodes 2–8 automatically. You can still browse for each file manually.
-3. Keep **Default — recommended**, choose another preset, or press **Make custom** for an Easy/Advanced profile editor.
-4. Optionally add Episode 2–8 folders or chapter ZIPs.
+2. Press **Scan folder** and choose the folder containing your Android files. The builder finds the exact PowerVR v1.37 APK, both matching base OBBs, and recognizable Episodes 2–8 automatically. You can still browse for each file manually.
+3. Keep **Balanced — recommended**, choose another preset, press **View profiles** for a quick comparison, or press **Make custom** for an Easy/Advanced profile editor.
+4. Optionally add Episode 2–8 folders, chapter OBBs, ZIPs, or full nested chapter bundles.
 5. Press **Build Data Folder**, then copy the resulting `mcsm` folder to `ux0:data/` with VitaShell.
 
 The final required path is `ux0:data/mcsm/assets`. The compact builder keeps version, renderer, OBB, bundled-fix, profile, and readiness information visible without exposing unnecessary setup controls. It reads `AndroidManifest.xml`, verifies the exact known PowerVR fingerprint, and accepts only the supported v1.37 APK (`versionCode 40137`); renaming an older or Mali/Adreno APK does not bypass the check. Both fingerprint-matched PowerVR OBBs are required. Extra chapter `.ttarch2` and descriptor `.lua` files are detected, validated, and put in the correct shared assets folder.
@@ -43,7 +43,7 @@ To build the self-contained Windows EXE from source:
 .\data-builder\build.ps1
 ```
 
-The app also creates `settings/graphics.txt` and `settings/game.txt`. **Default** is the recommended starting profile. The built-in Custom Profile maker exposes six simple Easy choices or exact Advanced resolution, FPS, PowerVR GPU name, effects, detail, distance, clock, filtering, and compatibility fixes. The generated text remains editable afterward. Advanced mode includes a 60 FPS cap, but that is a maximum target rather than a guaranteed lock—crowded scenes with many characters can fall to around 20 FPS.
+The app also creates `settings/graphics.txt` and `settings/game.txt`. **Balanced** is the recommended starting profile. The profile guide shows every preset's resolution, FPS cap, reported PowerVR GPU, detail, distance, and main tradeoff. The built-in Custom Profile maker exposes six simple Easy choices or exact Advanced resolution, FPS, PowerVR GPU name, effects, detail, distance, clock, filtering, and compatibility fixes. The generated text remains editable afterward. Advanced mode includes a 60 FPS cap, but that is a maximum target rather than a guaranteed lock—crowded scenes with many characters can fall to around 20 FPS.
 
 The **Fix & mods** panel can install a supplied controller-button asset fix and merge extra folders/ZIPs into the generated data directory. Locally distributed builds can also include the supported offline `choice.prop` dataset required by the crowd-choice statistics screen. General mod installation is experimental and has not been tested on Vita; add-ons are applied last, while the canonical OBBs and native runtime libraries remain protected.
 

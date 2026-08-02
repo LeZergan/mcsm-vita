@@ -4,12 +4,14 @@ A simple Windows app that creates the exact `ux0:data/mcsm` folder required by t
 
 ## Using the app
 
-1. Press **Scan folder** and choose the folder containing your game files. The app searches subfolders for the supported PowerVR APK, main OBB, patch OBB, Episode 2–8 folders, and chapter ZIPs.
+1. Press **Scan folder** and choose the folder containing your game files. The app searches subfolders for the supported PowerVR APK, both base OBBs, Episode 2–8 folders, chapter OBBs, ZIPs, and full nested chapter bundles.
 2. Review the compact verification labels. Missing files can still be selected individually with **Browse**. The APK manifest and exact supported PowerVR fingerprint are checked; Mali, Adreno, altered, and older APKs are rejected. Both OBBs must match too.
-3. Keep **Default — recommended**, choose a preset, or press **Make custom**. The custom maker offers an Easy mode with six clear choices and an Advanced mode with every supported exact value.
+3. Keep **Balanced — recommended**, choose another preset, or press **Make custom**. **View profiles** shows the useful differences at a glance; the custom maker offers an Easy mode with six clear choices and an Advanced mode with every supported exact value.
 4. Optionally add Episode 2–8 sources. The app accepts either:
    - the episode folder (including the original `com.telltalegames.minecraft100/files/Net` layout), or
-   - a ZIP containing that episode's `.ttarch2` and descriptor `.lua` files.
+   - a chapter `.obb`, ZIP, or large full bundle containing one or more nested chapter packages.
+
+The chapter importer copies generic and PowerVR/SGX assets, ignores Mali/Adreno variants in mixed bundles, and rejects packages with no PowerVR evidence.
 5. Choose the output location and press **Build Data Folder**.
 6. Copy the resulting `mcsm` folder to `ux0:data/` with VitaShell.
 
@@ -65,9 +67,9 @@ The self-contained executable is written to `dist/MCSM-Vita-Data-Builder.exe`. T
 
 - APK: the exact supported PowerVR v1.37 (`versionCode 40137`) build of `com.telltalegames.minecraft100`, with all five required ARMv7 libraries.
 - Base data: the exact supported PowerVR main `.obb` plus patch `.obb`; both are required and fingerprint-checked.
-- Folder scan: recursively discovers the verified base set and recognizable Episode 2–8 folders/ZIPs; it never accepts a candidate that fails the normal checks.
-- Graphics: Default (recommended), Performance, Balanced, Quality, Battery, or a builder-created Easy/Advanced Custom profile.
-- Extra episodes: folders or ZIPs containing `.ttarch2` and `.lua` files for Episodes 2–8.
+- Folder scan: recursively discovers the verified base set and recognizable Episode 2–8 folders, chapter OBBs, ZIPs, and nested full bundles; it never accepts a candidate that fails the normal checks.
+- Graphics: Balanced (recommended), Performance, Quality, Battery, or a builder-created Easy/Advanced Custom profile.
+- Extra episodes: folders, ZIPs, or ZIP-compatible chapter OBBs containing PowerVR `.ttarch2` and `.lua` files for Episodes 2–8. ZIPs and OBBs may be nested up to four levels deep.
 - Controller fix: a folder/ZIP containing `.d3dtx` files and all four required face-button `.d3dmesh` files.
 - Offline statistics: the supported non-empty `choice.prop` dataset when built into the local EXE.
 - Experimental mods: data folders or ZIPs to merge into `mcsm`.
