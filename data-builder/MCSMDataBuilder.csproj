@@ -11,7 +11,7 @@
     <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
     <DebugType>embedded</DebugType>
     <DebugSymbols>false</DebugSymbols>
-    <Version>1.6.0</Version>
+    <Version>1.7.0</Version>
     <ApplicationIcon Condition="Exists('LocalAssets\app-icon.ico')">LocalAssets\app-icon.ico</ApplicationIcon>
     <Authors>MCSM Vita contributors</Authors>
     <Description>Builds a ready-to-copy MCSM PS Vita data folder from user-owned Android files.</Description>
@@ -20,6 +20,9 @@
   <ItemGroup>
     <InternalsVisibleTo Include="MCSMDataBuilder.SmokeTests" />
     <EmbeddedResource Include="Defaults\*.txt" />
+    <EmbeddedResource Include="ThirdParty\ttarchext\ttarchext.exe">
+      <LogicalName>McsmVitaDataBuilder.ThirdParty.ttarchext.exe</LogicalName>
+    </EmbeddedResource>
     <EmbeddedResource Include="LocalAssets\button-fix.zip" Condition="Exists('LocalAssets\button-fix.zip')">
       <LogicalName>McsmVitaDataBuilder.LocalAssets.button-fix.zip</LogicalName>
     </EmbeddedResource>

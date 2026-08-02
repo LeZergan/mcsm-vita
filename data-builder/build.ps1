@@ -101,7 +101,17 @@ if ($LASTEXITCODE -ne 0) { throw "Publish failed." }
 $exe = Join-Path $output "MCSM-Vita-Data-Builder.exe"
 if (-not (Test-Path -LiteralPath $exe)) { throw "Expected executable was not created: $exe" }
 
-$hash = Get-FileHash -LiteralPath $exe -Algorithm SHA256
+$hash = $null
+for ($attempt = 1; $attempt -le 8; $attempt++) {
+    try {
+        $hash = Get-FileHash -LiteralPath $exe -Algorithm SHA256 -ErrorAction Stop
+        break
+    } catch [System.IO.IOException] {
+        if ($attempt -eq 8) { throw }
+        # Windows Defender can briefly retain a newly published single-file EXE.
+        Start-Sleep -Milliseconds 500
+    }
+}
 Write-Host ""
 Write-Host "Ready: $exe"
 Write-Host "SHA256: $($hash.Hash)"

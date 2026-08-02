@@ -9,7 +9,7 @@ Runs the Android build of *Minecraft: Story Mode* on the PS Vita. The package co
 The [latest GitHub release](../../releases/latest) contains both files needed for setup:
 
 - **`MCSM-1.10.vpk`** — complete loader with LiveArea artwork and trophy support; install with VitaShell.
-- **`MCSM-Vita-Data-Builder-v1.6.exe`** — creates the required `ux0:data/mcsm` folder from your legally owned Android files.
+- **`MCSM-Vita-Data-Builder-v1.7.exe`** — creates the required `ux0:data/mcsm` folder from your legally owned Android files.
 
 The release does not contain the Android game APK, OBBs, episodes, native libraries, or gameplay archives.
 
@@ -40,7 +40,7 @@ No Android game executable, native library, OBB, episode, or gameplay archive is
 The Windows [MCSM Vita Data Builder](data-builder/README.md) turns user-owned Android files into the exact ready-to-copy Vita folder. It does not download or contain game data.
 
 1. Open `MCSM-Vita-Data-Builder.exe`.
-2. Press **Scan folder** and choose the folder containing your Android files. The builder finds the exact PowerVR v1.37 APK, both matching base OBBs, and recognizable Episodes 2–8 automatically. You can still browse for each file manually.
+2. Press **Scan folder** and choose the folder containing your Android files. The builder finds the exact PowerVR v1.37 APK, both matching base OBBs, and recognizable Episodes 2–8 automatically. You can still browse for each file manually. Version 1.7 copies both OBBs and extracts their boot-critical NCTT contents into `mcsm/assets`; it refuses to finish an incomplete base folder.
 3. Keep **Balanced — recommended**, choose another preset, press **View profiles** for a quick comparison, or press **Make custom** for an Easy/Advanced profile editor.
 4. Optionally add Episode 2–8 folders, chapter OBBs, ZIPs, or full nested chapter bundles.
 5. Press **Build Data Folder**, then copy the resulting `mcsm` folder to `ux0:data/` with VitaShell.

@@ -33,6 +33,35 @@ if (args.Length == 2 && args[0].Equals("--scan-folder", StringComparison.Ordinal
     return found.BaseSetComplete ? 0 : 2;
 }
 
+if (args.Length == 5 && args[0].Equals("--build-real", StringComparison.OrdinalIgnoreCase))
+{
+    var request = new BuildRequest(
+        args[1],
+        args[2],
+        args[3],
+        args[4],
+        [],
+        "balanced",
+        new CustomProfileSettings(),
+        "en",
+        null,
+        []);
+    var progress = new Progress<BuildProgress>(value =>
+        Console.WriteLine($"{value.Percent,3}%  {value.Status}"));
+    BuildResult result = await new DataBuilderService().BuildAsync(request, progress);
+    int activeBaseFiles = Directory.EnumerateFiles(
+            Path.Combine(result.OutputDirectory, "assets"),
+            "*",
+            SearchOption.TopDirectoryOnly)
+        .Count(path =>
+            Path.GetExtension(path).Equals(".ttarch2", StringComparison.OrdinalIgnoreCase)
+            || Path.GetExtension(path).Equals(".lua", StringComparison.OrdinalIgnoreCase));
+    Console.WriteLine(
+        $"Real data build ready: {result.OutputDirectory}; " +
+        $"{activeBaseFiles} active base archives/descriptors.");
+    return 0;
+}
+
 if (args.Length == 2 && args[0].Equals("--render", StringComparison.OrdinalIgnoreCase))
 {
     RenderForm(args[1], () => new MainForm());

@@ -17,6 +17,12 @@ public sealed class DataBuilderService
     public const long SupportedApkBytes = 19_835_654;
     public const long SupportedMainObbBytes = 813_669_332;
     public const long SupportedPatchObbBytes = 3_868_418;
+    public const int SupportedMainAssetCount = 111;
+    public const int SupportedPatchAssetCount = 34;
+    public const long SupportedMainExtractedBytes = 813_600_664;
+    public const long SupportedPatchExtractedBytes = 3_801_906;
+    public const int SupportedActiveBaseAssetCount = 144;
+    public const long SupportedActiveBaseAssetBytes = 817_402_440;
     public const string SupportedChoiceDataSha256 = "F5F0C7FF7467707C7224BF056C6F7111E8D27279AA0BEE3BA422886B7EBB2616";
     public const string MainObbName = "main.40129.com.telltalegames.minecraft100.obb";
     public const string PatchObbName = "patch.40135.com.telltalegames.minecraft100.obb";
@@ -28,6 +34,16 @@ public sealed class DataBuilderService
         "libSDL2.so",
         "libfmod.so",
         "libfmodstudio.so"
+    ];
+
+    private static readonly string[] RequiredBaseAssets =
+    [
+        "_rescdesc_50_version_101.lua",
+        "MCSM_android-pvr_Project_all.ttarch2",
+        "MCSM_android-pvr_Minecraft101_txmesh.ttarch2",
+        "MCSM_android_Minecraft101_data.ttarch2",
+        "MCSM_android_Minecraft101_ms.ttarch2",
+        "MCSM_android_Minecraft101_voice.ttarch2"
     ];
 
     private static readonly string[] RequiredButtonMeshes =
@@ -75,9 +91,13 @@ public sealed class DataBuilderService
         }
         Directory.CreateDirectory(parent);
 
+        long extractionBytes = _allowSyntheticInputs
+            ? 0
+            : SupportedMainExtractedBytes + SupportedPatchExtractedBytes;
         long totalBytes = apkLayout.TotalBytes
             + mainObb.TotalBytes
             + patchObb.TotalBytes
+            + extractionBytes
             + (choiceData?.Size * 2 ?? 0)
             + (buttonFix?.TotalBytes ?? 0)
             + request.ChapterSources.Sum(source => source.TotalBytes)
@@ -132,6 +152,59 @@ public sealed class DataBuilderService
                 }
             }
 
+            Report("Copying the main game data…");
+            await CopyFileAsync(
+                request.MainObbPath,
+                Path.Combine(stagingDirectory, MainObbName),
+                bytes => copiedBytes += bytes,
+                cancellationToken);
+            Report("Main OBB ready");
+
+            await CopyFileAsync(
+                request.PatchObbPath,
+                Path.Combine(stagingDirectory, PatchObbName),
+                bytes => copiedBytes += bytes,
+                cancellationToken);
+            Report("Patch OBB ready");
+
+            int baseArchiveEntryCount = 0;
+            if (!_allowSyntheticInputs)
+            {
+                string assetsDirectory = Path.Combine(stagingDirectory, "assets");
+                TelltaleExtractionResult mainExtraction = await TelltaleObbExtractor.ExtractAsync(
+                    Path.Combine(stagingDirectory, MainObbName),
+                    assetsDirectory,
+                    "main",
+                    Report,
+                    cancellationToken);
+                ValidateBaseExtraction(
+                    "main",
+                    mainExtraction,
+                    SupportedMainAssetCount,
+                    SupportedMainExtractedBytes);
+                copiedBytes += mainExtraction.DeclaredBytes;
+                baseArchiveEntryCount += mainExtraction.FileCount;
+                Report($"Main OBB extracted — {mainExtraction.FileCount} assets");
+
+                TelltaleExtractionResult patchExtraction = await TelltaleObbExtractor.ExtractAsync(
+                    Path.Combine(stagingDirectory, PatchObbName),
+                    assetsDirectory,
+                    "patch",
+                    Report,
+                    cancellationToken);
+                ValidateBaseExtraction(
+                    "patch",
+                    patchExtraction,
+                    SupportedPatchAssetCount,
+                    SupportedPatchExtractedBytes);
+                copiedBytes += patchExtraction.DeclaredBytes;
+                baseArchiveEntryCount += patchExtraction.FileCount;
+                VerifyExtractedBaseAssets(assetsDirectory);
+                Report($"Patch OBB extracted — {patchExtraction.FileCount} assets");
+            }
+
+            // User-supplied fixes intentionally come after the base archives so they
+            // can replace the original controller prompts instead of being overwritten.
             int buttonFixFileCount = 0;
             if (buttonFix is not null)
             {
@@ -152,21 +225,6 @@ public sealed class DataBuilderService
                     bytes => copiedBytes += bytes,
                     cancellationToken);
             }
-
-            Report("Copying the main game data…");
-            await CopyFileAsync(
-                request.MainObbPath,
-                Path.Combine(stagingDirectory, MainObbName),
-                bytes => copiedBytes += bytes,
-                cancellationToken);
-            Report("Main OBB ready");
-
-            await CopyFileAsync(
-                request.PatchObbPath,
-                Path.Combine(stagingDirectory, PatchObbName),
-                bytes => copiedBytes += bytes,
-                cancellationToken);
-            Report("Patch OBB ready");
 
             foreach (ChapterSource source in request.ChapterSources)
             {
@@ -217,10 +275,16 @@ public sealed class DataBuilderService
                 includedEpisodes,
                 buttonFix,
                 choiceData,
+                baseArchiveEntryCount,
                 dataAddonFileCount,
                 dataAddonOverwriteCount,
                 cancellationToken);
-            VerifyOutput(stagingDirectory, includedEpisodes, buttonFix, choiceData);
+            VerifyOutput(
+                stagingDirectory,
+                includedEpisodes,
+                buttonFix,
+                choiceData,
+                requireBaseAssets: !_allowSyntheticInputs);
 
             Report("Finalizing the ready-to-copy folder…");
             if (Directory.Exists(outputDirectory))
@@ -1118,6 +1182,7 @@ public sealed class DataBuilderService
         IEnumerable<int> includedEpisodes,
         ButtonFixBundle? buttonFix,
         BundledAsset? choiceData,
+        int baseArchiveEntryCount,
         int dataAddonFileCount,
         int dataAddonOverwriteCount,
         CancellationToken cancellationToken)
@@ -1129,7 +1194,7 @@ public sealed class DataBuilderService
             "Copy this entire mcsm folder to ux0:data\\ on the PS Vita.\r\n" +
             "The final Vita path must be: ux0:data\\mcsm\\assets\r\n\r\n" +
             $"Detected episodes: {episodeText}\r\n" +
-            $"Base OBBs: main + patch included\r\n" +
+            $"Base OBBs: main + patch included and extracted ({baseArchiveEntryCount} archive entries)\r\n" +
             $"Graphics profile: {FormatGraphicsProfile(request)}\r\n" +
             $"Language: {request.LanguageCode}\r\n" +
             $"Controller button fix: {(buttonFix is null ? "not supplied" : $"included ({buttonFix.FileCount} assets)")}\r\n" +
@@ -1173,11 +1238,59 @@ public sealed class DataBuilderService
         return await reader.ReadToEndAsync(cancellationToken);
     }
 
+    private static void ValidateBaseExtraction(
+        string label,
+        TelltaleExtractionResult result,
+        int expectedFiles,
+        long expectedBytes)
+    {
+        if (result.FileCount != expectedFiles || result.DeclaredBytes != expectedBytes)
+        {
+            throw new InvalidDataException(
+                $"The supported {label} OBB extracted an unexpected asset set " +
+                $"({result.FileCount} files / {FormatBytes(result.DeclaredBytes)}; " +
+                $"expected {expectedFiles} / {FormatBytes(expectedBytes)}). " +
+                "The incomplete folder was not finalized.");
+        }
+    }
+
+    private static void VerifyExtractedBaseAssets(string assetsDirectory)
+    {
+        FileInfo[] baseAssets = new DirectoryInfo(assetsDirectory)
+            .EnumerateFiles("*", SearchOption.TopDirectoryOnly)
+            .Where(file =>
+                file.Extension.Equals(".ttarch2", StringComparison.OrdinalIgnoreCase)
+                || file.Extension.Equals(".lua", StringComparison.OrdinalIgnoreCase))
+            .ToArray();
+        long baseBytes = baseAssets.Sum(file => file.Length);
+
+        if (baseAssets.Length != SupportedActiveBaseAssetCount
+            || baseBytes != SupportedActiveBaseAssetBytes)
+        {
+            throw new InvalidDataException(
+                "Base-game extraction is incomplete: " +
+                $"found {baseAssets.Length} active archives/descriptors totaling {FormatBytes(baseBytes)}, " +
+                $"expected {SupportedActiveBaseAssetCount} totaling {FormatBytes(SupportedActiveBaseAssetBytes)}. " +
+                "The folder would black-screen on Vita, so it was not finalized.");
+        }
+
+        foreach (string assetName in RequiredBaseAssets)
+        {
+            string path = Path.Combine(assetsDirectory, assetName);
+            if (!File.Exists(path) || new FileInfo(path).Length <= 0)
+            {
+                throw new InvalidDataException(
+                    $"Base-game extraction is missing boot-critical asset '{assetName}'.");
+            }
+        }
+    }
+
     private static void VerifyOutput(
         string output,
         IEnumerable<int> episodes,
         ButtonFixBundle? buttonFix,
-        BundledAsset? choiceData)
+        BundledAsset? choiceData,
+        bool requireBaseAssets)
     {
         var required = RequiredLibraries
             .Select(library => Path.Combine(output, library))
@@ -1189,6 +1302,20 @@ public sealed class DataBuilderService
         if (missing is not null)
         {
             throw new IOException($"Build verification failed: '{missing}' is missing or empty.");
+        }
+
+        if (requireBaseAssets)
+        {
+            foreach (string assetName in RequiredBaseAssets)
+            {
+                string assetPath = Path.Combine(output, "assets", assetName);
+                if (!File.Exists(assetPath) || new FileInfo(assetPath).Length <= 0)
+                {
+                    throw new IOException(
+                        $"Base-game extraction verification failed: '{assetName}' is missing. " +
+                        "The folder would black-screen on Vita, so it was not finalized.");
+                }
+            }
         }
 
         foreach (int episode in episodes.Where(episode => episode >= 2))

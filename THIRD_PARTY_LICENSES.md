@@ -18,6 +18,7 @@ their original notices. The prior loader-level MIT notice is preserved at
 | miniz | `third_party/miniz/` | MIT | Rich Geldreich; RAD Game Tools; Valve |
 | kubridge (stub + header) | `lib/kubridge/` | none stated | bythos14; Andy Nguyen |
 | libc_bridge | `lib/libc_bridge/` | MIT | Andy Nguyen |
+| ttarchext | `data-builder/ThirdParty/ttarchext/` | GPL-2.0-or-later | Luigi Auriemma |
 
 Notes:
 - **FalsoJNI** is mostly MIT; two bundled bits are Apache-2.0 (Android/Dalvik JNI
@@ -28,6 +29,10 @@ Notes:
 - **kubridge** has no upstream license file. Vendored as the build stub + header on
   the de-facto terms used across the Vita homebrew scene; contact the author for terms.
 - **miniz** ships its own `LICENSE` under `third_party/miniz/`.
+- **ttarchext** is embedded in the Windows data builder to extract the exact
+  fingerprint-verified NCTT OBBs selected by the user. Its source headers retain the
+  GPL-2.0-or-later notice and the complete corresponding source is shipped beside the
+  builder source.
 
 ## Linked at build time (not in this repo)
 
@@ -47,4 +52,5 @@ These come from VitaSDK and are **not** redistributed here:
 ## Original game
 
 *Minecraft: Story Mode* © Telltale Games. *Minecraft* is a trademark of Mojang /
-Microsoft. No game code or assets are included in this repository.
+Microsoft. No Android game executable, native library, OBB, episode, or gameplay
+archive is included in this repository.

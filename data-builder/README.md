@@ -15,7 +15,7 @@ The chapter importer copies generic and PowerVR/SGX assets, ignores Mali/Adreno 
 5. Choose the output location and press **Build Data Folder**.
 6. Copy the resulting `mcsm` folder to `ux0:data/` with VitaShell.
 
-The app detects episode numbers from their real archive names, flattens episode files into `mcsm/assets`, creates the runtime folders, writes easy-to-edit graphics/game settings, and validates the result before replacing an existing output. Existing output is moved to a timestamped backup instead of being deleted.
+The app copies both OBBs and extracts their NCTT contents into `mcsm/assets`, then adds the APK assets and optional episodes. A correct Episode 1 base contains 144 active OBB archives/descriptors (about 817 MB) before APK assets or controller fixes are added. The build is rejected instead of finalized if that boot-critical set is incomplete. It also detects episode numbers from their real archive names, creates the runtime folders, writes easy-to-edit graphics/game settings, and moves an existing output to a timestamped backup instead of deleting it.
 
 The main screen intentionally stays compact: exact version/renderer results, both OBB states, automatic support packs, episodes/mods, profile details, and final readiness remain visible without separate wizard pages.
 
@@ -74,6 +74,6 @@ The self-contained executable is written to `dist/MCSM-Vita-Data-Builder.exe`. T
 - Offline statistics: the supported non-empty `choice.prop` dataset when built into the local EXE.
 - Experimental mods: data folders or ZIPs to merge into `mcsm`.
 
-The builder does not download, bundle, or link to copyrighted game data.
+The builder does not download or bundle game data. Its GPL-compatible embedded `ttarchext` helper extracts only the exact user-selected, fingerprint-verified MCSM OBBs; source and attribution are under `ThirdParty/ttarchext`.
 
 The base-game pickers expose only `.apk` and `.obb` formats. All hashes are calculated locally, and the Build button stays locked until the PowerVR APK, main OBB, and patch OBB have each passed validation.
