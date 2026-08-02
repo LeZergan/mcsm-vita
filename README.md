@@ -30,11 +30,29 @@ No Android game executable, native library, OBB, episode, or gameplay archive is
 
 ## Requirements
 
-- Homebrew-enabled Vita / PS TV (HENkaku ensō, 3.60 / 3.65) with **VitaShell**.
-- `kubridge.skprx` and `fd_fix.skprx` in `ur0:tai/` (both listed under `*KERNEL` in `config.txt`), and `libshacccg.suprx` in `ur0:data/`. `fd_fix.skprx` raises the open-file limit the loader needs to stream the game archives — without it, archive reads thrash on `EMFILE`. (Don't use it alongside the rePatch plugin.)
-- **capUnlocker is optional.** When core 3 is unavailable, the loader detects that at runtime and keeps engine and vitaGL worker threads on the three normal user cores; no setting file is required.
-- **NoTrpDrm** installed and enabled. The bundled homebrew trophy set cannot register without it.
+- Homebrew-enabled Vita / PS TV (HENkaku ensō, 3.60 / 3.65) with [VitaShell](https://github.com/TheOfficialFloW/VitaShell/releases).
+- [kubridge](https://github.com/TheOfficialFloW/kubridge/releases/tag/v0.1) and [FdFix](https://github.com/TheOfficialFloW/FdFix/releases/tag/v1.0) in `ur0:tai/`, both listed under `*KERNEL`. FdFix raises the open-file limit needed by the game archives. Do not use FdFix alongside rePatch.
+- `libshacccg.suprx` in `ur0:data/`; [ShaRKBR33D](https://github.com/Rinnegatamante/ShaRKBR33D/releases) is the one-click installer.
+- [NoTrpDrm](https://github.com/Rinnegatamante/NoTrpDrm/releases/tag/v.1.1) installed under `*KERNEL` and enabled. It is required for this homebrew trophy pack to register and unlock.
+- **CapUnlocker is optional.** [CapUnlocker v1.4](https://github.com/GrapheneCt/CapUnlocker/releases/tag/v1.4) exposes the reserved fourth core. Without it, the loader detects the rejection and safely uses the three normal user cores; no manual compatibility file is required.
 - Your own legally-owned game: the `com.telltalegames.minecraft100` APK plus its matching main and patch OBBs. The supported set is **PowerVR v1.37** (`40137`).
+
+### Optional performance plugins
+
+Use one overclock menu, not several at the same time. Good options are [PSVshellPlus](https://github.com/GrapheneCt/PSVshellPlus/releases/tag/v1.4), [PSV-VSH-Menu](https://github.com/joel16/PSV-VSH-Menu/releases/tag/3.40), or [LOLIcon](https://github.com/dots-tb/LOLIcon/releases/tag/1.0.1). CapUnlocker is separate from the clock menu and can be used with one of these. The loader still boots without CapUnlocker and requests only clocks allowed by the current system/plugin setup.
+
+### Trophy setup and repair
+
+MCSM 1.10 packages the trophy set under `MCSM00001_00`, creates the matching runtime context, and performs first-run registration without blocking the game forever. NoTrpDrm is still mandatory.
+
+If trophies work normally, do nothing. If an older test VPK left a broken registration and Vita reports an NP preparation/corruption error:
+
+1. Install [Trophy Manager v1.03](https://github.com/ONElua/TrophyManager/releases/tag/1.03).
+2. Disable Wi-Fi, open Trophy Manager, select the Minecraft: Story Mode set, and delete that set.
+3. Open the Vita's normal Trophies application once so its database refreshes, then reboot.
+4. Reinstall the latest MCSM VPK, confirm NoTrpDrm is enabled, and launch MCSM again.
+
+Do not manually delete random `ur0:user/.../trophy` files: that can leave the database row behind while removing only part of the registered set.
 
 ## Easy data setup
 
@@ -58,13 +76,22 @@ The app also creates `settings/graphics.txt` and `settings/game.txt`. **Balanced
 
 The **Fix & mods** panel can install a supplied controller-button asset fix and merge extra folders/ZIPs into the generated data directory. Locally distributed builds can also include the supported offline `choice.prop` dataset required by the crowd-choice statistics screen. General mod installation is experimental and has not been tested on Vita; add-ons are applied last, while the canonical OBBs and native runtime libraries remain protected.
 
+## Language, saves, and choices
+
+- The builder's language selector writes `settings/game.txt`. The loader forces both the initial system-language query and every later engine language-set call, so an old saved English preference cannot override Russian or another selected language. Voices remain English.
+- Personal story decisions and the “seen choice screen” state are stored with the local save bundles under `ux0:data/mcsm/Temp`. The `<User>`/bare-name redirects cover create, load, save, property, bundle, event-log, and both one-slash/two-slash choice paths.
+- Crowd percentages are offline data, not a network login. The builder installs the supported `choice.prop` at both required locations and verifies its SHA-256. The loader will no longer create an empty fake dataset: if valid crowd data is missing, statistics remain unavailable instead of opening a blank results screen.
+- Preferences such as font size are synchronized between the engine's native root resource and Lua's `<Temp>` resource after every `SavePrefs`, so both paths reload the same settings.
+
+Back up the entire `ux0:data/mcsm/Temp` directory before replacing data or testing save changes.
+
 ## Known limitations
 
 - Crowded scenes can still produce individual ~20 FPS frame intervals when CPU-heavy, but the configured 30/60 FPS target is retried immediately instead of being auto-downgraded.
 - The first boot can remain black for roughly 30 seconds while caches are created.
 - Save-slot titles cannot currently be renamed.
 - Experimental data add-ons/mods have not been validated on Vita hardware.
-- If a previous trophy test build left an `MCSM00001` registration and Vita reports an NP preparation/data error, remove the old set completely with Trophy Manager before reinstalling. Deleting only its folders can leave a stale database row.
+- Choice persistence, crowd results, language switching, and the newest timing/stall fixes need broader real-hardware coverage across all eight episodes.
 
 ## Building
 
@@ -89,9 +116,9 @@ VPKs and extracted game data are intentionally excluded from this source reposit
 
 Full attributions: [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md).
 
-## Acknowledgments
+## Development note
 
-Built with AI assistance from **Codex 5.5**, **Claude 4.8**, and **DeepSeek 4 Pro**.
+This whole thing is vibecoded slop made with **Claude 5** and **ChatGPT 5.6 sol**.
 
 ## License
 

@@ -4627,8 +4627,10 @@ static int hook_lua_is_episode_unlicensed(void *L) {
 }
 
 /* LANGUAGE. The engine loads ALL language packs as "constant" resource sets, so
- * getLocale doesn't pick the text language — luaGetUserSystemLanguage does (its
- * result feeds LangSetCurLanguage). Force it from settings/language.txt. The
+ * getLocale doesn't pick the text language — luaGetUserSystemLanguage supplies
+ * the initial choice, and luaLangSetCurLanguage applies later menu/prefs choices.
+ * Force BOTH boundaries from settings/game.txt so stale prefs cannot switch a
+ * builder-selected language back to English. The
  * value may be a locale (ru_RU/fr_FR/...) or a bare game language name; both map
  * to the engine's names: English/Russian/French/German/Spanish/Chinese/Portuguese. */
 static void mcsm_forced_language_name(char *out, int outsz) {
@@ -4684,6 +4686,34 @@ static int hook_lua_get_user_system_language(void *L) {
         if (r >= 0) return r;
     }
     return orig;
+}
+
+typedef void (*LuaReplaceFn)(void *L, int idx);
+static LuaReplaceFn g_lua_replace_fast;
+static so_hook g_hook_lua_lang_set_cur_language;
+
+static int hook_lua_lang_set_cur_language(void *L) {
+    char forced[32];
+    mcsm_forced_language_name(forced, sizeof(forced));
+    if (forced[0]) {
+        if (!g_lua_pushstring_fast) {
+            g_lua_pushstring_fast = (LuaPushStringFn)so_symbol(&so_mod_gameengine, "lua_pushstring");
+        }
+        if (!g_lua_replace_fast) {
+            g_lua_replace_fast = (LuaReplaceFn)so_symbol(&so_mod_gameengine, "lua_replace");
+        }
+        if (g_lua_pushstring_fast && g_lua_replace_fast) {
+            /* Replace arg1 in place. Do not add a second call or a second return:
+             * one language-set operation reaches the engine, with one identity. */
+            g_lua_pushstring_fast(L, forced);
+            g_lua_replace_fast(L, 1);
+#ifdef DEBUG_SOLOADER
+            static unsigned logged = 0;
+            if (logged++ < 8U) l_info("LANG: LangSetCurLanguage forced to \"%s\"", forced);
+#endif
+        }
+    }
+    return SO_CONTINUE(int, g_hook_lua_lang_set_cur_language, L);
 }
 
 static int hook_lua_get_demo_mode(void *L) {
@@ -6238,6 +6268,11 @@ static void patch_dlc_fast_path_hooks(void) {
                                   "luaGetUserSystemLanguage",
                                   (uintptr_t)&hook_lua_get_user_system_language,
                                   &g_hook_lua_get_user_system_language);
+        (void)hook_symbol_checked(&so_mod_gameengine,
+                                  "_Z21luaLangSetCurLanguageP9lua_State",
+                                  "luaLangSetCurLanguage",
+                                  (uintptr_t)&hook_lua_lang_set_cur_language,
+                                  &g_hook_lua_lang_set_cur_language);
     }
     (void)hook_symbol_checked(&so_mod_gameengine,
                               "_Z14luaGetDemoModeP9lua_State",

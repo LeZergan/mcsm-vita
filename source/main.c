@@ -1713,6 +1713,18 @@ void controls_handler_key(int32_t keycode, ControlsAction action) {
     const int is_shoulder_remap =
         (keycode == AKEYCODE_BUTTON_L1 || keycode == AKEYCODE_BUTTON_R1);
 
+    if (is_shoulder_remap) {
+        /* One physical edge fans out to both console identities below. Suppress
+         * duplicate DOWN/DOWN or UP/UP deliveries so exposing L1+L2 compatibility
+         * cannot double-trigger a QTE or leave one route latched after resume. */
+        static unsigned char shoulder_down[2] = {0, 0};
+        const int side = (keycode == AKEYCODE_BUTTON_L1) ? 0 : 1;
+        const unsigned char next = (action == CONTROLS_ACTION_DOWN) ? 1U : 0U;
+        if (action != CONTROLS_ACTION_DOWN && action != CONTROLS_ACTION_UP) return;
+        if (shoulder_down[side] == next) return;
+        shoulder_down[side] = next;
+    }
+
     sdl_pad_sent = controls_emit_sdl_pad_button(keycode, action);
 
     if (is_shoulder_remap) {

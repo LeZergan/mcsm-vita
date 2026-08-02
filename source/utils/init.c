@@ -414,14 +414,11 @@ static void seed_empty_prefs_files(void) {
          * game actually reads. The save-bundle redirects are what make that path work. */
         DATA_PATH "choicestats.prop",
         DATA_PATH "Temp/choicestats.prop",
-        /* Cross-chapter choice carryover ("next chapter" presenter): the game
-         * saves the choice_tracker document to logical:<User>/choice.prop via
-         * SaveDownloadedDocumentAsPropertySet. Same write-over-existing rule ->
-         * seed it too, or the carryover is inconsistent/empty.
-         * ☠ choice.prop is handled by mirror_crowd_choice_data() FIRST -- see there;
-         * an empty seed here is the last resort, not the normal case. */
-        DATA_PATH "choice.prop",
-        DATA_PATH "Temp/choice.prop",
+        /* Do NOT seed choice.prop. That is the offline crowd-statistics dataset,
+         * not a generic preference file. A zero-byte placeholder makes
+         * ResourceExists succeed and produces a blank/misleading results screen.
+         * The builder supplies and hash-verifies the real dataset at both paths;
+         * when it is absent the honest behaviour is to report stats unavailable. */
     };
 
     for (int i = 0; i < (int)(sizeof(k_paths) / sizeof(k_paths[0])); ++i) {
@@ -513,11 +510,10 @@ void mcsm_sync_prefs_after_save(void) {
  * is DATA_PATH "Temp/choice.prop" -- while the copy that ships with the data drop
  * naturally lands at DATA_PATH "choice.prop".
  *
- * If only the root copy is present, seed_empty_prefs_files() would then create an
- * EMPTY Temp/choice.prop, and that is the worst of both worlds: ResourceExists says
- * yes (so the game offers the stats screen and never says "offline") while
- * PropertyGet finds nothing (so the screen is blank), and the empty file blocks any
- * later repair because it now "exists". Nothing in the log would say why.
+ * Older builds created an EMPTY Temp/choice.prop when only the root copy was
+ * present. That is the worst of both worlds: ResourceExists says yes while
+ * PropertyGet finds nothing, producing a blank results screen. Empty choice seeds
+ * are no longer created; this mirror only propagates real non-empty data.
  *
  * So mirror the real file into place first, in whichever direction has the content.
  * Runs BEFORE the empty-seed pass; a non-empty file is never overwritten. */

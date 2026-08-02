@@ -763,13 +763,19 @@ static jobject GetLocale(jmethodID id, va_list args) {
     static char loc[16] = "";
     static int logged = 0;
     if (!loc[0]) {
-        /* Explicit terminate: loc is static (so zero-filled) and strncpy of
-         * sizeof-1 cannot overflow, but GCC cannot prove the NUL survives. */
-        const char *lang_src = mcsm_game()->language;
-        size_t li = 0;
-        while (li + 1 < sizeof(loc) && lang_src[li]) { loc[li] = lang_src[li]; li++; }
-        loc[li] = 0;
-        if (!loc[0]) { strcpy(loc, "en_US"); }
+        const char *code = mcsm_game()->language;
+        static const struct { const char *code; const char *locale; } locales[] = {
+            { "en", "en_US" }, { "ru", "ru_RU" }, { "fr", "fr_FR" },
+            { "de", "de_DE" }, { "es", "es_ES" }, { "pt", "pt_BR" },
+            { "zh", "zh_CN" },
+        };
+        for (unsigned i = 0; i < sizeof(locales) / sizeof(locales[0]); ++i) {
+            if (strncmp(code, locales[i].code, 2) == 0) {
+                strcpy(loc, locales[i].locale);
+                break;
+            }
+        }
+        if (!loc[0]) strcpy(loc, "en_US");
     }
     if (!logged) { logged = 1; l_info("LANG: getLocale -> \"%s\"", loc); }
     return ret_string(loc);
