@@ -178,14 +178,14 @@ typedef struct {
                                * edges shows bright/white seams between blocks (a BASE
                                * level bleed, so turning mipmaps off cannot fix it). UI
                                * and 2D stay LINEAR so fonts remain smooth. 0 = engine
-                               * default. Was a stray nearest_filter.txt.               */
+                               * default. Controlled only by graphics.txt.              */
     int  fbfetch_zero;        /* framebuffer-fetch stub value. vitaGL has no
                                * gl_LastFragData, so it is replaced by a constant: 1 =
                                * vec4(0.0) (identity for ADDITIVE light accumulation),
                                * 0 = vec4(1.0) (identity for MODULATE). The wrong one
                                * turns whole surfaces solid white -- glass and other
-                               * blended surfaces are exactly where this shows. Was a
-                               * stray fbfetch_zero.txt.                                */
+                               * blended surfaces are exactly where this shows. The
+                               * value comes only from graphics.txt.                    */
     /* system */
     int  clock_adaptive;      /* 0 = ARM pinned, 1 = adaptive floor (battery)    */
     int  clock_mhz;           /* ARM target MHz. 444 = stock max. Higher only has

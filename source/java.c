@@ -247,10 +247,7 @@ int audio_gain_q8(void) {
     static int s_gain_q8 = -1;
     if (s_gain_q8 < 0) {
         int percent = 125;
-        /* mcsm_open_setting() checks settings/ then the data root, which is what every
-         * other tunable does. This hand-rolled version tried DATA_PATH and then the
-         * same literal path a second time -- two attempts at one location, and none at
-         * settings/, so a gain file placed alongside graphics.txt was silently ignored. */
+        /* All optional configuration lives beside graphics.txt in settings/. */
         FILE *fp = mcsm_open_setting("audio_gain.txt", "r");
         if (fp) {
             char buf[32];

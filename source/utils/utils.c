@@ -114,12 +114,10 @@ long long file_size(const char * path) {
 
 FILE * mcsm_open_setting(const char * basename, const char * mode) {
     char path[256];
-    /* Prefer the tidy settings/ subfolder; fall back to the data root so an
-     * existing flat layout keeps working unchanged. */
+    /* All user configuration has one canonical home. Do not fall back to the data
+     * root: duplicate flat files create invisible precedence and make a builder-made
+     * profile appear to ignore the user's edits. */
     snprintf(path, sizeof(path), DATA_PATH "settings/%s", basename);
-    FILE * f = fopen(path, mode);
-    if (f) return f;
-    snprintf(path, sizeof(path), DATA_PATH "%s", basename);
     return fopen(path, mode);
 }
 

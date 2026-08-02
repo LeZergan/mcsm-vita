@@ -709,10 +709,8 @@ void soloader_init_all() {
     // (up to 500) needs a kernel OC plugin that unlocks the PLL. We ATTEMPT the
     // requested value, fall back to 444 if the set is rejected, then read the
     // clock BACK so the log tells us exactly what the hardware accepted.
-    // ONE-DOC config: ux0:data/mcsm/settings/clock.txt (or the data root) sets it all
-    //   "off"      -> disable the in-game governor (ARM pinned to this boot clock)
-    //   "min <MHz>"/"max <MHz>" -> governor floor / ceiling
-    //   "gpu <MHz>" -> GPU clock
+    // ONE-DOC config: settings/graphics.txt `clock` is either a pinned ARM MHz
+    // value or `adaptive`. GPU clock remains the loader's fixed safe target.
     // The ARM clock set here is the BOOT = governor CEILING (arm_max); during gameplay
     // the adaptive governor (patch.c mcsm_clock_governor_tick) scales ARM DOWN toward
     // arm_min when scenes are light+smooth and jumps back up the instant a frame is

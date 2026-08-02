@@ -70,13 +70,12 @@ bool file_exists(const char * path);
 long long file_size(const char * path);
 
 /**
- * Open a user tunable, preferring the tidy ux0:data/mcsm/settings/ subfolder
- * and falling back to the data root for backward compatibility.
+ * Open a user tunable from the canonical ux0:data/mcsm/settings/ directory.
  *
- * @param basename Bare file name, e.g. "fps_cap.txt".
+ * @param basename Bare file name inside ux0:data/mcsm/settings/.
  * @param mode     fopen mode (these tunables are read-only in practice).
  *
- * @return open FILE* (settings/ copy wins, else root copy), or NULL if neither.
+ * @return open FILE*, or NULL when the settings/ file does not exist.
  */
 FILE * mcsm_open_setting(const char * basename, const char * mode);
 

@@ -331,7 +331,7 @@ static int hook_fmod_studio_initialize(void *studio_system,
              *
              * Must be called before FMOD's init, which is exactly where we are --
              * the same window that makes registerOutput legal. Override with
-             * ux0:data/mcsm/audio_rate.txt (e.g. 24000) if it ever misbehaves. */
+             * settings/audio_rate.txt (e.g. 24000) if it ever misbehaves. */
             if (low_level) {
                 int want_rate = 44100;
                 FILE *rf = mcsm_open_setting("audio_rate.txt", "r");
@@ -467,7 +467,7 @@ static int patch_arm32_instruction(const char *label,
  * chores/animation by an uneven amount each frame = stutter. Pacing the game loop
  * to a fixed period makes the delta the engine sees constant -> smooth motion.
  * Default 30fps (the cadence the original console builds used). Tunable at runtime
- * with no rebuild via ux0:data/mcsm/graphics.txt (fps_cap) (an integer fps; <=0 = uncapped).
+ * with no rebuild via settings/graphics.txt `fps_cap` (an integer; <=0 = uncapped).
  * This must honor the user's configured cap directly; forcing 60 down to 30
  * made character/menu animation visibly regress in heavy scenes. */
 /* The EXACT frame period in us for the configured cap (0 = uncapped). This is the
@@ -1424,7 +1424,7 @@ static void resolve_animation_runtime_flags(void) {
  * work, but recursive per-bone contribution is CPU-heavy and is the prime
  * suspect for the ~40ms sim spikes in animated scenes. Make it tunable so its
  * real cost can be measured / the user can pick perf-vs-animation:
- * ux0:data/mcsm/graphics.txt (skinning) = "0" -> disable (faster, animation degraded),
+ * settings/graphics.txt `skinning` = "0" -> disable (faster, animation degraded),
  * absent or "1" -> full (default, current behaviour). */
 static int mcsm_anim_full(void) { return mcsm_cfg()->skinning_full; }
 
@@ -1436,9 +1436,7 @@ static int mcsm_anim_full(void) { return mcsm_cfg()->skinning_full; }
  * Visual trade: close-up motion + lip-sync step at ~15Hz (N=2), so it's for heavy
  * gameplay/crowd scenes, not dialogue. Default 1 = zero change. */
 static int mcsm_anim_rate(void) {
-    /* Consolidated into settings/graphics.txt (`anim_rate`) — it used to be a
-     * stray anim_rate.txt, which left the single biggest remaining sim lever
-     * undiscoverable next to every other tunable. mcsm_cfg() caches, so this is
+    /* Consolidated into settings/graphics.txt (`anim_rate`). mcsm_cfg() caches, so this is
      * just a field read; the value is already clamped to 1..3 at parse time. */
     const int rate = mcsm_cfg()->anim_rate;
 #ifdef DEBUG_SOLOADER
@@ -4502,39 +4500,36 @@ static int hook_lua_offers_enumeration_ready(void *L) {
     return ret >= 0 ? ret : SO_CONTINUE(int, g_hook_lua_offers_enumeration_ready, L);
 }
 
-/* EPISODE VISIBILITY via chapters.txt  (2026-07-10)
+/* EPISODE VISIBILITY via settings/game.txt
  * -----------------------------------------------------------------------------
  * The engine asks luaIsEpisodeAvailable/Downloaded once per episode. We answer
  * per chapter so ONLY the chapters you want appear in Episode Select -- and you
  * change which ones show WITHOUT ever rebuilding again: just edit a text file on
  * the Vita:
  *
- *     ux0:data/mcsm/chapters.txt        (one line per chapter)
- *         1=true
- *         2=true
- *         3=false
- *         4=false ... 8=false
+ *     chapter1 = on
+ *     chapter2 = auto
+ *     chapter3 = off
  *
  * Resolution order for a given chapter N:
  *   1. Chapter 1 is ALWAYS available (never break the base game / a CH1 test).
- *   2. If chapters.txt lists N -> obey it exactly (true shows it, false hides it).
+ *   2. If game.txt lists N as on/off -> obey it exactly.
  *   3. Otherwise fall back to "is its data archive actually on disk?"
  *      (assets/MCSM_android_Minecraft10N_data.ttarch2).
  *   4. If we cannot identify the episode at all -> available (old safe default).
- * chapters.txt is read once and cached; accepted values: true/1/yes or
- * false/0/no. Delete the file to fall back to pure on-disk auto-detection. */
+ * game.txt is read once and cached; `auto` uses on-disk detection. */
 static int mcsm_file_present(const char *path) {
     FILE *f = fopen(path, "rb");
     if (f) { fclose(f); return 1; }
     return 0;
 }
-static signed char s_ch_txt[9];        /* [1..8]: 1=force-show, 0=force-hide, -1=unspecified */
-static int         s_ch_txt_loaded = 0;
-static void mcsm_load_chapters_txt(void) {
+static signed char s_ch_override[9];        /* [1..8]: 1=show, 0=hide, -1=auto */
+static int         s_ch_settings_loaded = 0;
+static void mcsm_load_chapter_settings(void) {
     const McsmGame *g = mcsm_game();
-    s_ch_txt[0] = -1;
-    for (int i = 0; i < 8; i++) s_ch_txt[i + 1] = (signed char)g->chapters[i];
-    s_ch_txt_loaded = 1;
+    s_ch_override[0] = -1;
+    for (int i = 0; i < 8; i++) s_ch_override[i + 1] = (signed char)g->chapters[i];
+    s_ch_settings_loaded = 1;
 }
 /* Which chapter (1..8) is this availability query about, or 0 if we can't tell.
  * Handles both a string set-name ("...Minecraft10N...") and a numeric index. */
@@ -4570,11 +4565,11 @@ static int mcsm_episode_available(void *L) {
 #endif
     int ch = mcsm_episode_chapter(L);
     if (ch == 1) return 1;                              /* CH1 = base game, always available */
-    if (!s_ch_txt_loaded) mcsm_load_chapters_txt();
+    if (!s_ch_settings_loaded) mcsm_load_chapter_settings();
     if (ch >= 2 && ch <= 8) {
         int vis; const char *src;
-        if (s_ch_txt[ch] == 1)      { vis = 1; src = "chapters.txt"; }   /* force-show */
-        else if (s_ch_txt[ch] == 0) { vis = 0; src = "chapters.txt"; }   /* force-hide */
+        if (s_ch_override[ch] == 1)      { vis = 1; src = "game.txt"; }
+        else if (s_ch_override[ch] == 0) { vis = 0; src = "game.txt"; }
         else {                                         /* unlisted -> require its data on disk (memoized) */
             /* The three IsEpisode* menu hooks call this on every refresh while
              * Episode-Select is open; the chapter archives don't appear/disappear
@@ -5004,7 +4999,7 @@ static const char *resource_set_arg_name(void *L); /* fwd decl (defined below) *
  * visible gameplay bug. Correctness first; the freeze is an annoyance, a Jesse
  * the player did not choose is not.
  *
- * Opt back in with ux0:data/mcsm/keep_resident.txt if you play male Jesse and
+ * Opt back in with settings/keep_resident.txt if you play male Jesse and
  * want the ~4-5s character-swap freezes gone. */
 static int keep_resident_opt_in(void) {
     static int s_on = -1;
@@ -5061,12 +5056,12 @@ static int resource_set_name_is_xbox_ui(const char *name) {
          strcmp(name, "XboxOne") == 0);
 }
 
-/* Is chapter 2 meant to be shown? chapters.txt is authoritative (2=true force-on,
- * 2=false force-off); if unlisted, only when its data archive is present. */
+/* Is chapter 2 meant to be shown? game.txt is authoritative (chapter2=on/off);
+ * `auto` shows it only when its data archive is present. */
 static int mcsm_ch2_forced_visible(void) {
-    if (!s_ch_txt_loaded) mcsm_load_chapters_txt();
-    if (s_ch_txt[2] == 1) return 1;
-    if (s_ch_txt[2] == 0) return 0;
+    if (!s_ch_settings_loaded) mcsm_load_chapter_settings();
+    if (s_ch_override[2] == 1) return 1;
+    if (s_ch_override[2] == 0) return 0;
     /* Memoized: this is reached from the resource-set hooks, which fire hundreds of
      * times during a load, and the probe is an fopen on a .ttarch2 path. Chapter
      * archives are copied in before boot and never appear or vanish mid-session, so
@@ -5093,9 +5088,9 @@ static int resource_set_name_is_episode2_local(const char *name) {
     }
     /* The whole Episode-2 spoof (ResourceSetExists/Enabled -> true, cloud-mount,
      * fallback descriptor) exists ONLY to force Episode 2 present. For a CH1 tester
-     * (chapters.txt 2=false / no CH2 data) return 0 so none of it runs: Episode 2
+     * (game.txt chapter2=off / no CH2 data) return 0 so none of it runs: Episode 2
      * reads as genuinely absent, so the menu neither shows it installed nor lets you
-     * "restart" it — the pre-CH2-subsystem behaviour. Set chapters.txt 2=true to
+     * "restart" it — the pre-CH2-subsystem behaviour. Set game.txt chapter2=on to
      * re-enable the spoof. */
     return mcsm_ch2_forced_visible();
 }
@@ -5813,7 +5808,7 @@ static int hook_job_init(void) {
  * Scene::PrepareToRenderShadows — a big chunk of the 488k-vert/100ms-CPU heavy
  * frames. Hooking LightInstance::IsShadowLight / IsContributingShadowLight to
  * report FALSE makes the engine treat no light as a shadow caster, so it skips
- * the whole shadow setup + pass. Opt-in via ux0:data/mcsm/graphics.txt (shadows) (visual
+ * the whole shadow setup + pass. Controlled by settings/graphics.txt `shadows` (visual
  * trade: objects lose cast shadows). */
 static int shadows_disabled(void) { return !mcsm_cfg()->shadows; }
 static so_hook g_hook_is_shadow_light;

@@ -199,7 +199,7 @@ PTHR_INLINE int _cond_t_static_init(pthread_cond_t_bionic * cond, const pthread_
  * cores. Masks: USER_0=0x10000, USER_1=0x20000, USER_2=0x40000, and the
  * system core 3 = 0x80000. Try all-4 (0xF0000); if capUnlocker isn't active
  * the kernel rejects the system core and we fall back to 0-2 (0x70000) so we
- * never break thread startup. Read the toggle once: ux0:data/mcsm/no_core3.txt
+ * never break thread startup. Read the toggle once: settings/no_core3.txt
  * forces the 3-core mask. */
 static int g_core3_mask = -1; /* -1=unresolved, else the mask to apply */
 static int mcsm_resolve_core_mask(void) {

@@ -1151,7 +1151,7 @@ void gl_preload() {
 #endif
 }
 
-/* ---- Render-scale (opt-in via ux0:data/mcsm/graphics.txt (resolution) = "WxH") --------
+/* ---- Render-scale (settings/graphics.txt `resolution = WxH`) ----------------
  * Render the game into a low-res FBO and bilinear-upscale it to the native
  * 960x544 display on present. Fewer fragment-shaded pixels => higher fps on this
  * fragment-bound 3D engine, while the picture stays native/fullscreen.
@@ -1343,11 +1343,8 @@ void gl_init() {
      * vsync alone beats 17ms<->34ms (60<->30) because the GPU renders just under
      * 60fps and keeps missing vblank by a hair; the loop-level pace clamp forces a
      * consistent ~33ms delta so animation advances evenly = smooth motion. */
-    /* Presenter: vsync ON by default gives a PRECISE vblank-locked rate (the
-     * present-lock below pins it to an exact 30/60 with no beating). vsync OFF
-     * (novsync.txt) stops the CPU blocking on vblank = highest throughput, but
-     * timing then rides the sleep clock -> can judder. Tunable so the user can
-     * pick fastest-throughput vs smoothest. */
+    /* Presenter: vsync ON by default gives a precise vblank-aligned rate. Turning
+     * graphics.txt `vsync` off stops that hardware wait for maximum throughput. */
     if (!mcsm_cfg()->vsync) { vglWaitVblankStart(GL_FALSE); l_info("presenter: vsync OFF (graphics.txt) — max throughput"); }
     else                    { vglWaitVblankStart(GL_TRUE);  l_info("presenter: vsync ON (precise vblank lock)"); }
 
@@ -1454,18 +1451,6 @@ void gl_init() {
                 g_present_period_den = fps;
                 g_present_vb_whole   = (fps > 0 && fps <= 60 && (60 % fps) == 0) ? (60 / fps) : 0;
         }
-        /* DE-STACK PACING opt-in (2026-07-17, ux0:data/mcsm/no_present_lock.txt):
-         * with vsync ON there are THREE period gates at the same rate but
-         * independent phase — sim-pace (mcsm_pace_frame), this present-lock, and
-         * hw vsync — which can beat against each other and jitter frame time. The
-         * sim-pace is the primary judder fix; dropping the present-lock leaves
-         * vsync as the sole present clock. Kept OFF by default because the
-         * present-lock also caps sub-16ms frames from presenting at 60 (its
-         * original anti-60<->30 purpose); this can only be judged on-device, so
-         * it's a toggle the user can A/B for the smoothest result. */
-        { FILE *npl = mcsm_open_setting("no_present_lock.txt", "r");
-          if (npl) { fclose(npl); g_present_period_us = 0; g_present_period_rem = 0; g_present_period_den = 0;
-                     l_info("present frame-lock DISABLED (no_present_lock.txt) — vsync+sim-pace only"); } }
         if (g_present_vb_whole > 0)
             l_info("present frame-lock = %d vblanks/frame (%d fps, EXACT — paced by vblank count)",
                    g_present_vb_whole, 60 / g_present_vb_whole);
@@ -2927,14 +2912,12 @@ void glTexParameterxv_soloader(GLenum target, GLenum pname, const GLfixed *param
 /* WHITE-LINES-BETWEEN-BLOCKS FIX (2026-07-20): the 3D world (compressed PVRTC/ETC1
  * textures) is Minecraft-style tile art that must sample GL_NEAREST — forcing
  * GL_LINEAR bilinearly interpolates across atlas/tile edges and shows bright/white
- * seams (a BASE-level bleed, so mipmaps-off can't fix it). Opt-in nearest_filter.txt
- * flips world textures to NEAREST (leaves UI/2D uncompressed textures on LINEAR so
- * fonts stay smooth). Default = unchanged. */
+ * seams (a BASE-level bleed, so mipmaps-off can't fix it). The consolidated
+ * graphics.txt `nearest_filter` switch flips world textures to NEAREST while leaving
+ * UI/2D uncompressed textures on LINEAR. Default = unchanged. */
 static int world_nearest_enabled(void) {
     static int v = -1;
-    if (v < 0) { v = mcsm_cfg()->nearest_filter ? 1 : 0;
-                 FILE *f = mcsm_open_setting("nearest_filter.txt", "r");   /* legacy override */
-                 if (f) { fclose(f); v = 1; } }
+    if (v < 0) v = mcsm_cfg()->nearest_filter ? 1 : 0;
     return v;
 }
 static inline void force_complete_filter_ex(GLenum target, int allow_nearest) {
@@ -3016,7 +2999,7 @@ void glCompressedTexImage2D_soloader(GLenum target, GLint level, GLenum internal
             l_info("glCompressedTexImage2D: OOM -> 1x1 placeholder (tex=%d ph_err=0x%X)", bound_texture, (unsigned)ph_err);
         err = ph_err;
     }
-    force_complete_filter_ex(target, 1);   /* compressed = world art -> may use NEAREST (nearest_filter.txt) */
+    force_complete_filter_ex(target, 1);   /* compressed world art may use graphics.txt NEAREST */
 
     if (texture_upload_should_log(s_count, err) ||
         pre_err != GL_NO_ERROR ||
@@ -3178,7 +3161,7 @@ void glFramebufferTexture2D_soloader(GLenum target, GLenum attachment,
     glFramebufferTexture2D(target, attachment, textarget, texture, level);
 }
 
-/* Opt-in (ux0:data/mcsm/mipmaps.txt): build mip chains for POT RGBA textures.
+/* Opt-in (settings/mipmaps.txt): build mip chains for POT RGBA textures.
  * The engine uploads only level 0, so without this distant surfaces sample the
  * full-res texel = shimmer + wasted GPU texture-cache bandwidth. Trilinear mips
  * are sharper at distance AND cheaper to sample. Opt-in because it adds ~33%
@@ -3783,9 +3766,7 @@ void glUniform4f_soloader(GLint location, GLfloat v0, GLfloat v1, GLfloat v2, GL
 static int mcsm_anim_pose_diag_enabled(void) {
     static int s_enabled = -1;
     if (s_enabled < 0) {
-        /* mcsm_open_setting(), like every other tunable: the raw sceIoOpen this
-         * replaced looked only at the data root, so animdiag.txt in settings/ --
-         * where the device actually keeps its config -- was silently ignored. */
+        /* Diagnostic switches use the same canonical settings/ directory. */
         FILE *fd = mcsm_open_setting("animdiag.txt", "r");
         if (fd) {
             fclose(fd);
@@ -4190,13 +4171,11 @@ static int neutralize_unsupported_glsl(char **src_io, size_t *len_io) {
         /* WHITE-SURFACE FIX (2026-07-20): the framebuffer-read (gl_LastFragData) stub
          * is white by default. That's the identity for MODULATE blends (mix(white,surf)
          * = surf at a=1) but for ADDITIVE light accumulation (out = fbRead + light) it
-         * makes every pixel white. Opt-in fbfetch_zero.txt swaps the stub to vec4(0.0),
-         * the identity for additive — pick whichever makes the white surfaces correct.
-         * Both are 9 chars < gl_LastFragData[0] (18), so glsl_replace_shorter is valid. */
+         * makes every pixel white. graphics.txt `fbfetch_zero` swaps the stub to
+         * vec4(0.0), the identity for additive. Both replacements are 9 chars <
+         * gl_LastFragData[0] (18), so glsl_replace_shorter is valid. */
         static int s_fbz = -1;
-        if (s_fbz < 0) { s_fbz = mcsm_cfg()->fbfetch_zero ? 1 : 0;
-                         FILE *fz = mcsm_open_setting("fbfetch_zero.txt", "r");   /* legacy override */
-                         if (fz) { fclose(fz); s_fbz = 1; } }
+        if (s_fbz < 0) s_fbz = mcsm_cfg()->fbfetch_zero ? 1 : 0;
         const char *repl = s_fbz ? "vec4(0.0)" : "vec4(1.0)";
         changed += glsl_replace_shorter(src, "gl_LastFragData[0]", repl);
         changed += glsl_replace_shorter(src, "gl_LastFragData[1]", repl);

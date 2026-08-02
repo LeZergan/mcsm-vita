@@ -24,28 +24,24 @@ static char buffer_a[2048];
 // Buffer B is used to compile the final log using the updated format string.
 static char buffer_b[2048];
 
-/* Complete logging kill-switch: if ux0:data/mcsm/nolog.txt exists, ALL logging
+/* Complete logging kill-switch: if settings/nolog.txt exists, ALL logging
  * (file + debug console) is suppressed so we can definitively rule logging out as
  * a performance factor. Checked once, lazily, under the log mutex. */
 static int _log_enabled = -1; /* -1 unchecked, 1 enabled, 0 disabled */
 static int log_enabled_locked(void) {
     if (_log_enabled < 0) {
-        /* settings/ first, then the data root -- the same order
-         * mcsm_open_setting() uses. (The previous second attempt retried
-         * "ux0:data/mcsm/nolog.txt", which is what DATA_PATH already expands to,
-         * so settings/ was never consulted at all.)
-         * Kept as raw sceIoOpen rather than mcsm_open_setting: this runs
+        /* Kept as raw sceIoOpen rather than mcsm_open_setting: this runs
          * under the log mutex, and that helper lives in utils.c, which logs
-         * on failure -- re-entering the logger while it holds its own lock. */
+         * on failure -- re-entering the logger while it holds its own lock.
+         * There is deliberately no data-root fallback. */
         SceUID f = sceIoOpen(DATA_PATH "settings/nolog.txt", SCE_O_RDONLY, 0);
-        if (f < 0) f = sceIoOpen(DATA_PATH "nolog.txt", SCE_O_RDONLY, 0);
         if (f >= 0) { sceIoClose(f); _log_enabled = 0; }
         else _log_enabled = 1;
     }
     return _log_enabled;
 }
 
-/* Diagnostic flush-every-line mode: if ux0:data/mcsm/logsync.txt exists, EVERY
+/* Diagnostic flush-every-line mode: if settings/logsync.txt exists, EVERY
  * log line is flushed to disk immediately (no RAM batching). Lets us see the
  * exact pre-hang/pre-crash tail when a boot hangs (which never flushes the
  * accumulated buffer). Costs write latency, so only for debugging — not the
@@ -53,15 +49,11 @@ static int log_enabled_locked(void) {
 static int _log_sync = -1; /* -1 unchecked, 1 sync-every-line, 0 batched */
 static int log_sync_locked(void) {
     if (_log_sync < 0) {
-        /* settings/ first, then the data root -- the same order
-         * mcsm_open_setting() uses. (The previous second attempt retried
-         * "ux0:data/mcsm/logsync.txt", which is what DATA_PATH already expands to,
-         * so settings/ was never consulted at all.)
-         * Kept as raw sceIoOpen rather than mcsm_open_setting: this runs
+        /* Kept as raw sceIoOpen rather than mcsm_open_setting: this runs
          * under the log mutex, and that helper lives in utils.c, which logs
-         * on failure -- re-entering the logger while it holds its own lock. */
+         * on failure -- re-entering the logger while it holds its own lock.
+         * There is deliberately no data-root fallback. */
         SceUID f = sceIoOpen(DATA_PATH "settings/logsync.txt", SCE_O_RDONLY, 0);
-        if (f < 0) f = sceIoOpen(DATA_PATH "logsync.txt", SCE_O_RDONLY, 0);
         if (f >= 0) { sceIoClose(f); _log_sync = 1; }
         else _log_sync = 0;
     }

@@ -250,27 +250,6 @@ static int split_kv(const char *line, char *k, int ksz, char *v, int vsz) {
     return sscanf(norm, fmt, k, v) == 2;
 }
 
-/* Import the flat tuning files used by the proven v1.7 data layout when the
- * consolidated graphics.txt does not exist. New data folders stay governed by
- * graphics.txt; this fallback only prevents an existing working folder from
- * silently losing its resolution/FPS/effect choices after updating the VPK. */
-static int legacy_read_token(const char *name, char *dst, size_t cap) {
-    FILE *f = mcsm_open_setting(name, "r");
-    if (!f) return 0;
-    char value[64] = "";
-    const int ok = fscanf(f, " %63s", value) == 1;
-    fclose(f);
-    if (ok) cfg_set(dst, cap, value);
-    return ok;
-}
-
-static int legacy_marker_present(const char *name) {
-    FILE *f = mcsm_open_setting(name, "r");
-    if (!f) return 0;
-    fclose(f);
-    return 1;
-}
-
 static void load_cfg(void) {
     char prof[16] = "balanced";
     char res[16] = "", fps[16] = "", vsync[16] = "", outl[16] = "", shad[16] = "";
@@ -287,7 +266,6 @@ static void load_cfg(void) {
     char aarate[16] = "";
 
     FILE *f = mcsm_open_setting("graphics.txt", "r");
-    const int have_graphics = (f != NULL);
     if (f) {
         char line[160], k[24], v[64];
         while (fgets(line, sizeof(line), f)) {
@@ -355,36 +333,6 @@ static void load_cfg(void) {
         fclose(f);
     }
 
-    if (!have_graphics) {
-        int imported = 0;
-        imported |= legacy_read_token("fb_override.txt", res, sizeof(res));
-        imported |= legacy_read_token("fps_cap.txt", fps, sizeof(fps));
-        imported |= legacy_read_token("anim_rate.txt", arate, sizeof(arate));
-        imported |= legacy_read_token("anim_full.txt", skin, sizeof(skin));
-        imported |= legacy_read_token("render_quality.txt", rq, sizeof(rq));
-        imported |= legacy_read_token("far_clip.txt", dist, sizeof(dist));
-
-        char detail_scale[16] = "";
-        if (legacy_read_token("detail_scale.txt", detail_scale, sizeof(detail_scale))) {
-            const float scale = (float)atof(detail_scale);
-            if (scale >= 0.1f && scale <= 1.0f) {
-                snprintf(det, sizeof(det), "%d", (int)(scale * 1000.0f + 0.5f));
-            }
-            imported = 1;
-        }
-
-        if (legacy_marker_present("shadows.txt"))       { cfg_set(shad, sizeof(shad), "on");  imported = 1; }
-        if (legacy_marker_present("no_shadows.txt"))    { cfg_set(shad, sizeof(shad), "off"); imported = 1; }
-        if (legacy_marker_present("no_outlines.txt"))   { cfg_set(outl, sizeof(outl), "off"); imported = 1; }
-        if (legacy_marker_present("novsync.txt"))       { cfg_set(vsync, sizeof(vsync), "off"); imported = 1; }
-        if (legacy_marker_present("nearest_filter.txt")){ cfg_set(nfilt, sizeof(nfilt), "on"); imported = 1; }
-        if (legacy_marker_present("fbfetch_zero.txt"))  { cfg_set(fbz, sizeof(fbz), "on"); imported = 1; }
-
-        if (imported) {
-            l_info("CONFIG(graphics): graphics.txt absent; imported compatible v1.7 flat tuning files");
-        }
-    }
-
     int p = PROF_BALANCED;
     if      (!strcmp(prof, "quality"))     p = PROF_QUALITY;
     else if (!strcmp(prof, "performance")) p = PROF_PERFORMANCE;
@@ -397,8 +345,8 @@ static void load_cfg(void) {
     /* Activate exactly one self-contained custom panel. custom_mode=easy uses the
      * six grouped word choices; custom_mode=advanced uses the permanently visible
      * raw values. This avoids comment/uncomment mechanics and prevents the inactive
-     * block from leaking into the active one. Legacy custom_* raw overrides still
-     * come last for backward compatibility with already-shipped settings files. */
+     * block from leaking into the active one. Raw custom_* overrides still come
+     * last so an advanced user can replace any grouped choice explicitly. */
     if (p == PROF_CUSTOM) {
         const int advanced_mode = !strcmp(cmode, "advanced");
         if (!advanced_mode) {
@@ -447,7 +395,7 @@ static void load_cfg(void) {
             if (agpu[0])   cfg_set(gpu_name, sizeof(gpu_name), agpu);
         }
 
-        /* Legacy raw overrides intentionally come last. */
+        /* Raw overrides intentionally come last. */
         if (cres[0])   cfg_set(res,   sizeof(res),   cres);
         if (cfps[0])   cfg_set(fps,   sizeof(fps),   cfps);
         if (cvsync[0]) cfg_set(vsync, sizeof(vsync), cvsync);

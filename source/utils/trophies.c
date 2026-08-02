@@ -118,7 +118,7 @@ static McsmTrophyUnlockState g_unlocked;
 static SceUID g_req_sema = -1, g_done_sema = -1;
 static volatile int g_pending_id = -1;
 
-/* name -> id map, loaded once from ux0:data/mcsm/trophies.txt */
+/* name -> id map, loaded once from ux0:data/mcsm/settings/trophies.txt */
 #define TROPHY_MAP_MAX 128
 #define TROPHY_NAME_MAX 64
 typedef struct { char name[TROPHY_NAME_MAX]; int id; } TrophyMapEntry;
@@ -563,5 +563,5 @@ void mcsm_trophies_unlock_by_name(const char *name) {
     static unsigned s_unmapped = 0;
     if (s_unmapped++ < 64u)
         l_info("TROPHY: achievement \"%s\" is UNMAPPED — add a line \"%s = <id>\" to "
-               "ux0:data/mcsm/trophies.txt", name, name);
+               "ux0:data/mcsm/settings/trophies.txt", name, name);
 }

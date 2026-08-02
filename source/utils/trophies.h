@@ -38,7 +38,7 @@ int mcsm_trophies_init(void);
 void mcsm_trophies_unlock(uint32_t id);
 
 /* Unlock by the engine's achievement name, resolved through the name->ID map read
- * from ux0:data/mcsm/trophies.txt. Unknown names are logged (throttled) rather than
+ * from ux0:data/mcsm/settings/trophies.txt. Unknown names are logged (throttled) rather than
  * dropped, so a single playthrough reveals the exact strings the game uses -- they
  * live in packed .ttarch2 Lua and cannot be extracted offline. */
 void mcsm_trophies_unlock_by_name(const char *name);

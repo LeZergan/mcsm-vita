@@ -21,7 +21,7 @@
  * NIDs can be resolved at runtime. That makes the questions answerable ON DEVICE
  * for the cost of one load -- which is what this file does, and nothing more.
  *
- * OFF unless ux0:data/mcsm/fmod_native_probe.txt exists. It does not touch the
+ * OFF unless settings/fmod_native_probe.txt exists. It does not touch the
  * audio path, does not change what the engine links against, and unloads the
  * module before returning. A negative result costs one boot; a positive result
  * means the rewrite is worth doing and tells us exactly which symbols exist.
@@ -77,7 +77,7 @@ static int probe_symbol(const char *modname, const char *sym, uint32_t nid) {
 
 void mcsm_fmod_native_probe(void) {
     char flag[256];
-    snprintf(flag, sizeof(flag), DATA_PATH "fmod_native_probe.txt");
+    snprintf(flag, sizeof(flag), DATA_PATH "settings/fmod_native_probe.txt");
     FILE *fp = fopen(flag, "r");
     if (!fp) return;
     fclose(fp);
