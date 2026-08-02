@@ -68,8 +68,8 @@ endif()
 # Vita application configuration
 set(VITA_APP_NAME "Minecraft: Story Mode")
 set(VITA_TITLEID "MCSM00001")
-set(VITA_VPKNAME "mcsm_diag")
-set(VITA_VERSION "01.02")
+set(VITA_VPKNAME "MCSM-1.10")
+set(VITA_VERSION "01.10")
 set(VITA_MKSFOEX_FLAGS "-d ATTRIBUTE2=12")
 
 # ☠ THE NP COMMUNICATION ID HAS EXACTLY ONE DEFINITION, AND THIS IS IT.

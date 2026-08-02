@@ -2,7 +2,16 @@
 
 Runs the Android build of *Minecraft: Story Mode* on the PS Vita. Loader code only — **no game code or assets**; bring your own legally-owned copy. Built on [soloader-boilerplate](https://github.com/v-atamanenko/soloader-boilerplate), rendered with [vitaGL](https://github.com/Rinnegatamante/vitaGL).
 
-> **WIP.**
+> **Public testing release.** Expect rough edges and keep backups of your saves.
+
+## Download
+
+The [latest GitHub release](../../releases/latest) contains both files needed for setup:
+
+- **`MCSM-1.10.vpk`** — install with VitaShell.
+- **`MCSM-Vita-Data-Builder-v1.6.exe`** — creates the required `ux0:data/mcsm` folder from your legally owned Android files.
+
+The release does not contain the Android game, APK, OBBs, episodes, or other retail data.
 
 ## Videos
 
@@ -23,7 +32,7 @@ No *Minecraft: Story Mode* code or assets are included or linked — supply your
 
 - Homebrew-enabled Vita / PS TV (HENkaku ensō, 3.60 / 3.65) with **VitaShell**.
 - `kubridge.skprx` and `fd_fix.skprx` in `ur0:tai/` (both listed under `*KERNEL` in `config.txt`), and `libshacccg.suprx` in `ur0:data/`. `fd_fix.skprx` raises the open-file limit the loader needs to stream the game archives — without it, archive reads thrash on `EMFILE`. (Don't use it alongside the rePatch plugin.)
-- Your own legally-owned game: the `com.telltalegames.minecraft100` APK + its OBB. Target **v1.37** (`40137`).
+- Your own legally-owned game: the `com.telltalegames.minecraft100` APK plus its matching main and patch OBBs. The supported set is **PowerVR v1.37** (`40137`).
 
 ## Easy data setup
 
@@ -47,23 +56,23 @@ The app also creates `settings/graphics.txt` and `settings/game.txt`. **Balanced
 
 The **Fix & mods** panel can install a supplied controller-button asset fix and merge extra folders/ZIPs into the generated data directory. Locally distributed builds can also include the supported offline `choice.prop` dataset required by the crowd-choice statistics screen. General mod installation is experimental and has not been tested on Vita; add-ons are applied last, while the canonical OBBs and native runtime libraries remain protected.
 
-## Known issues
+## Known limitations
 
-- Stutters and fluctuating frame rate.
-- Your choices don't display in the menu.
-- Can't change the save file title.
+- Crowded scenes can become CPU-heavy and fall to around 20 FPS.
+- The first boot can remain black for roughly 30 seconds while caches are created.
+- Save-slot titles cannot currently be renamed.
+- Experimental data add-ons/mods have not been validated on Vita hardware.
 
 ## Building
 
-softfp VitaSDK with vitaGL, vitaShaRK, mathneon, OpenSLES, kubridge.
+The Vita loader requires the **softfp** VitaSDK with vitaGL, vitaShaRK, mathneon, OpenSLES, and kubridge. The build script rejects a hard-float SDK instead of producing an ABI-unsafe package.
 
-```bash
-export VITASDK=/path/to/vitasdk-softfp
-cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-cmake --build build
+```powershell
+$env:VITASDK = "C:\path\to\vitasdk-softfp"
+.\build_vpk.ps1
 ```
 
-VPK lands in `build/`. Windows: `build_vpk.ps1`.
+The production package is written to `build_local/MCSM-1.10.vpk` with telemetry disabled by default. Build the Windows data preparer with `data-builder/build.ps1`.
 
 VPKs and extracted game data are intentionally excluded from this source repository.
 
