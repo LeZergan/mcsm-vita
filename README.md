@@ -17,7 +17,7 @@ Development progress, oldest to newest:
 
 ## Legal
 
-No *Minecraft: Story Mode* code or assets are included or linked — supply your own `.apk` + `.obb`. Unofficial fan project, not affiliated with Mojang, Microsoft, Telltale/LCG, Skybound, or Netflix. Trademarks belong to their owners.
+No *Minecraft: Story Mode* code or assets are included or linked — supply your own `.apk`, main `.obb`, and patch `.obb`. Unofficial fan project, not affiliated with Mojang, Microsoft, Telltale/LCG, Skybound, or Netflix. Trademarks belong to their owners.
 
 ## Requirements
 
@@ -30,12 +30,12 @@ No *Minecraft: Story Mode* code or assets are included or linked — supply your
 The Windows [MCSM Vita Data Builder](data-builder/README.md) turns user-owned Android files into the exact ready-to-copy Vita folder. It does not download or contain game data.
 
 1. Open `MCSM-Vita-Data-Builder.exe`.
-2. Choose the 32-bit PowerVR APK and its main OBB.
+2. Choose the 32-bit PowerVR APK, main OBB, and patch OBB. A matching patch beside the main OBB is filled automatically.
 3. Optionally add Episode 2–8 folders or chapter ZIPs.
 4. Press **Build Data Folder**.
 5. Copy the resulting `mcsm` folder to `ux0:data/` with VitaShell.
 
-The final required path is `ux0:data/mcsm/assets`. A matching patch OBB placed beside the main OBB is detected automatically. Extra chapter `.ttarch2` and descriptor `.lua` files are detected, validated, and put in the correct shared assets folder.
+The final required path is `ux0:data/mcsm/assets`. Both OBBs are required for the base install; the patch is detected automatically when it sits beside the main OBB, or it can be selected manually. Extra chapter `.ttarch2` and descriptor `.lua` files are detected, validated, and put in the correct shared assets folder.
 
 To build the self-contained Windows EXE from source:
 

@@ -4,8 +4,8 @@ A simple Windows app that creates the exact `ux0:data/mcsm` folder required by t
 
 ## Using the app
 
-1. Choose the 32-bit PowerVR `com.telltalegames.minecraft100` APK.
-2. Choose its main `.obb` file. A single matching `patch.*.obb` beside the main OBB is included automatically.
+1. Choose the 32-bit PowerVR `com.telltalegames.minecraft100` `.apk` file.
+2. Choose its main `.obb` and patch `.obb`. Selecting the main OBB automatically fills one matching `patch.*.obb` beside it, or you can choose the patch manually.
 3. Optionally add Episode 2–8 sources. The app accepts either:
    - the episode folder (including the original `com.telltalegames.minecraft100/files/Net` layout), or
    - a ZIP containing that episode's `.ttarch2` and descriptor `.lua` files.
@@ -44,10 +44,12 @@ The self-contained executable is written to `dist/MCSM-Vita-Data-Builder.exe`. T
 
 ## Supported inputs
 
-- APK: ARMv7 build containing all five required native libraries.
-- Base data: one main OBB. A neighboring patch OBB is optional.
+- APK: one `.apk` ARMv7 build containing all five required native libraries.
+- Base data: one main `.obb` plus one separate patch `.obb`; both are required.
 - Extra episodes: folders or ZIPs containing `.ttarch2` and `.lua` files for Episodes 2–8.
 - Controller fix: a folder/ZIP containing `.d3dtx` files and all four required face-button `.d3dmesh` files.
 - Experimental mods: data folders or ZIPs to merge into `mcsm`.
 
 The builder does not download, bundle, or link to copyrighted game data.
+
+The base-game pickers expose only `.apk` and `.obb` formats. The Build button stays locked until the APK, main OBB, and patch OBB have each passed validation.

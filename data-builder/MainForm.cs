@@ -19,8 +19,12 @@ public sealed class MainForm : Form
     private readonly FlowLayoutPanel _page = new();
     private readonly TextBox _apkBox = new();
     private readonly TextBox _obbBox = new();
+    private readonly TextBox _patchObbBox = new();
     private readonly TextBox _outputBox = new();
-    private readonly Label _patchLabel = new();
+    private readonly Label _apkValidationLabel = new();
+    private readonly Label _mainObbValidationLabel = new();
+    private readonly Label _patchObbValidationLabel = new();
+    private readonly Label _baseNoteLabel = new();
     private readonly Label _extrasSummaryLabel = new();
     private readonly ListBox _chapterList = new();
     private readonly ComboBox _profileBox = new();
@@ -39,6 +43,9 @@ public sealed class MainForm : Form
     private string? _buttonFixError;
     private string? _selectedButtonFixPath;
     private readonly List<DataAddonSource> _dataAddons = [];
+    private string? _validatedApkPath;
+    private string? _validatedMainObbPath;
+    private string? _validatedPatchObbPath;
     private CancellationTokenSource? _buildCancellation;
     private BuildResult? _lastResult;
 
@@ -47,7 +54,7 @@ public sealed class MainForm : Form
         Text = "MCSM Vita Data Builder";
         StartPosition = FormStartPosition.CenterScreen;
         MinimumSize = new Size(900, 760);
-        Size = new Size(1020, 960);
+        Size = new Size(1040, 1000);
         BackColor = Page;
         ForeColor = TextMain;
         Font = new Font("Segoe UI", 9.5f);
@@ -75,7 +82,7 @@ public sealed class MainForm : Form
         _outputBox.Text = Path.Combine(desktop, "MCSM Vita Data", "mcsm");
         _profileBox.SelectedIndex = 0;
         _languageBox.SelectedIndex = 0;
-        UpdatePatchStatus();
+        UpdateBaseNote();
         UpdateOptionalSummary();
         UpdateReadyState();
 
@@ -99,7 +106,7 @@ public sealed class MainForm : Form
     {
         Panel header = new()
         {
-            Height = 96,
+            Height = 92,
             Margin = new Padding(0, 0, 0, 8),
             BackColor = Page
         };
@@ -108,7 +115,7 @@ public sealed class MainForm : Form
         Label badge = new()
         {
             AutoSize = true,
-            Text = "  VITA DATA TOOL  ",
+            Text = "  MCSM  •  PS VITA  ",
             Font = new Font("Segoe UI Semibold", 8.5f),
             ForeColor = Primary,
             BackColor = Color.FromArgb(18, 64, 54),
@@ -118,20 +125,30 @@ public sealed class MainForm : Form
         Label title = new()
         {
             AutoSize = true,
-            Text = "Build your game data in one pass",
+            Text = "Prepare your Vita data",
             Font = new Font("Segoe UI Semibold", 24f),
             ForeColor = TextMain,
-            Location = new Point(0, 32)
+            Location = new Point(0, 28)
         };
         Label subtitle = new()
         {
             AutoSize = true,
-            Text = "Choose your own APK and main OBB. Chapters are optional. The tool does the Vita layout.",
+            Text = "Drop the APK + both OBBs anywhere. Each required file is checked before Build unlocks.",
             Font = new Font("Segoe UI", 10.5f),
             ForeColor = TextSoft,
-            Location = new Point(3, 76)
+            Location = new Point(3, 68)
         };
-        header.Controls.AddRange([badge, title, subtitle]);
+        Label localOnly = new()
+        {
+            AutoSize = true,
+            Text = "LOCAL ONLY  •  YOUR FILES ARE NEVER UPLOADED",
+            Font = new Font("Segoe UI Semibold", 8f),
+            ForeColor = Info,
+            Location = new Point(626, 8),
+            Anchor = AnchorStyles.Top | AnchorStyles.Right
+        };
+        header.SizeChanged += (_, _) => localOnly.Left = Math.Max(420, header.ClientSize.Width - localOnly.Width - 2);
+        header.Controls.AddRange([badge, title, subtitle, localOnly]);
         _page.Controls.Add(header);
     }
 
@@ -139,44 +156,85 @@ public sealed class MainForm : Form
     {
         Panel card = CreateCard(
             "1",
-            "Choose the base game",
-            "Use the 32-bit PowerVR APK and its main OBB. A matching patch OBB beside it is included automatically.",
-            196);
+            "Add the three required base files",
+            "Only .apk and .obb files are accepted. Use the 32-bit PowerVR APK plus its main and patch OBBs.",
+            248);
 
-        Label apkLabel = CreateFieldLabel("GAME APK", 24, 76);
-        ConfigurePathBox(_apkBox, 24, 98);
-        Button apkButton = CreateSecondaryButton("Choose APK", 0, 96, 112);
-        apkButton.Click += (_, _) => BrowseApk();
+        Label apkLabel = CreateFieldLabel("1  GAME PACKAGE  ·  .APK ONLY", 24, 70);
+        ConfigureInputState(_apkValidationLabel, 250, 68, "REQUIRED");
+        ConfigurePathBox(_apkBox, 24, 88, "Choose or drop the game .apk");
+        Button apkButton = CreateSecondaryButton("Browse .APK", 0, 86, 116);
+        apkButton.Click += async (_, _) => await BrowseApkAsync();
 
-        Label obbLabel = CreateFieldLabel("MAIN OBB", 24, 130);
-        ConfigurePathBox(_obbBox, 24, 152);
-        Button obbButton = CreateSecondaryButton("Choose OBB", 0, 150, 112);
-        obbButton.Click += (_, _) => BrowseObb();
+        Label obbLabel = CreateFieldLabel("2  MAIN EXPANSION  ·  .OBB ONLY", 24, 118);
+        ConfigureInputState(_mainObbValidationLabel, 250, 116, "REQUIRED");
+        ConfigurePathBox(_obbBox, 24, 136, "Choose or drop the main .obb");
+        Button obbButton = CreateSecondaryButton("Browse .OBB", 0, 134, 116);
+        obbButton.Click += async (_, _) => await BrowseMainObbAsync();
 
-        _patchLabel.AutoSize = true;
-        _patchLabel.Font = new Font("Segoe UI", 8.5f);
-        _patchLabel.ForeColor = TextSoft;
-        _patchLabel.Location = new Point(24, 180);
+        Label patchObbLabel = CreateFieldLabel("3  PATCH EXPANSION  ·  .OBB ONLY", 24, 166);
+        ConfigureInputState(_patchObbValidationLabel, 250, 164, "REQUIRED");
+        ConfigurePathBox(_patchObbBox, 24, 184, "Auto-detected beside main OBB, or choose it");
+        Button patchObbButton = CreateSecondaryButton("Browse .OBB", 0, 182, 116);
+        patchObbButton.Click += async (_, _) => await BrowsePatchObbAsync();
+
+        _baseNoteLabel.AutoSize = false;
+        _baseNoteLabel.Font = new Font("Segoe UI", 8.5f);
+        _baseNoteLabel.ForeColor = TextSoft;
+        _baseNoteLabel.Location = new Point(24, 220);
+        _baseNoteLabel.Height = 20;
 
         void ResizeFields()
         {
-            int buttonX = card.ClientSize.Width - 136;
+            int buttonX = card.ClientSize.Width - 140;
             int boxWidth = Math.Max(300, buttonX - 42);
             _apkBox.Width = boxWidth;
             _obbBox.Width = boxWidth;
+            _patchObbBox.Width = boxWidth;
             apkButton.Left = buttonX;
             obbButton.Left = buttonX;
+            patchObbButton.Left = buttonX;
+            int stateWidth = Math.Max(180, card.ClientSize.Width - 274);
+            _apkValidationLabel.Width = stateWidth;
+            _mainObbValidationLabel.Width = stateWidth;
+            _patchObbValidationLabel.Width = stateWidth;
+            _baseNoteLabel.Width = Math.Max(300, card.ClientSize.Width - 48);
         }
         card.SizeChanged += (_, _) => ResizeFields();
 
-        _apkBox.TextChanged += (_, _) => UpdateReadyState();
-        _obbBox.TextChanged += (_, _) =>
+        _apkBox.TextChanged += (_, _) =>
         {
-            UpdatePatchStatus();
+            if (!PathsMatch(_validatedApkPath, _apkBox.Text))
+            {
+                _validatedApkPath = null;
+            }
             UpdateReadyState();
         };
-        _inputs.AddRange([_apkBox, _obbBox, apkButton, obbButton]);
-        card.Controls.AddRange([apkLabel, _apkBox, apkButton, obbLabel, _obbBox, obbButton, _patchLabel]);
+        _obbBox.TextChanged += (_, _) =>
+        {
+            if (!PathsMatch(_validatedMainObbPath, _obbBox.Text))
+            {
+                _validatedMainObbPath = null;
+            }
+            UpdateBaseNote();
+            UpdateReadyState();
+        };
+        _patchObbBox.TextChanged += (_, _) =>
+        {
+            if (!PathsMatch(_validatedPatchObbPath, _patchObbBox.Text))
+            {
+                _validatedPatchObbPath = null;
+            }
+            UpdateBaseNote();
+            UpdateReadyState();
+        };
+        _inputs.AddRange([_apkBox, _obbBox, _patchObbBox, apkButton, obbButton, patchObbButton]);
+        card.Controls.AddRange([
+            apkLabel, _apkValidationLabel, _apkBox, apkButton,
+            obbLabel, _mainObbValidationLabel, _obbBox, obbButton,
+            patchObbLabel, _patchObbValidationLabel, _patchObbBox, patchObbButton,
+            _baseNoteLabel
+        ]);
         ResizeFields();
     }
 
@@ -184,12 +242,12 @@ public sealed class MainForm : Form
     {
         Panel card = CreateCard(
             "2",
-            "Add optional content",
-            "Episodes go here. Controller fixes and experimental mods are available under Fix & mods.",
-            216);
+            "Optional episodes, fixes + mods",
+            "Episode 1 is already in the base files. Add owned Episodes 2–8 here; fixes and mods stay separate.",
+            202);
 
         _chapterList.Location = new Point(24, 78);
-        _chapterList.Height = 112;
+        _chapterList.Height = 96;
         _chapterList.BackColor = Field;
         _chapterList.ForeColor = TextMain;
         _chapterList.BorderStyle = BorderStyle.FixedSingle;
@@ -197,8 +255,8 @@ public sealed class MainForm : Form
         _chapterList.IntegralHeight = false;
 
         Button addFolder = CreateSecondaryButton("Add folder", 0, 78, 116);
-        Button addZip = CreateSecondaryButton("Add ZIP", 0, 116, 116);
-        Button remove = CreateGhostButton("Remove", 0, 154, 116);
+        Button addZip = CreateSecondaryButton("Add ZIP", 0, 113, 116);
+        Button remove = CreateGhostButton("Remove", 0, 148, 116);
         addFolder.Click += async (_, _) => await BrowseChapterFolderAsync();
         addZip.Click += async (_, _) => await BrowseChapterZipAsync();
         remove.Click += (_, _) =>
@@ -215,10 +273,10 @@ public sealed class MainForm : Form
         _extrasSummaryLabel.Text = "Episode 1 only";
         _extrasSummaryLabel.ForeColor = TextSoft;
         _extrasSummaryLabel.Font = new Font("Segoe UI", 8.5f);
-        _extrasSummaryLabel.Location = new Point(24, 197);
+        _extrasSummaryLabel.Location = new Point(24, 178);
         _extrasSummaryLabel.Height = 18;
 
-        Button extras = CreateGhostButton("Fix + mods…", 0, 184, 116);
+        Button extras = CreateGhostButton("Fix + mods…", 0, 173, 116);
         extras.ForeColor = Warning;
         extras.Click += (_, _) => OpenExtrasDialog();
 
@@ -243,17 +301,17 @@ public sealed class MainForm : Form
     {
         Panel card = CreateCard(
             "3",
-            "Choose where the ready folder goes",
-            "The result is always named mcsm. Copy that whole folder to ux0:data\\ on your Vita.",
+            "Choose output and starting defaults",
+            "The result is always named mcsm. Copy the whole finished folder to ux0:data\\ on your Vita.",
             190);
 
         Label outputLabel = CreateFieldLabel("OUTPUT FOLDER", 24, 77);
-        ConfigurePathBox(_outputBox, 24, 99);
+        ConfigurePathBox(_outputBox, 24, 99, "Choose where the finished mcsm folder should be created");
         Button outputButton = CreateSecondaryButton("Choose folder", 0, 97, 116);
         outputButton.Click += (_, _) => BrowseOutput();
 
         Label profileLabel = CreateFieldLabel("STARTING PROFILE", 24, 138);
-        ConfigureCombo(_profileBox, 24, 158, 230);
+        ConfigureCombo(_profileBox, 24, 158, 250);
         _profileBox.Items.AddRange([
             new Choice("Performance — recommended", "performance"),
             new Choice("Balanced", "balanced"),
@@ -261,8 +319,8 @@ public sealed class MainForm : Form
             new Choice("Battery", "battery")
         ]);
 
-        Label languageLabel = CreateFieldLabel("TEXT LANGUAGE", 282, 138);
-        ConfigureCombo(_languageBox, 282, 158, 180);
+        Label languageLabel = CreateFieldLabel("TEXT LANGUAGE", 302, 138);
+        ConfigureCombo(_languageBox, 302, 158, 180);
         _languageBox.Items.AddRange([
             new Choice("English", "en"),
             new Choice("French", "fr"),
@@ -292,7 +350,7 @@ public sealed class MainForm : Form
 
     private void BuildActionCard()
     {
-        Panel card = CreateCard("✓", "Ready check", "Nothing is changed until you press Build.", 146);
+        Panel card = CreateCard("✓", "Final check", "Build unlocks only after the APK and both OBBs pass validation.", 146);
 
         _statusLabel.AutoSize = false;
         _statusLabel.Location = new Point(24, 74);
@@ -398,7 +456,7 @@ public sealed class MainForm : Form
         Location = new Point(x, y)
     };
 
-    private static void ConfigurePathBox(TextBox box, int x, int y)
+    private static void ConfigurePathBox(TextBox box, int x, int y, string placeholder = "")
     {
         box.Location = new Point(x, y);
         box.Height = 28;
@@ -406,6 +464,20 @@ public sealed class MainForm : Form
         box.ForeColor = TextMain;
         box.BorderStyle = BorderStyle.FixedSingle;
         box.Font = new Font("Segoe UI", 9f);
+        box.ReadOnly = true;
+        box.PlaceholderText = placeholder;
+        box.Cursor = Cursors.Hand;
+    }
+
+    private static void ConfigureInputState(Label label, int x, int y, string text)
+    {
+        label.AutoSize = false;
+        label.Location = new Point(x, y);
+        label.Height = 18;
+        label.TextAlign = ContentAlignment.MiddleRight;
+        label.Font = new Font("Segoe UI Semibold", 7.7f);
+        label.ForeColor = TextSoft;
+        label.Text = $"○  {text}";
     }
 
     private static void ConfigureCombo(ComboBox box, int x, int y, int width)
@@ -417,6 +489,27 @@ public sealed class MainForm : Form
         box.BackColor = Field;
         box.ForeColor = TextMain;
         box.Font = new Font("Segoe UI", 9f);
+        box.DrawMode = DrawMode.OwnerDrawFixed;
+        box.ItemHeight = 24;
+        box.DrawItem += (_, e) =>
+        {
+            Color background = (e.State & DrawItemState.Selected) != 0
+                ? Color.FromArgb(30, 64, 78)
+                : Field;
+            using SolidBrush backgroundBrush = new(background);
+            e.Graphics.FillRectangle(backgroundBrush, e.Bounds);
+            if (e.Index >= 0)
+            {
+                using SolidBrush textBrush = new(TextMain);
+                e.Graphics.DrawString(
+                    box.Items[e.Index]?.ToString() ?? string.Empty,
+                    box.Font,
+                    textBrush,
+                    e.Bounds.Left + 5,
+                    e.Bounds.Top + 3);
+            }
+            e.DrawFocusRectangle();
+        };
     }
 
     private static Button CreateSecondaryButton(string text, int x, int y, int width)
@@ -484,32 +577,170 @@ public sealed class MainForm : Form
         }
     }
 
-    private void BrowseApk()
+    private async Task BrowseApkAsync()
     {
         using OpenFileDialog dialog = new()
         {
             Title = "Choose your Minecraft: Story Mode APK",
-            Filter = "Android package (*.apk)|*.apk|All files (*.*)|*.*",
-            CheckFileExists = true
+            Filter = "Android APK (*.apk)|*.apk",
+            DefaultExt = "apk",
+            AddExtension = false,
+            CheckFileExists = true,
+            RestoreDirectory = true
         };
         if (dialog.ShowDialog(this) == DialogResult.OK)
         {
-            _apkBox.Text = dialog.FileName;
+            await SelectApkAsync(dialog.FileName);
         }
     }
 
-    private void BrowseObb()
+    private async Task BrowseMainObbAsync()
     {
         using OpenFileDialog dialog = new()
         {
             Title = "Choose the main Minecraft: Story Mode OBB",
-            Filter = "Main expansion (*.obb)|*.obb|All files (*.*)|*.*",
-            CheckFileExists = true
+            Filter = "Android OBB (*.obb)|*.obb",
+            DefaultExt = "obb",
+            AddExtension = false,
+            CheckFileExists = true,
+            RestoreDirectory = true
         };
         if (dialog.ShowDialog(this) == DialogResult.OK)
         {
-            _obbBox.Text = dialog.FileName;
+            await SelectMainObbAsync(dialog.FileName);
         }
+    }
+
+    private async Task BrowsePatchObbAsync()
+    {
+        using OpenFileDialog dialog = new()
+        {
+            Title = "Choose the patch Minecraft: Story Mode OBB",
+            Filter = "Android OBB (*.obb)|*.obb",
+            DefaultExt = "obb",
+            AddExtension = false,
+            CheckFileExists = true,
+            RestoreDirectory = true
+        };
+        if (dialog.ShowDialog(this) == DialogResult.OK)
+        {
+            await SelectPatchObbAsync(dialog.FileName);
+        }
+    }
+
+    private async Task SelectApkAsync(string path)
+    {
+        string fullPath = Path.GetFullPath(path);
+        _validatedApkPath = null;
+        _apkBox.Text = fullPath;
+        SetInputState(_apkValidationLabel, "CHECKING APK…", Info, "…");
+        UpdateReadyState();
+
+        try
+        {
+            ApkLayout layout = await Task.Run(() => DataBuilderService.InspectApk(fullPath));
+            if (!PathsMatch(fullPath, _apkBox.Text))
+            {
+                return;
+            }
+            _validatedApkPath = fullPath;
+            SetInputState(
+                _apkValidationLabel,
+                $"READY  •  {layout.LibraryCount} ARMv7 LIBS  •  {layout.AssetCount} ASSETS",
+                Primary,
+                "✓");
+        }
+        catch (Exception exception)
+        {
+            SetInputState(_apkValidationLabel, "NOT ACCEPTED", Warning, "!");
+            MessageBox.Show(this, exception.Message, "APK not accepted", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        }
+        UpdateReadyState();
+    }
+
+    private async Task SelectMainObbAsync(string path)
+    {
+        string fullPath = Path.GetFullPath(path);
+        _validatedMainObbPath = null;
+        _obbBox.Text = fullPath;
+        SetInputState(_mainObbValidationLabel, "CHECKING MAIN OBB…", Info, "…");
+        UpdateReadyState();
+
+        try
+        {
+            ObbLayout layout = await Task.Run(() => DataBuilderService.InspectMainObb(fullPath));
+            if (!PathsMatch(fullPath, _obbBox.Text))
+            {
+                return;
+            }
+            _validatedMainObbPath = fullPath;
+            SetInputState(
+                _mainObbValidationLabel,
+                $"READY  •  {FormatBytes(layout.TotalBytes)}",
+                Primary,
+                "✓");
+
+            if (PathsMatch(fullPath, _patchObbBox.Text))
+            {
+                _validatedPatchObbPath = null;
+                SetInputState(_patchObbValidationLabel, "CHOOSE A DIFFERENT OBB", Warning, "!");
+            }
+
+            if (layout.PatchPath is not null && !PathsMatch(layout.PatchPath, _patchObbBox.Text))
+            {
+                await SelectPatchObbAsync(layout.PatchPath, detectedAutomatically: true);
+            }
+            else if (layout.PatchPath is null && string.IsNullOrWhiteSpace(_patchObbBox.Text))
+            {
+                SetInputState(_patchObbValidationLabel, "REQUIRED  •  NOT FOUND BESIDE MAIN", Warning, "!");
+            }
+        }
+        catch (Exception exception)
+        {
+            SetInputState(_mainObbValidationLabel, "NOT ACCEPTED", Warning, "!");
+            MessageBox.Show(this, exception.Message, "Main OBB not accepted", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        }
+        UpdateBaseNote();
+        UpdateReadyState();
+    }
+
+    private async Task SelectPatchObbAsync(string path, bool detectedAutomatically = false)
+    {
+        string fullPath = Path.GetFullPath(path);
+        _validatedPatchObbPath = null;
+        _patchObbBox.Text = fullPath;
+        SetInputState(_patchObbValidationLabel, "CHECKING PATCH OBB…", Info, "…");
+        UpdateReadyState();
+
+        try
+        {
+            if (PathsMatch(fullPath, _obbBox.Text))
+            {
+                throw new InvalidDataException("Main OBB and patch OBB must be two different files.");
+            }
+            ObbLayout layout = await Task.Run(() => DataBuilderService.InspectPatchObb(fullPath));
+            if (!PathsMatch(fullPath, _patchObbBox.Text))
+            {
+                return;
+            }
+            _validatedPatchObbPath = fullPath;
+            string source = detectedAutomatically ? "AUTO-DETECTED" : "READY";
+            SetInputState(
+                _patchObbValidationLabel,
+                $"{source}  •  {FormatBytes(layout.TotalBytes)}",
+                Primary,
+                "✓");
+        }
+        catch (Exception exception)
+        {
+            SetInputState(_patchObbValidationLabel, "NOT ACCEPTED", Warning, "!");
+            if (!detectedAutomatically)
+            {
+                MessageBox.Show(this, exception.Message, "Patch OBB not accepted", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            }
+        }
+        UpdateBaseNote();
+        UpdateReadyState();
     }
 
     private async Task BrowseChapterFolderAsync()
@@ -531,8 +762,11 @@ public sealed class MainForm : Form
         using OpenFileDialog dialog = new()
         {
             Title = "Choose one or more chapter ZIPs",
-            Filter = "Chapter ZIP (*.zip)|*.zip|All files (*.*)|*.*",
+            Filter = "Chapter ZIP (*.zip)|*.zip",
+            DefaultExt = "zip",
+            AddExtension = false,
             CheckFileExists = true,
+            RestoreDirectory = true,
             Multiselect = true
         };
         if (dialog.ShowDialog(this) == DialogResult.OK)
@@ -602,7 +836,7 @@ public sealed class MainForm : Form
         _dataAddons.Clear();
         _dataAddons.AddRange(dialog.DataAddons);
         UpdateOptionalSummary();
-        UpdatePatchStatus();
+        UpdateBaseNote();
     }
 
     private void UpdateOptionalSummary()
@@ -674,6 +908,7 @@ public sealed class MainForm : Form
             var request = new BuildRequest(
                 _apkBox.Text.Trim(),
                 _obbBox.Text.Trim(),
+                _patchObbBox.Text.Trim(),
                 output,
                 chapters,
                 profile.Value,
@@ -751,20 +986,33 @@ public sealed class MainForm : Form
         _buildButton.Enabled = ready;
         if (ready)
         {
-            SetStatus("Ready to build. Your original files will not be modified.", Primary);
+            SetStatus("All 3 base files passed. Ready to build safely.", Primary);
+        }
+        else if (!PathsMatch(_validatedApkPath, _apkBox.Text))
+        {
+            SetStatus("Start with the required 32-bit PowerVR .apk.", TextSoft);
+        }
+        else if (!PathsMatch(_validatedMainObbPath, _obbBox.Text))
+        {
+            SetStatus("APK ready — now add the main .obb.", TextSoft);
+        }
+        else if (!PathsMatch(_validatedPatchObbPath, _patchObbBox.Text))
+        {
+            SetStatus("Main data ready — add the separate patch .obb.", TextSoft);
         }
         else
         {
-            SetStatus("Choose an APK, a main OBB, and an output folder.", TextSoft);
+            SetStatus("Choose where the finished mcsm folder should go.", TextSoft);
         }
     }
 
     private bool InputsLookReady() =>
-        File.Exists(_apkBox.Text.Trim())
-        && File.Exists(_obbBox.Text.Trim())
+        PathsMatch(_validatedApkPath, _apkBox.Text)
+        && PathsMatch(_validatedMainObbPath, _obbBox.Text)
+        && PathsMatch(_validatedPatchObbPath, _patchObbBox.Text)
         && !string.IsNullOrWhiteSpace(_outputBox.Text);
 
-    private void UpdatePatchStatus()
+    private void UpdateBaseNote()
     {
         string? activeFixError = _selectedButtonFixPath is null ? _buttonFixError : null;
         bool hasButtonFix = _selectedButtonFixPath is not null || _buttonFixBundle is not null;
@@ -775,35 +1023,37 @@ public sealed class MainForm : Form
             : _buttonFixBundle is null
                 ? "controller fix not bundled"
                 : $"controller fix built in ({_buttonFixBundle.FileCount} assets)";
-        string path = _obbBox.Text.Trim();
-        if (!File.Exists(path))
-        {
-            _patchLabel.Text = $"Patch OBB: optional — auto-detected  ·  {fixText}";
-            _patchLabel.ForeColor = activeFixError is not null
-                ? Warning
-                : hasButtonFix ? Primary : TextSoft;
-            _toolTip.SetToolTip(_patchLabel, activeFixError ?? "The controller fix is copied into mcsm/assets automatically.");
-            return;
-        }
+        string obbText = PathsMatch(_validatedPatchObbPath, _patchObbBox.Text)
+            ? "Main + patch OBB ready"
+            : "Both main and patch OBBs are required";
+        _baseNoteLabel.Text = $"{obbText}  ·  {fixText}";
+        _baseNoteLabel.ForeColor = activeFixError is not null
+            ? Warning
+            : hasButtonFix && PathsMatch(_validatedPatchObbPath, _patchObbBox.Text) ? Primary : TextSoft;
+        _toolTip.SetToolTip(
+            _baseNoteLabel,
+            activeFixError ?? "The controller fix is copied into mcsm/assets automatically.");
+    }
 
+    private static void SetInputState(Label label, string text, Color color, string icon)
+    {
+        label.Text = $"{icon}  {text}";
+        label.ForeColor = color;
+    }
+
+    private static bool PathsMatch(string? expected, string? actual)
+    {
+        if (string.IsNullOrWhiteSpace(expected) || string.IsNullOrWhiteSpace(actual))
+        {
+            return false;
+        }
         try
         {
-            string? patch = DataBuilderService.FindPatchObb(path);
-            string patchText = patch is null
-                ? "Patch OBB: not found (main-only build is supported)"
-                : $"Patch OBB: found automatically — {Path.GetFileName(patch)}";
-            _patchLabel.Text = $"{patchText}  ·  {fixText}";
-            _patchLabel.ForeColor = activeFixError is not null
-                ? Warning
-                : patch is not null || hasButtonFix ? Primary : TextSoft;
-            string patchTip = patch ?? "Place one matching patch.*.obb beside the main OBB to include it.";
-            _toolTip.SetToolTip(_patchLabel, $"{patchTip}\n{activeFixError ?? fixText}");
+            return Path.GetFullPath(expected).Equals(Path.GetFullPath(actual.Trim()), StringComparison.OrdinalIgnoreCase);
         }
-        catch (Exception exception)
+        catch
         {
-            _patchLabel.Text = "Patch OBB: choose which patch belongs beside the main OBB";
-            _patchLabel.ForeColor = Warning;
-            _toolTip.SetToolTip(_patchLabel, exception.Message);
+            return false;
         }
     }
 
@@ -828,9 +1078,14 @@ public sealed class MainForm : Form
 
     private void OnDragEnter(object? sender, DragEventArgs e)
     {
-        if (e.Data?.GetDataPresent(DataFormats.FileDrop) == true)
+        if (e.Data?.GetData(DataFormats.FileDrop) is string[] paths
+            && paths.Any(IsSupportedDrop))
         {
             e.Effect = DragDropEffects.Copy;
+        }
+        else
+        {
+            e.Effect = DragDropEffects.None;
         }
     }
 
@@ -841,23 +1096,60 @@ public sealed class MainForm : Form
             return;
         }
 
-        foreach (string path in paths)
+        int ignored = 0;
+        foreach (string path in paths.OrderBy(path =>
+                     Path.GetFileName(path).StartsWith("patch.", StringComparison.OrdinalIgnoreCase) ? 1 : 0))
         {
             string extension = Path.GetExtension(path);
             if (File.Exists(path) && extension.Equals(".apk", StringComparison.OrdinalIgnoreCase))
             {
-                _apkBox.Text = path;
+                await SelectApkAsync(path);
             }
             else if (File.Exists(path) && extension.Equals(".obb", StringComparison.OrdinalIgnoreCase))
             {
-                _obbBox.Text = path;
+                bool looksLikePatch = Path.GetFileName(path).StartsWith("patch.", StringComparison.OrdinalIgnoreCase);
+                if (looksLikePatch || PathsMatch(_validatedMainObbPath, _obbBox.Text))
+                {
+                    await SelectPatchObbAsync(path);
+                }
+                else
+                {
+                    await SelectMainObbAsync(path);
+                }
             }
             else if (Directory.Exists(path)
                      || (File.Exists(path) && extension.Equals(".zip", StringComparison.OrdinalIgnoreCase)))
             {
                 await AddChapterSourceAsync(path);
             }
+            else
+            {
+                ignored++;
+            }
         }
+
+        if (ignored > 0)
+        {
+            SetStatus(
+                $"Ignored {ignored} unsupported file(s). Base game accepts only .apk and .obb.",
+                Warning);
+        }
+    }
+
+    private static bool IsSupportedDrop(string path)
+    {
+        if (Directory.Exists(path))
+        {
+            return true;
+        }
+        if (!File.Exists(path))
+        {
+            return false;
+        }
+        string extension = Path.GetExtension(path);
+        return extension.Equals(".apk", StringComparison.OrdinalIgnoreCase)
+            || extension.Equals(".obb", StringComparison.OrdinalIgnoreCase)
+            || extension.Equals(".zip", StringComparison.OrdinalIgnoreCase);
     }
 
     private void OnFormClosing(object? sender, FormClosingEventArgs e)

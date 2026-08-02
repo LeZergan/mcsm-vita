@@ -43,6 +43,7 @@ public sealed record ChapterSource(
 public sealed record BuildRequest(
     string ApkPath,
     string MainObbPath,
+    string PatchObbPath,
     string OutputDirectory,
     IReadOnlyList<ChapterSource> ChapterSources,
     string GraphicsProfile,

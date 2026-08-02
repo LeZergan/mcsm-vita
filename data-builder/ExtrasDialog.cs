@@ -32,7 +32,7 @@ public sealed class ExtrasDialog : Form
         _buttonFixPath = selectedButtonFixPath;
         _addons = dataAddons.ToList();
 
-        Text = "Fixes and experimental mods";
+        Text = "Optional fixes and experimental mods";
         StartPosition = FormStartPosition.CenterParent;
         FormBorderStyle = FormBorderStyle.FixedDialog;
         MaximizeBox = false;
@@ -52,7 +52,7 @@ public sealed class ExtrasDialog : Form
         Label title = new()
         {
             AutoSize = true,
-            Text = "Fixes & data add-ons",
+            Text = "Fixes + data add-ons",
             Font = new Font("Segoe UI Semibold", 22f),
             ForeColor = TextMain,
             Location = new Point(28, 20)
@@ -60,7 +60,7 @@ public sealed class ExtrasDialog : Form
         Label subtitle = new()
         {
             AutoSize = true,
-            Text = "Optional tools stay out of the normal APK + OBB setup flow.",
+            Text = "Optional tools stay out of the normal APK + two-OBB setup flow.",
             ForeColor = TextSoft,
             Location = new Point(31, 62)
         };
@@ -78,7 +78,7 @@ public sealed class ExtrasDialog : Form
 
         Button chooseFixFolder = CreateButton("Choose folder", 20, 102, 118);
         Button chooseFixZip = CreateButton("Choose ZIP", 146, 102, 104);
-        Button useBuiltIn = CreateGhostButton("Reset to built-in", 260, 102, 142);
+        Button useBuiltIn = CreateGhostButton("Use built-in fix", 260, 102, 142);
         chooseFixFolder.Click += (_, _) => ChooseFixFolder();
         chooseFixZip.Click += (_, _) => ChooseFixZip();
         useBuiltIn.Click += (_, _) =>
@@ -162,8 +162,11 @@ public sealed class ExtrasDialog : Form
         using OpenFileDialog dialog = new()
         {
             Title = "Choose the controller button-fix ZIP",
-            Filter = "ZIP archive (*.zip)|*.zip|All files (*.*)|*.*",
-            CheckFileExists = true
+            Filter = "ZIP archive (*.zip)|*.zip",
+            DefaultExt = "zip",
+            AddExtension = false,
+            CheckFileExists = true,
+            RestoreDirectory = true
         };
         if (dialog.ShowDialog(this) == DialogResult.OK)
         {
@@ -205,8 +208,11 @@ public sealed class ExtrasDialog : Form
         using OpenFileDialog dialog = new()
         {
             Title = "Choose one or more mod/data ZIPs",
-            Filter = "ZIP archive (*.zip)|*.zip|All files (*.*)|*.*",
+            Filter = "ZIP archive (*.zip)|*.zip",
+            DefaultExt = "zip",
+            AddExtension = false,
             CheckFileExists = true,
+            RestoreDirectory = true,
             Multiselect = true
         };
         if (dialog.ShowDialog(this) == DialogResult.OK)

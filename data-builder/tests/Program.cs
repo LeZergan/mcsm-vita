@@ -42,6 +42,60 @@ try
     string patchObb = Path.Combine(inputs, "patch.99999.com.telltalegames.minecraft100.obb");
     await File.WriteAllTextAsync(patchObb, "synthetic patch");
 
+    ObbLayout inspectedMainObb = DataBuilderService.InspectMainObb(mainObb);
+    Assert(
+        inspectedMainObb.PatchPath?.Equals(patchObb, StringComparison.OrdinalIgnoreCase) == true,
+        "The neighboring required patch OBB was not detected.");
+    _ = DataBuilderService.InspectPatchObb(patchObb);
+
+    string disguisedApk = Path.Combine(inputs, "minecraft.zip");
+    File.Copy(apkPath, disguisedApk);
+    bool wrongApkExtensionRejected = false;
+    try
+    {
+        _ = DataBuilderService.InspectApk(disguisedApk);
+    }
+    catch (InvalidDataException)
+    {
+        wrongApkExtensionRejected = true;
+    }
+    Assert(wrongApkExtensionRejected, "A non-.apk base package was accepted.");
+
+    string disguisedObb = Path.Combine(inputs, "main-data.bin");
+    File.Copy(mainObb, disguisedObb);
+    bool wrongObbExtensionRejected = false;
+    try
+    {
+        _ = DataBuilderService.InspectMainObb(disguisedObb);
+    }
+    catch (InvalidDataException)
+    {
+        wrongObbExtensionRejected = true;
+    }
+    Assert(wrongObbExtensionRejected, "A non-.obb main expansion was accepted.");
+
+    bool swappedObbsRejected = false;
+    try
+    {
+        _ = DataBuilderService.InspectMainObb(patchObb);
+    }
+    catch (InvalidDataException)
+    {
+        swappedObbsRejected = true;
+    }
+    Assert(swappedObbsRejected, "A patch OBB was accepted in the main OBB slot.");
+
+    bool mainInPatchSlotRejected = false;
+    try
+    {
+        _ = DataBuilderService.InspectPatchObb(mainObb);
+    }
+    catch (InvalidDataException)
+    {
+        mainInPatchSlotRejected = true;
+    }
+    Assert(mainInPatchSlotRejected, "A main OBB was accepted in the patch OBB slot.");
+
     string episode2 = Path.Combine(inputs, "episode2", "com.telltalegames.minecraft100", "files", "Net");
     Directory.CreateDirectory(episode2);
     await File.WriteAllTextAsync(
@@ -120,6 +174,7 @@ try
     var request = new BuildRequest(
         apkPath,
         mainObb,
+        patchObb,
         output,
         [source2, source3],
         "balanced",
@@ -128,6 +183,28 @@ try
         [addonFolder, addonZip]);
 
     DataBuilderService builder = new();
+    bool missingPatchRejected = false;
+    try
+    {
+        _ = await builder.BuildAsync(request with { PatchObbPath = string.Empty });
+    }
+    catch (FileNotFoundException)
+    {
+        missingPatchRejected = true;
+    }
+    Assert(missingPatchRejected, "A build without the required patch OBB was accepted.");
+
+    bool duplicateObbsRejected = false;
+    try
+    {
+        _ = await builder.BuildAsync(request with { PatchObbPath = mainObb });
+    }
+    catch (InvalidDataException)
+    {
+        duplicateObbsRejected = true;
+    }
+    Assert(duplicateObbsRejected, "The same OBB was accepted for both required OBB slots.");
+
     BuildResult first = await builder.BuildAsync(request);
     Assert(first.IncludedEpisodes.SequenceEqual([1, 2, 3]), "Included episode list is wrong.");
     Assert(first.ButtonFixFileCount == 4, "User-supplied controller fix was not installed.");
@@ -170,7 +247,7 @@ try
     }
     Assert(File.Exists(Path.Combine(output, "DATA_FOLDER_READY.txt")), "Final ready marker is missing.");
 
-    Console.WriteLine("PASS: APK/OBB extraction, chapters, supplied/built-in controller fixes, experimental folder/ZIP data add-ons, settings, validation, and backups.");
+    Console.WriteLine("PASS: strict APK + required main/patch OBB validation, extraction, chapters, controller fixes, experimental data add-ons, settings, and backups.");
     return 0;
 }
 catch (Exception exception)

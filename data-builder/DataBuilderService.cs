@@ -35,7 +35,8 @@ public sealed class DataBuilderService
     {
         ValidateRequest(request);
         ApkLayout apkLayout = InspectApk(request.ApkPath);
-        string? patchObbPath = FindPatchObb(request.MainObbPath);
+        ObbLayout mainObb = InspectMainObb(request.MainObbPath);
+        ObbLayout patchObb = InspectPatchObb(request.PatchObbPath);
         ButtonFixBundle? buttonFix = ResolveButtonFix(request.ButtonFixPath);
 
         string outputDirectory = Path.GetFullPath(request.OutputDirectory.Trim());
@@ -53,8 +54,8 @@ public sealed class DataBuilderService
         Directory.CreateDirectory(parent);
 
         long totalBytes = apkLayout.TotalBytes
-            + new FileInfo(request.MainObbPath).Length
-            + (patchObbPath is null ? 0 : new FileInfo(patchObbPath).Length)
+            + mainObb.TotalBytes
+            + patchObb.TotalBytes
             + (buttonFix?.TotalBytes ?? 0)
             + request.ChapterSources.Sum(source => source.TotalBytes)
             + request.DataAddons.Sum(source => source.TotalBytes);
@@ -128,15 +129,12 @@ public sealed class DataBuilderService
                 cancellationToken);
             Report("Main OBB ready");
 
-            if (patchObbPath is not null)
-            {
-                await CopyFileAsync(
-                    patchObbPath,
-                    Path.Combine(stagingDirectory, PatchObbName),
-                    bytes => copiedBytes += bytes,
-                    cancellationToken);
-                Report("Optional patch OBB included");
-            }
+            await CopyFileAsync(
+                request.PatchObbPath,
+                Path.Combine(stagingDirectory, PatchObbName),
+                bytes => copiedBytes += bytes,
+                cancellationToken);
+            Report("Patch OBB ready");
 
             foreach (ChapterSource source in request.ChapterSources)
             {
@@ -235,6 +233,10 @@ public sealed class DataBuilderService
         {
             throw new FileNotFoundException("APK not found.", apkPath);
         }
+        if (!Path.GetExtension(apkPath).Equals(".apk", StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidDataException("Only Android .apk files are accepted for the game package.");
+        }
 
         try
         {
@@ -262,6 +264,59 @@ public sealed class DataBuilderService
         {
             throw new InvalidDataException("The selected APK could not be opened as an Android package.", exception);
         }
+    }
+
+    public static ObbLayout InspectMainObb(string mainObbPath)
+    {
+        if (!File.Exists(mainObbPath))
+        {
+            throw new FileNotFoundException("Main OBB not found.", mainObbPath);
+        }
+        if (!Path.GetExtension(mainObbPath).Equals(".obb", StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidDataException("Only Android .obb files are accepted for the main expansion data.");
+        }
+
+        string fileName = Path.GetFileName(mainObbPath);
+        if (fileName.StartsWith("patch.", StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidDataException(
+                "That is a patch OBB. Choose the larger main.*.obb file instead; a matching patch is found automatically.");
+        }
+
+        long bytes = new FileInfo(mainObbPath).Length;
+        if (bytes < 1024 * 1024)
+        {
+            throw new InvalidDataException("The selected main OBB is unexpectedly small and cannot be used.");
+        }
+
+        return new ObbLayout(bytes, FindPatchObb(mainObbPath));
+    }
+
+    public static ObbLayout InspectPatchObb(string patchObbPath)
+    {
+        if (!File.Exists(patchObbPath))
+        {
+            throw new FileNotFoundException("Patch OBB not found.", patchObbPath);
+        }
+        if (!Path.GetExtension(patchObbPath).Equals(".obb", StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidDataException("Only Android .obb files are accepted for the patch expansion data.");
+        }
+
+        string fileName = Path.GetFileName(patchObbPath);
+        if (fileName.StartsWith("main.", StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidDataException("That looks like the main OBB. Choose the separate patch.*.obb file here.");
+        }
+
+        long bytes = new FileInfo(patchObbPath).Length;
+        if (bytes <= 0)
+        {
+            throw new InvalidDataException("The selected patch OBB is empty and cannot be used.");
+        }
+
+        return new ObbLayout(bytes, null);
     }
 
     public static ButtonFixBundle? InspectBundledButtonFix()
@@ -405,9 +460,18 @@ public sealed class DataBuilderService
         {
             throw new InvalidDataException("The second file must be a main .obb.");
         }
-        if (new FileInfo(request.MainObbPath).Length < 1024 * 1024)
+        if (!File.Exists(request.PatchObbPath))
         {
-            throw new InvalidDataException("The selected main OBB is unexpectedly small.");
+            throw new FileNotFoundException("Choose the patch OBB first.", request.PatchObbPath);
+        }
+        if (!Path.GetExtension(request.PatchObbPath).Equals(".obb", StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidDataException("The third file must be a patch .obb.");
+        }
+        if (Path.GetFullPath(request.MainObbPath)
+            .Equals(Path.GetFullPath(request.PatchObbPath), StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidDataException("Main OBB and patch OBB must be two different files.");
         }
         if (string.IsNullOrWhiteSpace(request.OutputDirectory))
         {
@@ -678,6 +742,7 @@ public sealed class DataBuilderService
             "Copy this entire mcsm folder to ux0:data\\ on the PS Vita.\r\n" +
             "The final Vita path must be: ux0:data\\mcsm\\assets\r\n\r\n" +
             $"Detected episodes: {episodeText}\r\n" +
+            $"Base OBBs: main + patch included\r\n" +
             $"Graphics profile: {request.GraphicsProfile}\r\n" +
             $"Language: {request.LanguageCode}\r\n" +
             $"Controller button fix: {(buttonFix is null ? "not supplied" : $"included ({buttonFix.FileCount} assets)")}\r\n" +
@@ -850,3 +915,5 @@ public sealed class DataBuilderService
 }
 
 public sealed record ApkLayout(int LibraryCount, int AssetCount, long TotalBytes);
+
+public sealed record ObbLayout(long TotalBytes, string? PatchPath);
