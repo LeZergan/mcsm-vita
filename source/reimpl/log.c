@@ -18,6 +18,7 @@
 #define RECENT_ALOG_TAG_MAX 32
 #define RECENT_ALOG_TEXT_MAX 224
 
+#ifdef DEBUG_SOLOADER
 typedef struct RecentAlog {
     int prio;
     char tag[RECENT_ALOG_TAG_MAX];
@@ -60,37 +61,59 @@ static int should_suppress_alog_print(int prio, const char *tag, const char *tex
            strncmp(text, "Found file:", 11) == 0;
 }
 
-#define print_common \
-    if (!should_suppress_alog_print(prio, tag, text)) { \
-        switch (prio) { \
-            case ANDROID_LOG_INFO: \
-                l_info("[ALOG][%s] %s", tag, text); \
-                break; \
-            case ANDROID_LOG_WARN: \
-                l_warn("[ALOG][%s] %s", tag, text); \
-                break; \
-            case ANDROID_LOG_ERROR: \
-            case ANDROID_LOG_FATAL: \
-                l_error("[ALOG][%s] %s", tag, text); \
-                break; \
-            case ANDROID_LOG_UNKNOWN: \
-            case ANDROID_LOG_DEFAULT: \
-            case ANDROID_LOG_VERBOSE: \
-            case ANDROID_LOG_DEBUG: \
-            case ANDROID_LOG_SILENT: \
-            default: \
-                l_debug("[ALOG][%s] %s", tag, text); \
-                break; \
-        } \
-    } \
+static void print_common(int prio, const char *tag, const char *text) {
+    if (!should_suppress_alog_print(prio, tag, text)) {
+        switch (prio) {
+            case ANDROID_LOG_INFO:
+                l_info("[ALOG][%s] %s", tag, text);
+                break;
+            case ANDROID_LOG_WARN:
+                l_warn("[ALOG][%s] %s", tag, text);
+                break;
+            case ANDROID_LOG_ERROR:
+            case ANDROID_LOG_FATAL:
+                l_error("[ALOG][%s] %s", tag, text);
+                break;
+            case ANDROID_LOG_UNKNOWN:
+            case ANDROID_LOG_DEFAULT:
+            case ANDROID_LOG_VERBOSE:
+            case ANDROID_LOG_DEBUG:
+            case ANDROID_LOG_SILENT:
+            default:
+                l_debug("[ALOG][%s] %s", tag, text);
+                break;
+        }
+    }
     alog_store(prio, tag, text);
+}
+#else
+static int alog_is_important(int prio) {
+    return prio == ANDROID_LOG_ERROR || prio == ANDROID_LOG_FATAL;
+}
+
+static void print_common(int prio, const char *tag, const char *text) {
+    if (alog_is_important(prio)) {
+        l_error("[ALOG][%s] %s", tag, text);
+    }
+}
+#endif
 
 int __android_log_write(int prio, const char* tag, const char* text) {
-    print_common
+#ifndef DEBUG_SOLOADER
+    if (!alog_is_important(prio)) {
+        return 0;
+    }
+#endif
+    print_common(prio, tag, text);
     return 0;
 }
 
 int __android_log_print(int prio, const char* tag, const char* fmt, ...) {
+#ifndef DEBUG_SOLOADER
+    if (!alog_is_important(prio)) {
+        return 0;
+    }
+#endif
     va_list list;
     char text[1024];
 
@@ -98,17 +121,22 @@ int __android_log_print(int prio, const char* tag, const char* fmt, ...) {
     sceClibVsnprintf(text, sizeof(text), fmt, list);
     va_end(list);
 
-    print_common
+    print_common(prio, tag, text);
 
     return 0;
 }
 
 int __android_log_vprint(int prio, const char* tag, const char* fmt, va_list ap) {
+#ifndef DEBUG_SOLOADER
+    if (!alog_is_important(prio)) {
+        return 0;
+    }
+#endif
     char text[1024];
 
     sceClibVsnprintf(text, sizeof(text), fmt, ap);
 
-    print_common
+    print_common(prio, tag, text);
 
     return 0;
 }
@@ -119,6 +147,10 @@ void android_log_dump_recent(char *out, size_t out_size) {
     }
     out[0] = '\0';
 
+#ifndef DEBUG_SOLOADER
+    sceClibSnprintf(out, out_size, "none");
+    return;
+#else
     unsigned count = atomic_load_explicit(&g_recent_alog_count, memory_order_relaxed);
     unsigned head = atomic_load_explicit(&g_recent_alog_head, memory_order_relaxed);
     if (count == 0) {
@@ -146,6 +178,7 @@ void android_log_dump_recent(char *out, size_t out_size) {
             break;
         }
     }
+#endif
 }
 
 void __android_log_assert(const char* cond, const char* tag, const char* fmt, ...) {

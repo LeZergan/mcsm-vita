@@ -80,6 +80,10 @@ static void apply_profile(McsmCfg *c, int prof) {
     c->fmod_channels = 0; c->scene_prio_min = 0; c->scene_prio_max = 0;
     c->trophy_test = 0;
     c->upscale_nearest = 0;
+    /* MUST be 1: forcing the engine's recursive-bone-contribution fix is what makes
+     * skeletal animation work at all. Defaulting it off was tried on device and made
+     * animation far worse. See patch.c force_animation_runtime_flags(). */
+    c->anim_engine_flags = 1;
     /* Y orientation of the render-scale blit. NOT a quality tier -- it is purely a
      * property of WHICH libvitaGL.a this eboot links, so it is set for every profile.
      *
@@ -103,52 +107,110 @@ static void apply_profile(McsmCfg *c, int prof) {
     switch (prof) {
     case PROF_QUALITY:
         /* Best picture the hardware can hold WITHOUT the framerate ever moving.
-         * Native res, every effect on, real GPU reported so the engine configures
-         * itself at full quality -- then locked to 24, delivered as a true 3:2:3:2
-         * pulldown by the fractional present timeline (see the note above). At
-         * 41.67ms per frame the engine (~30-45ms sim) makes the deadline, which is
-         * what "does not move" means. Steady 24 reads far better than a 25-30 that
-         * lurches, and it is the cinematic cadence this game was authored for. */
-        c->render_w = 960; c->render_h = 544; c->fps_cap = 24; c->vsync = 1;
+         * Native res, real GPU identity so the engine configures itself at full
+         * quality, and a rate that is genuinely LOCKED.
+         *
+         * ★★ 20, NOT 24 -- AND 20 IS THE ONE THAT IS ACTUALLY LOCKED (2026-07-31).
+         * This profile asked for 24 for a long time, on the reasoning that 24 is the
+         * cinematic cadence the game was authored for. The reasoning was fine and the
+         * number was not achievable: the panel is 60Hz, and with vsync a frame can
+         * only last a WHOLE number of vblanks. 60/24 = 2.5, which does not exist, so
+         * "24" was never a locked 24 -- it was a 3:2 pulldown alternating 33ms and
+         * 50ms frames that merely AVERAGED 24. Every per-second counter reported a
+         * truthful 24 while the motion carried the 50ms half, which is exactly the
+         * "counter says 24, feels like 15" the tester reported.
+         *
+         * The only even rates available are 60/N: 60, 30, 20, 15. 24 is the gap
+         * between 30 and 20. Of those two neighbours:
+         *   30 = 33.3ms budget -- this workload (sim ~30-45ms) MISSES it, so it would
+         *        drop frames and be uneven again, just wearing a faster label.
+         *   20 = 50.0ms budget -- fits with real margin, and every frame is exactly
+         *        3 vblanks. Same worst case as the 3:2 pattern's slow half, but now
+         *        it is EVERY frame instead of every other one, and consistency is
+         *        most of what perceived smoothness actually is.
+         * So 20 is both the closest even rate and the only one this profile can hold.
+         * It is still slow and deliberate, which is what "cinematic" was after.
+         *
+         * DO NOT "fix" this back to 24 because 24 sounds more filmic. 24 on a 60Hz
+         * panel is a pulldown, not a frame rate. Check the PACING log line: a locked
+         * 20 puts essentially every frame in the 3-vblank bucket; the old 24 spread
+         * across buckets 2 and 3. That spread IS the judder. */
+        c->render_w = 800; c->render_h = 452; c->fps_cap = 30; c->vsync = 1;
         /* draw_distance is NOT unlimited here, even though this is the pretty
          * profile. Device data: the GPU idles around 40% while frames take 55ms,
-         * i.e. the CPU is the entire limit -- so pixels and shadows are nearly
-         * free, and culling distant objects is what actually buys stability.
-         * Unlimited distance made the CPU walk every far object for almost no
-         * visible gain, and sim work measured p50 49ms / p90 71ms against the
-         * 50ms budget -- half the frames missed 20fps before drawing anything. */
-        c->outlines = 1;   c->shadows = 1;    c->draw_distance = 6000; c->skinning_full = 1;
+         * i.e. the CPU is the entire limit -- so pixels are nearly free, and culling
+         * distant objects is what actually buys stability. Unlimited distance made
+         * the CPU walk every far object for almost no visible gain, and sim work
+         * measured p50 49ms / p90 71ms against the 50ms budget -- half the frames
+         * missed 20fps before drawing anything.
+         *
+         * ★ SHADOWS ARE OFF, AND THAT IS WHAT MAKES THIS PROFILE HONEST (2026-07-31).
+         * They were on, and the profile could not hold the 24 it promises: 24fps is a
+         * 41.7ms budget and measured sim was p50 49ms -- the median frame missed,
+         * before a single draw. Shadows re-submit the ENTIRE scene, so on a
+         * CPU-bound frame they are the most expensive thing in the profile and the
+         * only cut big enough to close a 7ms median gap.
+         *
+         * Native resolution and full detail are KEPT precisely because the limit is
+         * the CPU: dropping pixels would cost sharpness and buy almost nothing, and
+         * this is the profile someone picks for sharpness. So the trade is
+         * "everything the CPU can afford at 24, nothing it cannot" -- native res,
+         * outlines, full-detail geometry, no shadows. Distance also comes 6000->5000
+         * (matching `default`) to take the remaining margin from object walking
+         * rather than from anything visible up close. */
+        c->outlines = 1;   c->shadows = 0;    c->draw_distance = 4000; c->skinning_full = 1;
         c->anim_rate = 1;   c->detail = 1000; c->render_quality = -1; c->gpu_tier = 1;
         c->shader_opt = 2; c->clock_adaptive = 0; c->clock_mhz = 444; break;
 
     case PROF_BALANCED:    /* "default" -- good visuals AND good performance */
-        /* Middle GPU identity so the engine trims its heaviest effects but keeps the
-         * look, outlines kept (they carry the art style), shadows off (biggest cheap
-         * win), 800x452 stays sharp for text. Targets 30. */
+        /* Targets a real 30, which is a 33.3ms budget.
+         *
+         * ★ RETUNED 2026-07-31 to actually reach it. The old settings (gpu_tier 1,
+         * detail 1000, dist 5000) were strictly HEAVIER than the performance profile,
+         * and performance measures p50 26ms / p90 42ms -- so this profile's median
+         * frame was already over 33.3ms and the 30 was aspirational. Three cuts, in
+         * order of measured value:
+         *   gpu_tier 1 -> 0   the strongest single lever there is, worth 22.2 -> 26.2
+         *                     fps (+18%) on its own. It tells the engine it is a
+         *                     weak phone so it picks its own low-spec path.
+         *   detail 1000 -> 900  slow frames track VERTEX count, and detail is one of
+         *                     only two runtime levers that cuts vertices. 900 is a
+         *                     mild bias toward coarser baked LODs -- visible on close
+         *                     inspection, not in motion.
+         *   dist 5000 -> 4000  cheapest of the three: culls before submission and
+         *                     costs only far-object pop-in.
+         *
+         * What is deliberately KEPT is what separates this from `performance`:
+         * outlines on (they carry the art style), full-rate animation (no lip-sync
+         * stepping), and the higher 720x408 render scale for legible text. That is
+         * the actual difference now -- not the engine tier. */
         c->render_w = 720; c->render_h = 408; c->fps_cap = 30; c->vsync = 1;
         c->outlines = 1;   c->shadows = 0;    c->draw_distance = 5000; c->skinning_full = 1;
-        c->anim_rate = 1;   c->detail = 1000; c->render_quality = -1; c->gpu_tier = 1;
+        c->anim_rate = 1;   c->detail = 1000;  c->render_quality = -1; c->gpu_tier = 1;
         c->shader_opt = 2; c->clock_adaptive = 0; c->clock_mhz = 444; break;
 
     case PROF_PERFORMANCE:
         /* Frames over everything -- but "frames" means DISPLAYED frames, which on a
          * 60Hz vsynced panel is a ladder, not a dial: only 60/30/20/15 exist.
          *
-         * ★ CAP STAYS 60. It was briefly lowered to 30 on 2026-07-30 on the theory
-         * that 60 "manufactures judder". That was wrong, and the arithmetic says so:
-         * capping lower never makes a frame arrive sooner, it only ever delays one.
-         * Same workload (sim p50 26ms / p90 42ms) through both caps:
-         *     work 12ms   cap60 -> present 16.7ms = 60fps
-         *                 cap30 -> HELD to 33.3ms = 30fps   <-- pure loss
-         *     work 26ms   cap60 -> next vblank 33.3ms = 30fps
-         *                 cap30 ->           33.3ms = 30fps   <-- identical
-         *     work 42ms   cap60 -> next vblank 50ms   = 20fps
-         *                 cap30 ->           50ms   = 20fps   <-- identical
-         * 30 is never faster on a heavy frame and strictly slower on a light one.
-         * The 60->30->20 spread is the WORKLOAD's variance, not something the cap
-         * creates; a lower cap only hides it by discarding the good frames as well.
-         * This profile exists for maximum frames, so it takes the spread -- balanced
-         * and quality are where a flat cadence is the goal.
+         * ★★ CAP IS 30, NOT 60 (2026-08-01). It was 60 on the argument that capping
+         * lower never makes a frame arrive sooner, only later -- which is true about
+         * THROUGHPUT and wrong about what a player sees.
+         *
+         * On a 60Hz panel with vsync a frame lasts a whole number of vblanks. 60 means
+         * ONE vblank, 16.7ms, and this workload (sim p50 26ms / p90 42ms) never gets
+         * there -- so every single frame misses its target and lands on whichever
+         * vblank it happens to reach. The result is a rate that constantly changes
+         * duration, reported from device as "it was uncapped fps it seems" and felt as
+         * microstutter. 30 is two vblanks, 33.3ms, which the median frame actually
+         * makes: frames that fit are EVEN, and frames that miss degrade to a steady 20
+         * via the pacer's hysteresis rather than oscillating.
+         *
+         * It also aligns the two pacers. mcsm_frame_pace_us() paces the SIM from this
+         * same cap, so at 60 the engine was being driven at 14.2ms while the display
+         * delivered 20-30fps -- the engine's own frame delta varying every frame, which
+         * is motion judder no amount of present-side smoothing can fix. At 30 the sim
+         * and the display are asking for the same thing.
          *
          * (Related: the anim_rate throttle's thresholds were hardcoded for a 30 cap
          * and so NEVER fired at 60, which made anim_rate = 2 inert here. Now that
@@ -184,20 +246,75 @@ static void apply_profile(McsmCfg *c, int prof) {
          * provably does not act on the cost is a strict loss, so it is 1 again.
          * The actual per-character cost is graphics.txt `map_buffers` -- see
          * so_patch() and PERF_FINDINGS_2026-07-30.md. */
-        c->render_w = 576; c->render_h = 326; c->fps_cap = 60; c->vsync = 1;
-        c->outlines = 0;   c->shadows = 0;    c->draw_distance = 3000; c->skinning_full = 1;
-        c->anim_rate = 2;   c->detail = 700;  c->render_quality = -1; c->gpu_tier = 0;
+        /* ★ RETUNED 2026-07-31. A 79-minute device session on these settings averaged
+         * 23.9 fps -- roughly what `battery` aims for, from the profile named
+         * "fastest". Every cheap lever was already taken (gpu_tier 0, outlines off,
+         * shadows off, anim_rate 2), so the remaining headroom is the one thing slow
+         * frames actually track: VERTEX COUNT. detail 700 -> 600 and dist 3000 ->
+         * 2500 both attack it -- detail biases the engine to coarser baked LODs,
+         * distance culls whole objects before submission. Geometry gets visibly
+         * chunkier and far scenery pops in sooner; that is the entire point of the
+         * profile, and it is the only place left to take time from.
+         * Resolution STILL stays 576x326 -- pixels were never the bottleneck (the GPU
+         * idles ~40% while frames take 55ms), so dropping it further would cost
+         * sharpness and buy nothing. */
+        /* ★★ anim_rate IS 1, NOT 2 (2026-08-01). Half-rate animation blending was the
+         * last "make it faster by making it worse" lever still shipping, and it is the
+         * most visible one: it steps FACIAL animation and lip-sync, on a dialogue-driven
+         * adventure game where faces are what the camera is pointed at. Reported from
+         * device as "facial animations are kinda fucked on basic performance profile".
+         *
+         * A profile may cost sharpness, draw distance, geometry detail or frame rate.
+         * It may NOT make the game look WRONG -- that is the same line already drawn
+         * for `skinning = reduced` (attachments trailing the body) two entries up.
+         * Speed comes out of pixels and vertices, never out of correctness.
+         *
+         * The frames are elsewhere anyway: animation is only ~15% of a frame, so this
+         * was a small win bought at a large visual cost. */
+        c->render_w = 640; c->render_h = 362; c->fps_cap = 30; c->vsync = 1;
+        c->outlines = 0;   c->shadows = 0;    c->draw_distance = 2500; c->skinning_full = 1;
+        c->anim_rate = 1;   c->detail = 600;   c->render_quality = -1; c->gpu_tier = 0;
         c->shader_opt = 2; c->clock_adaptive = 0; c->clock_mhz = 444; break;
 
     case PROF_BATTERY:
         /* Longest play time. Power on this console tracks CPU clock and pixels, so:
-         * downclock when idle, half native resolution (480x272 is an exact 1/2 of
-         * 960x544, so it upscales cleanly instead of resampling), weakest GPU
-         * identity, coarser geometry, half-rate animation, and 20fps -- a lower
-         * locked rate is less work per second AND a clean 3-vblank lock. */
-        c->render_w = 480; c->render_h = 272; c->fps_cap = 20; c->vsync = 1;
-        c->outlines = 0;   c->shadows = 0;    c->draw_distance = 3000; c->skinning_full = 0;
-        c->anim_rate = 2;   c->detail = 700;  c->render_quality = -1; c->gpu_tier = 0;
+         * downclock when idle, weakest GPU identity, coarser geometry,
+         *
+         * ☠ 456x258 IS NOT AN EXACT HALF OF 960x544 (2026-08-01). This was 480x272
+         * precisely because that IS half, so it upscaled by clean pixel doubling with
+         * no resampling -- and sanitize_framebuffer_override() was fixed specifically
+         * to stop snapping it to 480x270 and destroying that. The ~10% step down was
+         * requested across every profile and gives the doubling up: the upscale now
+         * resamples and reads a touch softer. A deliberate trade, not an oversight --
+         * put this one line back to 480x272 to recover the crisp doubling. Note that
+         * `upscale = nearest` only pays off at the exact 2x ratio, so it no longer
+         * helps here either,
+         * half-rate animation, and 20fps -- a lower locked rate is less work per
+         * second AND a clean 3-vblank lock.
+         *
+         * ★ skinning is FULL here too, for exactly the reason PROF_PERFORMANCE gives
+         * above: the flag does not reach the software-skinning decision at all
+         * (RenderObject_Mesh::_RenderMeshInstance branches on skeletonInstance,
+         * mesh flags bit 23 and mesh[+0x1c8] -- never on it), so it saves nothing,
+         * while reduced skinning makes attached parts visibly trail the body. This
+         * profile trades frames and pixels for battery; it does not get to trade
+         * correctness for nothing. It was the last profile still shipping that
+         * defect. */
+        /* ★ RETUNED 2026-07-31 (detail 700 -> 600, dist 3000 -> 2500, matching
+         * `performance`). 20fps is a 50ms budget and these settings already fit it --
+         * measured sim on the heavier performance profile is p50 26ms / p90 42ms --
+         * so the extra cuts are NOT about hitting the cap. They are the battery win
+         * itself: the adaptive governor below only steps the ARM clock down when a
+         * frame finishes early, so every millisecond of headroom converts directly
+         * into a lower clock for the rest of that frame. Buying headroom this profile
+         * does not need for frames is exactly how it buys runtime. */
+        /* anim_rate 1 here too, for the reason spelled out in PROF_PERFORMANCE: stepped
+         * faces and lip-sync are a defect, not a battery setting. Battery buys its
+         * runtime from pixels, geometry and clock -- all of which look correct, just
+         * simpler. */
+        c->render_w = 576; c->render_h = 326; c->fps_cap = 30; c->vsync = 1;
+        c->outlines = 0;   c->shadows = 0;    c->draw_distance = 3000; c->skinning_full = 1;
+        c->anim_rate = 1;   c->detail = 700;   c->render_quality = -1; c->gpu_tier = 0;
         c->shader_opt = 2; c->clock_adaptive = 1; c->clock_mhz = 444; break;
 
     case PROF_AUTO:
@@ -206,7 +323,16 @@ static void apply_profile(McsmCfg *c, int prof) {
          * for the GPU we reported. Resolution/fps_cap/vsync/clock stay ours (the
          * engine has no concept of the Vita render scale or power), and skinning
          * stays full because reduced is a correctness defect. Use it to A/B the
-         * engine own judgement against the tuned profiles. */
+         * engine own judgement against the tuned profiles.
+         *
+         * ☠ THIS IS THE SLOWEST OPTION IN THE FILE, BY MEASUREMENT -- do not read
+         * "auto" as "sensible default". Unlimited draw distance plus shadows is
+         * exactly the configuration that measured sim p50 49ms / p90 71ms, i.e. more
+         * than half the frames missed even a 50ms (20fps) budget before drawing
+         * anything, so its 30 cap is never reached. It stays untuned ON PURPOSE:
+         * its entire job is to show what the engine does when the loader keeps its
+         * hands off, which is the baseline the other four profiles are measured
+         * against. The player-facing graphics.txt says so plainly. */
         c->render_w = 720; c->render_h = 408; c->fps_cap = 30; c->vsync = 1;
         c->outlines = 1;   c->shadows = 1;    c->draw_distance = 0; c->skinning_full = 1;
         c->anim_rate = 1;   c->detail = 1000; c->render_quality = -1; c->gpu_tier = -1;
@@ -223,10 +349,17 @@ static void apply_profile(McsmCfg *c, int prof) {
          *
          * Kept only as a defensive fallback for an out-of-range value, and made
          * identical to PROF_BALANCED so that if it ever DID run it would agree with
-         * what custom actually does. The player-facing doc has been corrected too. */
+         * what custom actually does. The player-facing doc has been corrected too.
+         *
+         * ☠ IT HAS ALREADY DRIFTED ONCE: the 2026-07-31 retune moved BALANCED to
+         * gpu_tier 0 / dist 4000 / detail 900 and this arm kept the old
+         * 1 / 5000 / 1000, so the "identical" claim above was false within minutes of
+         * being written. Being unreachable is exactly why nothing caught it. If you
+         * touch PROF_BALANCED, touch this too -- or better, delete this arm and let
+         * the compiler's -Wswitch tell you when an enumerator is unhandled. */
         c->render_w = 720; c->render_h = 408; c->fps_cap = 30; c->vsync = 1;
         c->outlines = 1;   c->shadows = 0;    c->draw_distance = 5000; c->skinning_full = 1;
-        c->anim_rate = 1;   c->detail = 1000; c->render_quality = -1; c->gpu_tier = 1;
+        c->anim_rate = 1;   c->detail = 1000;  c->render_quality = -1; c->gpu_tier = 1;
         c->shader_opt = 2; c->clock_adaptive = 0; c->clock_mhz = 444; break;
     }
 }
@@ -239,6 +372,22 @@ static int parse_bool(const char *v, int dflt) {
     if (!strcmp(v, "off") || !strcmp(v, "0") || !strcmp(v, "false") ||
         !strcmp(v, "no") || !strcmp(v, "reduced")) return 0;
     return dflt;
+}
+
+/* Friendly one-word GPU names for graphics.txt. The generic key/value reader
+ * intentionally reads a single value token, so exposing raw renderer strings such
+ * as "PowerVR SGX 540" would be a trap: only "PowerVR" would reach the engine.
+ * Keep the player-facing names short and expand them here. Unknown values retain
+ * the legacy gpu_name behaviour for developer experiments. */
+static const char *gpu_name_from_alias(const char *v) {
+    if (!v || !v[0]) return v;
+    if (!strcmp(v, "sgx540") || !strcmp(v, "fastest")) return "PowerVR SGX 540";
+    if (!strcmp(v, "sgx541") || !strcmp(v, "fast"))    return "PowerVR SGX 541";
+    if (!strcmp(v, "sgx542") || !strcmp(v, "medium"))  return "PowerVR SGX 542";
+    if (!strcmp(v, "sgx543") || !strcmp(v, "quality")) return "PowerVR SGX 543";
+    if (!strcmp(v, "sgx543mp") || !strcmp(v, "vita") || !strcmp(v, "original"))
+        return "PowerVR SGX 543MP";
+    return v;
 }
 
 /* Split a "key = value" (or "key value") line; '=' counts as whitespace.
@@ -257,7 +406,16 @@ static int split_kv(const char *line, char *k, int ksz, char *v, int vsz) {
 static void load_cfg(void) {
     char prof[16] = "balanced";
     char res[16] = "", fps[16] = "", vsync[16] = "", outl[16] = "", shad[16] = "";
-    char upsc[16] = "", gpu_name[32] = "", dist[16] = "", skin[16] = "", clk[16] = "", arate[16] = "", det[16] = "", rq[16] = "", gt[16] = "", sopt[16] = "", mapb[16] = "", bflip[16] = "", pvita[16] = "", fmodch[16] = "", spmin[16] = "", spmax[16] = "", trtest[16] = "";
+    char animef[16] = "", nfilt[16] = "", fbz[16] = "", upsc[16] = "", gpu_name[32] = "", dist[16] = "", skin[16] = "", clk[16] = "", arate[16] = "", det[16] = "", rq[16] = "", gt[16] = "", sopt[16] = "", mapb[16] = "", bflip[16] = "", pvita[16] = "", fmodch[16] = "", spmin[16] = "", spmax[16] = "", trtest[16] = "";
+    /* Player-facing custom profile bank. These values stay active in graphics.txt,
+     * but are copied into the normal override bank only when profile=custom. That
+     * makes selecting a stock preset a true one-line operation: the custom panel
+     * cannot silently leak into performance/balanced/quality/battery. */
+    char cres[16] = "", cfps[16] = "", cvsync[16] = "", coutl[16] = "", cshad[16] = "";
+    char cnfilt[16] = "", cfbz[16] = "", cupsc[16] = "", cdist[16] = "", cclk[16] = "", cdet[16] = "", cgt[16] = "", cgpu[32] = "";
+    char cmode[16] = "easy", cpicture[16] = "", cmotion[16] = "", ceffects[16] = "", cworld[16] = "", cpower[16] = "";
+    char ares[16] = "", afps[16] = "", avsync[16] = "", aoutl[16] = "", ashad[16] = "";
+    char anfilt[16] = "", afbz[16] = "", aupsc[16] = "", adist[16] = "", aclk[16] = "", adet[16] = "", agpu[32] = "";
 
     FILE *f = mcsm_open_setting("graphics.txt", "r");
     if (f) {
@@ -265,6 +423,38 @@ static void load_cfg(void) {
         while (fgets(line, sizeof(line), f)) {
             if (!split_kv(line, k, sizeof(k), v, sizeof(v))) continue;
             if      (!strcmp(k, "profile"))       cfg_set(prof, sizeof(prof), v);
+            else if (!strcmp(k, "custom_mode"))    cfg_set(cmode, sizeof(cmode), v);
+            else if (!strcmp(k, "custom_picture")) cfg_set(cpicture, sizeof(cpicture), v);
+            else if (!strcmp(k, "custom_motion"))  cfg_set(cmotion, sizeof(cmotion), v);
+            else if (!strcmp(k, "custom_effects")) cfg_set(ceffects, sizeof(ceffects), v);
+            else if (!strcmp(k, "custom_world"))   cfg_set(cworld, sizeof(cworld), v);
+            else if (!strcmp(k, "custom_power"))   cfg_set(cpower, sizeof(cpower), v);
+            else if (!strcmp(k, "custom_resolution"))    cfg_set(cres, sizeof(cres), v);
+            else if (!strcmp(k, "custom_fps_cap"))       cfg_set(cfps, sizeof(cfps), v);
+            else if (!strcmp(k, "custom_vsync"))         cfg_set(cvsync, sizeof(cvsync), v);
+            else if (!strcmp(k, "custom_outlines"))      cfg_set(coutl, sizeof(coutl), v);
+            else if (!strcmp(k, "custom_shadows"))       cfg_set(cshad, sizeof(cshad), v);
+            else if (!strcmp(k, "custom_nearest_filter")) cfg_set(cnfilt, sizeof(cnfilt), v);
+            else if (!strcmp(k, "custom_fbfetch_zero"))  cfg_set(cfbz, sizeof(cfbz), v);
+            else if (!strcmp(k, "custom_upscale"))       cfg_set(cupsc, sizeof(cupsc), v);
+            else if (!strcmp(k, "custom_draw_distance")) cfg_set(cdist, sizeof(cdist), v);
+            else if (!strcmp(k, "custom_clock"))         cfg_set(cclk, sizeof(cclk), v);
+            else if (!strcmp(k, "custom_detail"))        cfg_set(cdet, sizeof(cdet), v);
+            else if (!strcmp(k, "custom_gpu_tier"))      cfg_set(cgt, sizeof(cgt), v);
+            else if (!strcmp(k, "custom_gpu") || !strcmp(k, "custom_gpu_name"))
+                cfg_set(cgpu, sizeof(cgpu), v);
+            else if (!strcmp(k, "advanced_resolution"))    cfg_set(ares, sizeof(ares), v);
+            else if (!strcmp(k, "advanced_fps_cap"))       cfg_set(afps, sizeof(afps), v);
+            else if (!strcmp(k, "advanced_vsync"))         cfg_set(avsync, sizeof(avsync), v);
+            else if (!strcmp(k, "advanced_outlines"))      cfg_set(aoutl, sizeof(aoutl), v);
+            else if (!strcmp(k, "advanced_shadows"))       cfg_set(ashad, sizeof(ashad), v);
+            else if (!strcmp(k, "advanced_nearest_filter")) cfg_set(anfilt, sizeof(anfilt), v);
+            else if (!strcmp(k, "advanced_fbfetch_zero"))  cfg_set(afbz, sizeof(afbz), v);
+            else if (!strcmp(k, "advanced_upscale"))       cfg_set(aupsc, sizeof(aupsc), v);
+            else if (!strcmp(k, "advanced_draw_distance")) cfg_set(adist, sizeof(adist), v);
+            else if (!strcmp(k, "advanced_clock"))         cfg_set(aclk, sizeof(aclk), v);
+            else if (!strcmp(k, "advanced_detail"))        cfg_set(adet, sizeof(adet), v);
+            else if (!strcmp(k, "advanced_gpu"))           cfg_set(agpu, sizeof(agpu), v);
             else if (!strcmp(k, "resolution"))    cfg_set(res, sizeof(res), v);
             else if (!strcmp(k, "fps_cap"))       cfg_set(fps, sizeof(fps), v);
             else if (!strcmp(k, "vsync"))         cfg_set(vsync, sizeof(vsync), v);
@@ -287,6 +477,9 @@ static void load_cfg(void) {
             else if (!strcmp(k, "scene_prio_min")) cfg_set(spmin, sizeof(spmin), v);
             else if (!strcmp(k, "scene_prio_max")) cfg_set(spmax, sizeof(spmax), v);
             else if (!strcmp(k, "upscale"))       cfg_set(upsc, sizeof(upsc), v);
+            else if (!strcmp(k, "anim_engine_flags")) cfg_set(animef, sizeof(animef), v);
+            else if (!strcmp(k, "nearest_filter")) cfg_set(nfilt, sizeof(nfilt), v);
+            else if (!strcmp(k, "fbfetch_zero"))  cfg_set(fbz, sizeof(fbz), v);
         }
         fclose(f);
     }
@@ -299,6 +492,73 @@ static void load_cfg(void) {
     else if (!strcmp(prof, "balanced"))    p = PROF_BALANCED;
     else if (!strcmp(prof, "auto"))        p = PROF_AUTO;
     else if (!strcmp(prof, "custom"))      p = PROF_CUSTOM;
+
+    /* Activate exactly one self-contained custom panel. custom_mode=easy uses the
+     * six grouped word choices; custom_mode=advanced uses the permanently visible
+     * raw values. This avoids comment/uncomment mechanics and prevents the inactive
+     * block from leaking into the active one. Legacy custom_* raw overrides still
+     * come last for backward compatibility with already-shipped settings files. */
+    if (p == PROF_CUSTOM) {
+        const int advanced_mode = !strcmp(cmode, "advanced");
+        if (!advanced_mode) {
+            if (cpicture[0]) {
+                if      (!strcmp(cpicture, "native"))  cfg_set(res, sizeof(res), "960x544");
+                else if (!strcmp(cpicture, "quality")) cfg_set(res, sizeof(res), "800x452");
+                else if (!strcmp(cpicture, "sharp"))   cfg_set(res, sizeof(res), "720x408");
+                else if (!strcmp(cpicture, "fast"))    cfg_set(res, sizeof(res), "640x362");
+                else if (!strcmp(cpicture, "battery")) cfg_set(res, sizeof(res), "576x326");
+                else if (!strcmp(cpicture, "low"))     cfg_set(res, sizeof(res), "480x272");
+            }
+            if (cmotion[0]) {
+                if      (!strcmp(cmotion, "smooth")) { cfg_set(fps, sizeof(fps), "30"); cfg_set(vsync, sizeof(vsync), "on"); }
+                else if (!strcmp(cmotion, "steady")) { cfg_set(fps, sizeof(fps), "20"); cfg_set(vsync, sizeof(vsync), "on"); }
+                else if (!strcmp(cmotion, "low"))    { cfg_set(fps, sizeof(fps), "15"); cfg_set(vsync, sizeof(vsync), "on"); }
+            }
+            if (ceffects[0]) {
+                if      (!strcmp(ceffects, "full"))     { cfg_set(outl, sizeof(outl), "on");  cfg_set(shad, sizeof(shad), "on"); }
+                else if (!strcmp(ceffects, "outlines")) { cfg_set(outl, sizeof(outl), "on");  cfg_set(shad, sizeof(shad), "off"); }
+                else if (!strcmp(ceffects, "minimal"))  { cfg_set(outl, sizeof(outl), "off"); cfg_set(shad, sizeof(shad), "off"); }
+            }
+            if (cworld[0]) {
+                if      (!strcmp(cworld, "detailed"))   { cfg_set(det, sizeof(det), "1000"); cfg_set(dist, sizeof(dist), "5000"); }
+                else if (!strcmp(cworld, "balanced"))  { cfg_set(det, sizeof(det), "800");  cfg_set(dist, sizeof(dist), "3500"); }
+                else if (!strcmp(cworld, "fast"))      { cfg_set(det, sizeof(det), "600");  cfg_set(dist, sizeof(dist), "2500"); }
+                else if (!strcmp(cworld, "unlimited")) { cfg_set(det, sizeof(det), "1000"); cfg_set(dist, sizeof(dist), "0"); }
+            }
+            if (cpower[0]) {
+                if      (!strcmp(cpower, "performance")) cfg_set(clk, sizeof(clk), "444");
+                else if (!strcmp(cpower, "battery"))     cfg_set(clk, sizeof(clk), "adaptive");
+            }
+            if (cgpu[0]) cfg_set(gpu_name, sizeof(gpu_name), cgpu);
+        } else {
+            if (ares[0])   cfg_set(res,   sizeof(res),   ares);
+            if (afps[0])   cfg_set(fps,   sizeof(fps),   afps);
+            if (avsync[0]) cfg_set(vsync, sizeof(vsync), avsync);
+            if (aoutl[0])  cfg_set(outl,  sizeof(outl),  aoutl);
+            if (ashad[0])  cfg_set(shad,  sizeof(shad),  ashad);
+            if (anfilt[0]) cfg_set(nfilt, sizeof(nfilt), anfilt);
+            if (afbz[0])   cfg_set(fbz,   sizeof(fbz),   afbz);
+            if (aupsc[0])  cfg_set(upsc,  sizeof(upsc),  aupsc);
+            if (adist[0])  cfg_set(dist,  sizeof(dist),  adist);
+            if (aclk[0])   cfg_set(clk,   sizeof(clk),   aclk);
+            if (adet[0])   cfg_set(det,   sizeof(det),   adet);
+            if (agpu[0])   cfg_set(gpu_name, sizeof(gpu_name), agpu);
+        }
+
+        /* Legacy raw overrides intentionally come last. */
+        if (cres[0])   cfg_set(res,   sizeof(res),   cres);
+        if (cfps[0])   cfg_set(fps,   sizeof(fps),   cfps);
+        if (cvsync[0]) cfg_set(vsync, sizeof(vsync), cvsync);
+        if (coutl[0])  cfg_set(outl,  sizeof(outl),  coutl);
+        if (cshad[0])  cfg_set(shad,  sizeof(shad),  cshad);
+        if (cnfilt[0]) cfg_set(nfilt, sizeof(nfilt), cnfilt);
+        if (cfbz[0])   cfg_set(fbz,   sizeof(fbz),   cfbz);
+        if (cupsc[0])  cfg_set(upsc,  sizeof(upsc),  cupsc);
+        if (cdist[0])  cfg_set(dist,  sizeof(dist),  cdist);
+        if (cclk[0])   cfg_set(clk,   sizeof(clk),   cclk);
+        if (cdet[0])   cfg_set(det,   sizeof(det),   cdet);
+        if (cgt[0])    cfg_set(gt,    sizeof(gt),    cgt);
+    }
 
     /* Start from the chosen profile (custom == balanced baseline), THEN let any
      * individual line that's actually present override just that one field. So
@@ -313,6 +573,9 @@ static void load_cfg(void) {
         if (vsync[0]) g_cfg.vsync          = parse_bool(vsync, g_cfg.vsync);
         if (outl[0])  g_cfg.outlines       = parse_bool(outl, g_cfg.outlines);
         if (shad[0])  g_cfg.shadows        = parse_bool(shad, g_cfg.shadows);
+        if (animef[0]) g_cfg.anim_engine_flags = parse_bool(animef, g_cfg.anim_engine_flags);
+        if (nfilt[0]) g_cfg.nearest_filter = parse_bool(nfilt, g_cfg.nearest_filter);
+        if (fbz[0])   g_cfg.fbfetch_zero   = parse_bool(fbz, g_cfg.fbfetch_zero);
         if (dist[0])  g_cfg.draw_distance  = atoi(dist);
         if (skin[0])  g_cfg.skinning_full  = parse_bool(skin, g_cfg.skinning_full);
         if (clk[0]) {
@@ -324,7 +587,8 @@ static void load_cfg(void) {
         if (det[0])   { int d = atoi(det);   if (d >= 100 && d <= 1000) g_cfg.detail = d; }
         if (rq[0])    { int q = atoi(rq);    if (q >= 0   && q <= 15)   g_cfg.render_quality = q; }
         if (gt[0])    { int t = atoi(gt);    if (t >= 0   && t <= 3)    g_cfg.gpu_tier = t; }
-        if (gpu_name[0]) cfg_set(g_cfg.gpu_name, sizeof(g_cfg.gpu_name), gpu_name);
+        if (gpu_name[0]) cfg_set(g_cfg.gpu_name, sizeof(g_cfg.gpu_name),
+                                 gpu_name_from_alias(gpu_name));
         if (sopt[0])  { int o = atoi(sopt); if (o >= 0   && o <= 4)    g_cfg.shader_opt = o; }
         if (mapb[0])  g_cfg.map_buffers = parse_bool(mapb, g_cfg.map_buffers);
         if (bflip[0]) g_cfg.blit_flip   = parse_bool(bflip, g_cfg.blit_flip);

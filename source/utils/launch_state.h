@@ -42,7 +42,9 @@ uint64_t launch_state_last_progress_age_ms(void);
 // vglSwapBuffers, so this reflects frames truly pushed to the display
 // (ground truth for "is the game rendering"), unlike the input poll above
 // which SDL ticks even while the screen stays black.
-void launch_state_mark_present(void);
+/* Call immediately after present with a timestamp already sampled by gl_swap.
+ * Reusing it avoids a second kernel-time query on every frame. */
+void launch_state_mark_present_at_us(uint64_t now_us);
 uint32_t launch_state_get_present_count(void);
 uint64_t launch_state_last_present_age_ms(void);
 
@@ -52,11 +54,18 @@ int launch_state_scene_active(void);
 /* Marks which (potentially blocking) GL call is in progress so a render-thread
  * freeze can be pinpointed from the watchdog snapshot.
  * 0=idle 1=vglSwapBuffers 2=glLinkProgram 3=glCompileShader */
+#ifdef DEBUG_SOLOADER
 void launch_state_mark_gl_phase(int phase);
 
 /* Records the in-flight draw (sets phase=3). If a GPU hang makes the draw block,
  * the watchdog snapshot shows which program/geometry/index-type stalled it. */
 void launch_state_mark_draw(unsigned mode, int count, unsigned type, int program);
+#else
+/* These feed only loader telemetry. Erase the call itself in production so hot GL
+ * wrappers do not pay an out-of-line no-op hundreds of times per frame. */
+#define launch_state_mark_gl_phase(...) ((void)0)
+#define launch_state_mark_draw(...)     ((void)0)
+#endif
 
 void launch_state_snapshot(char *out, size_t out_size);
 void launch_state_dump_history(char *out, size_t out_size);

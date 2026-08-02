@@ -16,6 +16,46 @@ project(so_loader C CXX)
 include("${VITASDK}/share/vita.cmake" REQUIRED)
 find_package(Python3 COMPONENTS Interpreter QUIET)
 
+# The Android engine modules and this loader use the softfp ABI. A second, regular
+# (hard-float) VitaSDK is commonly installed on development machines and used to be
+# silently accepted because the linker mismatch warning was suppressed below. That
+# produces a binary whose calls can disagree about where float arguments live.
+# Reject that toolchain before compiling and print the exact vitaGL archive identity
+# so release builds are attributable to a concrete dependency.
+set(MCSM_VITAGL_ARCHIVE "${VITASDK}/arm-vita-eabi/lib/libvitaGL.a")
+find_program(MCSM_READELF
+             NAMES arm-vita-eabi-readelf
+             HINTS "${VITASDK}/bin"
+             NO_DEFAULT_PATH)
+if (NOT EXISTS "${MCSM_VITAGL_ARCHIVE}")
+  message(FATAL_ERROR "vitaGL archive not found: ${MCSM_VITAGL_ARCHIVE}")
+endif()
+if (NOT MCSM_READELF)
+  message(FATAL_ERROR "arm-vita-eabi-readelf not found under ${VITASDK}/bin")
+endif()
+execute_process(COMMAND "${MCSM_READELF}" -A "${MCSM_VITAGL_ARCHIVE}"
+                RESULT_VARIABLE MCSM_VITAGL_ATTR_RC
+                OUTPUT_VARIABLE MCSM_VITAGL_ATTRIBUTES
+                ERROR_VARIABLE MCSM_VITAGL_ATTR_ERROR)
+if (NOT MCSM_VITAGL_ATTR_RC EQUAL 0)
+  message(FATAL_ERROR "Could not inspect vitaGL ABI: ${MCSM_VITAGL_ATTR_ERROR}")
+endif()
+if (MCSM_VITAGL_ATTRIBUTES MATCHES "Tag_ABI_VFP_args:[ \t]*VFP registers")
+  message(FATAL_ERROR
+          "Hard-float vitaGL detected at ${MCSM_VITAGL_ARCHIVE}. "
+          "MCSM requires the softfp VitaSDK; refusing an ABI-mixed build.")
+endif()
+file(SHA256 "${MCSM_VITAGL_ARCHIVE}" MCSM_VITAGL_SHA256)
+set(MCSM_KNOWN_GOOD_VITAGL_SHA256
+    "ea9110d0941eb961e09da90f4be034f0aafeaae83d8ace03b69a889fe0f5c913")
+if (MCSM_VITAGL_SHA256 STREQUAL MCSM_KNOWN_GOOD_VITAGL_SHA256)
+  message(STATUS "vitaGL: known-good rollback (${MCSM_VITAGL_SHA256})")
+else()
+  message(WARNING
+          "vitaGL differs from the device-tested rollback: ${MCSM_VITAGL_SHA256}. "
+          "Rendering/orientation/alpha must be hardware-validated before release.")
+endif()
+
 find_program(NETCAT_EXE
              NAMES nc ncat
              HINTS
@@ -28,8 +68,8 @@ endif()
 # Vita application configuration
 set(VITA_APP_NAME "Minecraft: Story Mode")
 set(VITA_TITLEID "MCSM00001")
-set(VITA_VPKNAME "mcsm_diag")
-set(VITA_VERSION "01.02")
+set(VITA_VPKNAME "MCSM-1.10")
+set(VITA_VERSION "01.10")
 set(VITA_MKSFOEX_FLAGS "-d ATTRIBUTE2=12")
 
 # ☠ THE NP COMMUNICATION ID HAS EXACTLY ONE DEFINITION, AND THIS IS IT.
@@ -43,12 +83,48 @@ set(VITA_MKSFOEX_FLAGS "-d ATTRIBUTE2=12")
 # are now both derived from this variable; (3) is a data file, so tools/trophies.def
 # still states it and must be kept in step by hand when rebuilding the pack.
 #
-# MCSM00002, not MCSM00001: the original id's registration was poisoned on the test
-# console (the set stayed registered after its conf/data folders were deleted, which
-# is unrepairable in place because TRPUSER.DAT is PFS-sealed). Registering under an id
-# the system had never seen was the fix. Do not go back to MCSM00001 -- any console
-# that ever saw the old build still holds the poisoned state for it.
-set(MCSM_NP_COMM_ID "MCSM00002")
+# BACK TO MCSM00001 (2026-07-31). This was MCSM00002 for a while because MCSM00001's
+# registration had been poisoned on the test console -- deleting a set's conf/data
+# folders leaves its row in the trophy database behind, and the half-state that
+# produces is not repairable in place (TRPUSER.DAT is PFS-sealed). Moving to an id the
+# system had never seen was the workaround, and it cost a permanent ghost entry in the
+# trophy list for every id abandoned that way.
+#
+# Burning a fresh id per accident is not the answer -- each one abandons a permanent
+# ghost entry in the trophy list and fixes nothing. Clear the old registration instead
+# and keep the id. What is known, all observed on device 2026-07-31:
+#   - Deleting a set's three folders ALONE leaves its title row in trophy_local.db
+#     with no trophy rows, and the game then boots to NP-10229-4 "data corrupted".
+#   - Trophy Manager (ONElua) deletes the folders AND trophy_local.db, and the system
+#     rebuilds that database from the folders that remain. That does fully remove the
+#     set -- verified: no MCSM rows left anywhere, retail sets intact.
+#
+# ☠ BUT THAT IS NOT SUFFICIENT, AND THIS IS UNRESOLVED. After a complete clean-up
+# (no MCSM trophy folders, no MCSM rows in trophy_local.db, no MCSM reference left in
+# ur0:shell/db/app.db, app correctly registered with 29 tbl_appinfo rows), a build
+# carrying sce_sys/trophy STILL fails to launch with NP-6182-7 "could not prepare the
+# application to start", while the byte-identical build without the trophy folder
+# launches and runs fine. The TRP itself was verified sound (v2, correct header SHA-1,
+# valid SFM XML, right npcommid). So the remaining fault is system-side state on that
+# one console that has not been found yet -- trophies are reported working on other
+# consoles with the same VPK. Do not read the id choice below as "the trophy problem
+# is solved"; it is not.
+#
+# If this ever needs to move again, all three places must move together, and
+# tools/trophies.def is the one that will not follow automatically.
+# ★ TEST BUILDS USE MCSM00003, SHIPPING BUILDS USE MCSM00001 (rule set 2026-07-31).
+# Anything that reaches a tester must be MCSM00001 -- that is the id their console will
+# carry forever, so it has to be the real one. Local experiments use MCSM00003 instead,
+# so a poisoned or half-registered set on the dev console can never contaminate the id
+# players get. MCSM00002 is burned (an abandoned experiment already ghosted on the dev
+# console); do not reuse it.
+#
+# Override per build, do not edit this line:
+#     cmake -B build_test -DMCSM_NP_COMM_ID=MCSM00003 ...
+# The pack's INTERNAL id must match, so a matching TROPHY.TRP has to be supplied for
+# whichever id is selected -- `python tools/trp_tool.py setcommid <trp> <old> <new>`
+# rewrites an existing pack in place (same-length ids, digest recomputed).
+set(MCSM_NP_COMM_ID "MCSM00001" CACHE STRING "NP communication id (MCSM00001 = ship, MCSM00003 = test)")
 
 # Optional: used for "send" and "dump" targets
 set(PSVITAIP "192.168.0.198" CACHE STRING "PSVita IP (for FTP access)")
@@ -83,11 +159,15 @@ add_definitions(
 )
 
 option(USE_SCELIBC_IO "Use SceLibcBridge for IO and some other std functions" OFF)
+set(MCSM_FIOS_SOURCE "")
+set(MCSM_FIOS_STUB "")
 if (USE_SCELIBC_IO)
   add_definitions(-DUSE_SCELIBC_IO)
+  set(MCSM_FIOS_SOURCE lib/fios/fios.c)
+  set(MCSM_FIOS_STUB SceFios2_stub)
 endif()
 
-option(ENABLE_TELEMETRY_LOGGING "Enable verbose runtime telemetry in ux0:data/mcsm/loader.log" ON)
+option(ENABLE_TELEMETRY_LOGGING "Enable verbose runtime telemetry in ux0:data/mcsm/loader.log" OFF)
 if (ENABLE_TELEMETRY_LOGGING)
   add_definitions(-DDEBUG_SOLOADER -DFALSOJNI_DEBUGLEVEL=2)
 endif()
@@ -128,8 +208,8 @@ add_definitions(-D_GNU_SOURCE -D__POSIX_VISIBLE=999999)
 # NEON codegen (2026-07-17): the Vita CPU is a Cortex-A9 w/ NEON. -mfpu=neon +
 # -mcpu/-mtune=cortex-a9 lets GCC (already -O3 -ffast-math) vectorize the hot
 # per-load loops (box-filter downsample, 565/4444/BGRA converters, memcpy). The
-# float ABI stays softfp so the boundary with VitaSDK stubs is unchanged (no new
-# mismatch beyond the ones -Wl,--no-warn-mismatch already covers).
+# float ABI stays softfp so the boundary with VitaSDK stubs is unchanged. The
+# archive check above now rejects a hard-float vitaGL instead of hiding a mismatch.
 # WARNINGS ARE ON (2026-07-30). This project pokes engine structs at raw byte
 # offsets, hand-builds ARM trampolines and passes floats through function pointers
 # whose prototypes it has to get exactly right -- compiler diagnostics are the
@@ -150,19 +230,22 @@ add_definitions(-D_GNU_SOURCE -D__POSIX_VISIBLE=999999)
 # would hide a genuine truncation anywhere in the ~30 other files that format into
 # fixed buffers -- several of which build device-log paths. Scoped to that file.)
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wl,-q -mfloat-abi=softfp -mcpu=cortex-a9 -mtune=cortex-a9 -mfpu=neon -std=gnu11 -Wall -Wextra -Wno-unused-parameter -Wno-sign-compare -Wno-unknown-pragmas -Wno-deprecated -fno-unwind-tables -fno-asynchronous-unwind-tables")
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wl,-q -mfloat-abi=softfp -mcpu=cortex-a9 -mtune=cortex-a9 -mfpu=neon -std=gnu++20 -Wno-write-strings -Wno-psabi -fno-exceptions -fno-rtti -fno-unwind-tables -fno-asynchronous-unwind-tables")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wl,-q -mfloat-abi=softfp -mcpu=cortex-a9 -mtune=cortex-a9 -mfpu=neon -std=gnu++20 -Wall -Wextra -Wno-unused-parameter -Wno-sign-compare -Wno-unknown-pragmas -Wno-deprecated -Wno-write-strings -Wno-psabi -fno-exceptions -fno-rtti -fno-unwind-tables -fno-asynchronous-unwind-tables")
 
 if (CMAKE_BUILD_TYPE STREQUAL "Debug")
     set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O1 -g3")
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O1 -g3")
 else ()
-    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O3 -g0 -ffast-math")
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -g0 -ffast-math")
+    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O3 -g0 -ffast-math -DNDEBUG -ffunction-sections -fdata-sections")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -g0 -ffast-math -DNDEBUG -ffunction-sections -fdata-sections")
 endif()
 
-# Some shipped Vita stubs are assembled without VFP ABI attributes; suppress linker
-# ABI mismatch diagnostics so hard-float third-party libs can still link.
-set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,--no-warn-mismatch")
+# Dead loader/FIOS compatibility paths account for hundreds of KiB of BSS when
+# USE_SCELIBC_IO is off. Per-function/data sections let the linker discard them.
+# Keep ABI mismatch diagnostics enabled: suppressing them hid a hard-float vitaGL.
+if (NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
+  set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,--gc-sections")
+endif()
 
 add_executable(${CMAKE_PROJECT_NAME}
                source/main.c
@@ -196,9 +279,9 @@ add_executable(${CMAKE_PROJECT_NAME}
                lib/falso_jni/FalsoJNI_ImplBridge.c
                lib/falso_jni/FalsoJNI_Logger.c
                lib/falso_jni/converter.c
-               lib/sha1/sha1.c
-               lib/fios/fios.c
-               lib/so_util/so_util.c)
+                lib/sha1/sha1.c
+                ${MCSM_FIOS_SOURCE}
+                lib/so_util/so_util.c)
 
 target_sources(${CMAKE_PROJECT_NAME} PRIVATE
                source/reimpl/egl.c)
@@ -268,9 +351,9 @@ target_link_libraries(${CMAKE_PROJECT_NAME}
                       SceCommonDialog_stub
                       # Vita trophies. VitaSDK ships this stub but NO header, so the
                       # API is declared by hand in source/utils/trophies.c.
-                      SceNpTrophy_stub
-                      SceFios2_stub
-                      taihen_stub
+                       SceNpTrophy_stub
+                       ${MCSM_FIOS_STUB}
+                       taihen_stub
                       ${LIBC_BRIDGE_STUB}
                       )
 
@@ -306,9 +389,20 @@ set(MCSM_TROPHY_FILE "")
 if (EXISTS "${CMAKE_SOURCE_DIR}/extras/trophy/TROPHY.TRP")
   set(MCSM_TROPHY_FILE FILE ${CMAKE_SOURCE_DIR}/extras/trophy/TROPHY.TRP
                             sce_sys/trophy/${MCSM_NP_COMM_ID}_00/TROPHY.TRP)
+  target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE MCSM_HAVE_TROPHY_PACK=1)
 else()
-  message(STATUS "No extras/trophy/TROPHY.TRP -- building without trophy support. "
-                 "See tools/make_trophy_pack.py.")
+  # ☠ The runtime MUST be told, not left to discover it. sceNpTrophyCreateContext
+  # SUCCEEDS even when no pack is present, so without this flag the loader concludes
+  # "not registered yet" and runs sceNpTrophySetupDialogInit -- the SYSTEM trophy
+  # setup dialog -- which then cannot complete, spins the full 3600-frame guard and
+  # puts an NP error dialog on screen on EVERY boot. Device-observed 2026-07-31:
+  #   TROPHY: set not registered yet (rc=0x80551612 count=0) -- running setup once
+  #   TROPHY: setup dialog did not finish in 3600 frames -- continuing anyway
+  # Deleting the pack from the VPK is therefore NOT sufficient to disable trophies;
+  # the code path has to be switched off at the same time, from the same fact.
+  target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE MCSM_HAVE_TROPHY_PACK=0)
+  message(STATUS "No extras/trophy/TROPHY.TRP -- building with trophies DISABLED "
+                 "(no context, no setup dialog). See tools/make_trophy_pack.py.")
 endif()
 
 vita_create_vpk(${VITA_VPKNAME}.vpk ${VITA_TITLEID} eboot.bin

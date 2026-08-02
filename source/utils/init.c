@@ -652,7 +652,12 @@ void soloader_init_all() {
     /* telemetry_stamp, NOT telemetry_log: the stamp has to survive
      * ENABLE_TELEMETRY_LOGGING=OFF, or a production/test build is unidentifiable
      * from its own log -- which is precisely how a stale eboot gets measured. */
-    telemetry_stamp("[BOOT] BUILD=2026-07-31-r109-RELEASE");
+    /* Hand-maintained, and it HAS gone stale: an r110 device log still announced
+     * itself as r109, which is actively misleading when the whole point of pulling a
+     * log is to confirm which build ran. `[BOOT] build:` right below carries the
+     * compiler's own __DATE__/__TIME__ and cannot drift -- cross-check against that
+     * whenever this line matters. Bump this string with every build worth naming. */
+    telemetry_stamp("[BOOT] BUILD=2026-08-02-r147-PUBLIC-SOURCE");
     /* What changed, in the order it matters:
      * 1. NO BOOT PICTURE, AND NO OVERLAY. r100 held pic0 until the engine drew its
      *    first frame; on device that made the (legitimately multi-minute) asset load

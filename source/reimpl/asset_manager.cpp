@@ -50,9 +50,25 @@ static FILE *asset_fopen_with_retry(const char *path) {
     }
 
     int first_errno = errno;
+    /* Missing optional assets are normal: the caller immediately probes the
+     * fallback path. Trimming the VFD cache on every ENOENT destroyed up to forty
+     * hot archive descriptors and repeated the same guaranteed-to-fail open.
+     * Recovery is useful only when the descriptor table is actually exhausted. */
+    if (first_errno != EMFILE && first_errno != ENFILE) {
+#ifdef DEBUG_SOLOADER
+        static unsigned int s_fail_log = 0;
+        if (s_fail_log++ < 24u) {
+            l_warn("AAssetManager_open failed: %s errno=%d", path, first_errno);
+        }
+#endif
+        errno = first_errno;
+        return nullptr;
+    }
+
     asset_vfd_trim_cached_fds(8u);
     f = asset_fopen(path);
 
+#ifdef DEBUG_SOLOADER
     static unsigned int s_fail_log = 0;
     if (f) {
         if (s_fail_log++ < 24u) {
@@ -61,6 +77,7 @@ static FILE *asset_fopen_with_retry(const char *path) {
     } else if (s_fail_log++ < 24u) {
         l_warn("AAssetManager_open failed: %s errno=%d", path, first_errno);
     }
+#endif
     return f;
 }
 
@@ -167,7 +184,7 @@ void AAsset_close(AAsset* asset) {
 }
 
 int AAsset_read(AAsset* asset, void* buf, size_t count) {
-    l_debug("AAsset_read<%p>(%p, %p, %i)", __builtin_return_address(0), asset, buf, count);
+    l_debug("AAsset_read<%p>(%p, %p, %zu)", __builtin_return_address(0), asset, buf, count);
     if (!asset) return -1;
     aAsset * a = (aAsset *) asset;
     if (!a->opened) return -1;
@@ -187,7 +204,7 @@ int AAsset_read(AAsset* asset, void* buf, size_t count) {
 }
 
 off_t AAsset_seek(AAsset* asset, off_t offset, int whence) {
-    l_debug("AAsset_seek(%p, %d, %i)", asset, offset, whence);
+    l_debug("AAsset_seek(%p, %lld, %i)", asset, (long long)offset, whence);
     if (!asset) return (off_t)-1;
     aAsset * a = (aAsset *) asset;
     if (!a->opened) return -1;
@@ -287,7 +304,9 @@ int AAsset_openFileDescriptor(AAsset* asset, off_t* outStart, off_t* outLength) 
 }
 
 const void * AAsset_getBuffer(AAsset* asset) {
+#ifdef DEBUG_SOLOADER
     static unsigned log_count = 0;
+#endif
     if (!asset) { l_warn("AAsset_getBuffer: asset is null"); return NULL; }
 
     aAsset * a = (aAsset *) asset;
@@ -304,7 +323,9 @@ const void * AAsset_getBuffer(AAsset* asset) {
     if (!a->opened || !a->f) { l_error("AAsset_getBuffer: asset not open and no filename to re-open"); return NULL; }
 
     if (a->fileSize == 0) {
+#ifdef DEBUG_SOLOADER
         if (log_count < 4U) { l_warn("AAsset_getBuffer: asset %s has 0 size", a->filename ? a->filename : "(null)"); log_count++; }
+#endif
         return NULL;
     }
 
@@ -325,6 +346,8 @@ const void * AAsset_getBuffer(AAsset* asset) {
     a->bufferSize = a->fileSize;
     a->bytesRead = a->fileSize;
 
+#ifdef DEBUG_SOLOADER
     if (log_count < 8U) { l_info("AAsset_getBuffer: %s -> %p (%zu bytes)", a->filename ? a->filename : "(null)", buf, a->fileSize); log_count++; }
+#endif
     return buf;
 }

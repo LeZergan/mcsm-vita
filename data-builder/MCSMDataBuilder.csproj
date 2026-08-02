@@ -1,0 +1,31 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AssemblyName>MCSM-Vita-Data-Builder</AssemblyName>
+    <RootNamespace>McsmVitaDataBuilder</RootNamespace>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
+    <DebugType>embedded</DebugType>
+    <DebugSymbols>false</DebugSymbols>
+    <Version>1.6.0</Version>
+    <ApplicationIcon Condition="Exists('LocalAssets\app-icon.ico')">LocalAssets\app-icon.ico</ApplicationIcon>
+    <Authors>MCSM Vita contributors</Authors>
+    <Description>Builds a ready-to-copy MCSM PS Vita data folder from user-owned Android files.</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="MCSMDataBuilder.SmokeTests" />
+    <EmbeddedResource Include="Defaults\*.txt" />
+    <EmbeddedResource Include="LocalAssets\button-fix.zip" Condition="Exists('LocalAssets\button-fix.zip')">
+      <LogicalName>McsmVitaDataBuilder.LocalAssets.button-fix.zip</LogicalName>
+    </EmbeddedResource>
+    <EmbeddedResource Include="LocalAssets\choice.prop" Condition="Exists('LocalAssets\choice.prop')">
+      <LogicalName>McsmVitaDataBuilder.LocalAssets.choice.prop</LogicalName>
+    </EmbeddedResource>
+    <Compile Remove="tests\**\*.cs" />
+  </ItemGroup>
+</Project>

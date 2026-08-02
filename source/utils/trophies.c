@@ -24,6 +24,7 @@
 #include <psp2/sysmodule.h>
 #include <psp2/common_dialog.h>
 #include <stdio.h>
+#include <errno.h>
 #include <string.h>
 #include <stdlib.h>
 
@@ -72,9 +73,16 @@ int  sceNpTrophySetupDialogTerm(void);
  *
  * Overridable at runtime from ux0:data/mcsm/settings/trophy_commid.txt so a
  * differently-built pack can be used without a rebuild. */
+/* Set by CMake from whether extras/trophy/TROPHY.TRP was packaged. Defaults to 1 so
+ * an out-of-tree build that never defines it keeps the old behaviour. */
+#ifndef MCSM_HAVE_TROPHY_PACK
+#define MCSM_HAVE_TROPHY_PACK 1
+#endif
+
 #ifndef MCSM_NP_COMM_ID
 #error "MCSM_NP_COMM_ID must be defined by the build (see CMakeLists.txt)"
 #endif
+#if MCSM_HAVE_TROPHY_PACK
 static char g_comm_id[16] = MCSM_NP_COMM_ID;
 
 /* A DUMMY signature. Real titles carry a Sony-issued 160-byte NP communication
@@ -83,7 +91,25 @@ static char g_comm_id[16] = MCSM_NP_COMM_ID;
  * before the (now unverified) remainder. */
 static char g_comm_sig[160] = { (char)0xb9, (char)0xdd, (char)0xe1, (char)0x3b, 0x01, 0x00 };
 
+/* The sceNpTrophy context handle. Guarded with the two above because every use of
+ * it -- create, unlock-state probe, setup dialog, worker unlock -- lives in the
+ * pack-present path; a no-trophy build never opens a context at all. */
 static int g_ctx = 0;
+#endif /* MCSM_HAVE_TROPHY_PACK */
+
+/* First-boot trophy setup, driven from gl_swap instead of blocking the boot.
+ * g_setup_pending is read every present, so it is written last on completion.
+ * Guarded: a no-trophy build never opens a dialog, so these would be unused. */
+#if MCSM_HAVE_TROPHY_PACK
+static int  g_setup_pending = 0;
+static char g_setup_marker[128];
+static void remember_marker_path(const char *m) {
+    size_t n = 0;
+    while (n + 1 < sizeof(g_setup_marker) && m[n]) { g_setup_marker[n] = m[n]; n++; }
+    g_setup_marker[n] = 0;
+}
+#endif
+
 static int g_available = 0;
 static McsmTrophyUnlockState g_unlocked;
 
@@ -102,6 +128,7 @@ static int g_map_loaded = 0;
 
 /* ---- worker ------------------------------------------------------------------- */
 
+#if MCSM_HAVE_TROPHY_PACK
 static int trophy_worker(SceSize args, void *argp) {
     (void)args; (void)argp;
     for (;;) {
@@ -123,6 +150,9 @@ static int trophy_worker(SceSize args, void *argp) {
     }
     return 0;
 }
+#endif /* MCSM_HAVE_TROPHY_PACK -- the worker is only ever started by the
+        * pack-present init path, so it would be an unused-function warning
+        * in a no-trophy build. */
 
 /* ---- name -> id map ----------------------------------------------------------- */
 
@@ -168,14 +198,99 @@ static void trophy_map_load(void) {
 
 int mcsm_trophies_available(void) { return g_available; }
 
+/* Called from gl_swap every present. Returns 1 while the first-boot setup dialog is
+ * up, so the presenter knows to composite it (has_commondialog) -- the same contract
+ * the IME uses. Finishes the registration the moment the system reports it done:
+ * writes the once-only marker and re-reads the unlock bitmap so trophies earned in
+ * past sessions do not all re-notify. */
+/* Side-effect free: the presenter asks this once per frame purely to decide the
+ * has_commondialog flag. Kept separate from the poll so asking cannot advance state. */
+int mcsm_trophies_setup_active(void) {
+#if !MCSM_HAVE_TROPHY_PACK
+    return 0;
+#else
+    return g_setup_pending;
+#endif
+}
+
+int mcsm_trophies_setup_poll(void) {
+#if !MCSM_HAVE_TROPHY_PACK
+    return 0;
+#else
+    if (!g_setup_pending) return 0;
+    const SceCommonDialogStatus st = sceNpTrophySetupDialogGetStatus();
+    if (st == SCE_COMMON_DIALOG_STATUS_RUNNING) return 1;
+
+    sceNpTrophySetupDialogTerm();
+    g_setup_pending = 0;
+
+    FILE *mf = g_setup_marker[0] ? fopen(g_setup_marker, "wb") : NULL;
+    if (mf) {
+        fputs("trophy setup dialog completed for this comm id\n", mf);
+        fclose(mf);
+        l_info("TROPHY: setup finished — set registered (record: %s). Later boots skip "
+               "this on their own, because the system then reports it present.",
+               g_setup_marker);
+    } else {
+        l_warn("TROPHY: setup finished but could not write %s (errno=%d) — the dialog "
+               "will appear again next boot", g_setup_marker, errno);
+    }
+
+    /* Registration is what fills the unlock bitmap in. */
+    { int h = 0; uint32_t cnt = 0;
+      sceClibMemset(&g_unlocked, 0, sizeof(g_unlocked));
+      if (sceNpTrophyCreateHandle(&h) >= 0) {
+          sceNpTrophyGetTrophyUnlockState(g_ctx, h, &g_unlocked, &cnt);
+          sceNpTrophyDestroyHandle(h);
+      }
+      l_info("TROPHY: registered — %u trophies now known to the system", cnt); }
+    return 0;
+#endif
+}
+
+
 int mcsm_trophies_init(void) {
-    /* An override lets a pack built with a different comm id be used as-is. */
+#if !MCSM_HAVE_TROPHY_PACK
+    /* ☠ NO PACK WAS SHIPPED -- DO NOTHING AT ALL. Not "try and fail gracefully":
+     * sceNpTrophyCreateContext SUCCEEDS with no pack behind it, so the unlock-state
+     * probe below reports 0 trophies, the code concludes the set is unregistered and
+     * runs the SYSTEM SETUP DIALOG, which cannot complete without a pack. It then
+     * burns the entire 3600-frame guard and leaves an NP error dialog on screen --
+     * on every single boot. Observed on device 2026-07-31 with the pack removed from
+     * an installed app:
+     *     TROPHY: set not registered yet (rc=0x80551612 count=0) -- running setup once
+     *     TROPHY: setup dialog did not finish in 3600 frames -- continuing anyway
+     * Bailing here is what actually makes a no-trophy build quiet. */
+    l_info("TROPHY: no trophy pack in this build — trophy support compiled out "
+           "(no context, no setup dialog).");
+    g_available = 0;
+    return 0;
+#else
+    /* An override lets a pack built with a different comm id be used as-is.
+     *
+     * ☠ IT MUST ANNOUNCE ITSELF. This applied silently, and a stale
+     * ux0:data/mcsm/settings/trophy_commid.txt holding "MCSM00002" survived on the
+     * test console long after the build moved to MCSM00001 -- so every launch
+     * shipped a pack at sce_sys/trophy/MCSM00001_00/ and then asked the system for
+     * MCSM00002, which cannot ever match. That is the same packaged-vs-requested
+     * drift CMakeLists.txt was written to prevent, reintroduced at RUNTIME by a
+     * leftover file, and it was invisible precisely because nothing logged it.
+     * A one-time override is a debugging tool; a permanent undetectable one is a
+     * trap. If this line appears in a log and you did not put the file there,
+     * DELETE THE FILE -- the compiled-in id is the correct one. */
     { FILE *f = mcsm_open_setting("trophy_commid.txt", "r");
       if (f) { char b[16] = {0};
                if (fgets(b, sizeof(b), f)) {
                    size_t n = strcspn(b, "\r\n"); b[n] = 0;
-                   if (b[0]) { strncpy(g_comm_id, b, sizeof(g_comm_id) - 1);
-                               g_comm_id[sizeof(g_comm_id) - 1] = 0; } }
+                   if (b[0] && strcmp(b, g_comm_id) != 0) {
+                       l_warn("TROPHY: ☠ comm id OVERRIDDEN by settings/trophy_commid.txt: "
+                              "compiled-in '%s' -> '%s'. The packaged pack is "
+                              "sce_sys/trophy/%s_00/TROPHY.TRP, so unless that matches the "
+                              "override there will be NO trophies. Delete the file to use "
+                              "the build's own id.", g_comm_id, b, g_comm_id);
+                       strncpy(g_comm_id, b, sizeof(g_comm_id) - 1);
+                       g_comm_id[sizeof(g_comm_id) - 1] = 0;
+                   } }
                fclose(f); } }
 
     if (sceSysmoduleLoadModule(SCE_SYSMODULE_NP_TROPHY) < 0) {
@@ -222,39 +337,86 @@ int mcsm_trophies_init(void) {
           sceNpTrophyDestroyHandle(h);
           registered = (urc >= 0 && trophy_count > 0);
           if (!registered)
-              l_info("TROPHY: set not registered yet (rc=0x%08X count=%u) — running setup once",
+              l_info("TROPHY: unlock-state probe says not present (rc=0x%08X count=%u)",
                      (unsigned)urc, trophy_count);
       } }
 
+    /* ★★ THE SYSTEM IS THE SOURCE OF TRUTH, CHECKED EVERY BOOT (2026-08-01).
+     *
+     * There WAS a marker file here that recorded "setup already completed once" and
+     * suppressed the dialog on later boots. It was wrong: the marker lives in
+     * ux0:data/mcsm/ and knows nothing about the trophy store, so after the trophies
+     * were deleted from the system the marker still said "done" and registration never
+     * happened again. Reported from device: deleted the trophies, second boot did not
+     * re-initialise them.
+     *
+     * The marker only existed because setup used to BLOCK the boot for up to 3600
+     * presents, which made re-running it every boot genuinely expensive. Setup is now
+     * non-blocking (it is pumped from gl_swap), so the honest thing is also the cheap
+     * thing: ask the system every boot, and register whenever it says the set is not
+     * there. Present -> nothing happens. Absent for any reason, including the player
+     * deleting it -> it comes back.
+     *
+     * The marker is still WRITTEN on completion, purely as a timestamped record for
+     * the log. Nothing reads it to make a decision. */
+    /* ★★★ THE PROBE IS NOT TRUSTWORTHY -- ASK THE FILESYSTEM (2026-08-01).
+     *
+     * sceNpTrophyGetTrophyUnlockState returns 0x80551612 on this system even when the
+     * set is fully registered: device-verified with 51 rows in trophy_local.db and all
+     * three trophy folders present. So it can NEVER answer "present", and registration
+     * was being requested on every single boot. (Harmless -- the system just no-ops --
+     * but it is the "trophies re-initialise every reboot" complaint, and it is why the
+     * marker file got invented to paper over it.)
+     *
+     * Registration creates ur0:user/00/trophy/conf/<COMMID>_00 and deleting the
+     * trophies removes it. That directory IS the state we are asking about, so testing
+     * it directly is both more truthful than the API and correct in the case the marker
+     * got wrong: delete the trophies and the folder is gone, so the next boot registers
+     * again. Present -> skip. Absent -> register. Nothing cached, nothing to go stale.
+     *
+     * The API probe is still run first and still believed when it says YES -- it also
+     * fills the unlock bitmap, which the folder check cannot. This only adds a second
+     * way to say "already there". */
+    char trophy_dir[160];
+    sceClibSnprintf(trophy_dir, sizeof(trophy_dir),
+                    "ur0:user/00/trophy/conf/%s_00", g_comm_id);
+    if (!registered && is_dir(trophy_dir)) {
+        registered = 1;
+        l_info("TROPHY: set already installed (%s exists) — skipping setup", trophy_dir);
+    }
+
+    char marker[128];
+    sceClibSnprintf(marker, sizeof(marker), DATA_PATH "trophy_registered_%s.txt", g_comm_id);
+
     if (!registered) {
-        /* One-time system setup dialog. It is a common dialog, so it only advances
-         * while something presents frames -- hence this must run on the GL thread. */
+        /* ★★ START THE DIALOG, DO NOT SIT ON IT (2026-08-01).
+         *
+         * This used to spin here until the dialog finished -- up to 3600 presents,
+         * which at a 30fps cap is TWO MINUTES of a blocked GL thread, in the middle of
+         * the ~30s asset load, on the one boot a new player ever has. A common dialog
+         * only advances while frames are presented, and that was the excuse for pumping
+         * it inline; but gl_swap already pumps a common dialog every frame for the IME,
+         * so the correct place is there. Kick it off and return: the game keeps loading,
+         * the dialog composites over it, and mcsm_trophies_setup_poll() finishes the job
+         * when the system says it is done. No stall, and no arbitrary frame budget that
+         * can expire mid-registration. */
         McsmTrophySetupParam setup;
         sceClibMemset(&setup, 0, sizeof(setup));
         _sceCommonDialogSetMagicNumber(&setup.commonParam);
         setup.sdkVersion = PSP2_SDK_VERSION;
         setup.options = 0;
         setup.context = g_ctx;
-        if (sceNpTrophySetupDialogInit(&setup) >= 0) {
-            SceCommonDialogStatus st = SCE_COMMON_DIALOG_STATUS_RUNNING;
-            /* Bounded: if the dialog never reports FINISHED we must not hang the boot. */
-            for (int guard = 0; guard < 3600 && st == SCE_COMMON_DIALOG_STATUS_RUNNING; guard++) {
-                st = sceNpTrophySetupDialogGetStatus();
-                vglSwapBuffers(1 /* has_commondialog: let vitaGL composite the dialog */);
-            }
-            if (st == SCE_COMMON_DIALOG_STATUS_RUNNING)
-                l_warn("TROPHY: setup dialog did not finish in 3600 frames — continuing anyway");
-            sceNpTrophySetupDialogTerm();
+        const int drc = sceNpTrophySetupDialogInit(&setup);
+        if (drc >= 0) {
+            remember_marker_path(marker);
+            g_setup_pending = 1;
+            l_info("TROPHY: first boot — setup dialog opened, running alongside the load");
+        } else {
+            l_warn("TROPHY: setup dialog would not open (rc=0x%08X) — trophies will be "
+                   "unavailable this session; next boot retries", (unsigned)drc);
         }
-        /* Re-read: registration is what fills this in, and the bitmap must reflect
-         * trophies earned in past sessions or they would all re-notify. */
-        { int h = 0;
-          sceClibMemset(&g_unlocked, 0, sizeof(g_unlocked));
-          if (sceNpTrophyCreateHandle(&h) >= 0) {
-              sceNpTrophyGetTrophyUnlockState(g_ctx, h, &g_unlocked, &trophy_count);
-              sceNpTrophyDestroyHandle(h);
-          } }
     }
+
     l_info("TROPHY: context ready (commId=%s, %u trophies in pack, %s)",
            g_comm_id, trophy_count,
            registered ? "already registered" : "registered this launch");
@@ -295,6 +457,7 @@ int mcsm_trophies_init(void) {
           mcsm_trophies_unlock((uint32_t)t);
       } }
     return 0;
+#endif /* MCSM_HAVE_TROPHY_PACK */
 }
 
 int mcsm_trophies_already_unlocked(uint32_t id) {

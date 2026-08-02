@@ -2,7 +2,16 @@
 
 Runs the Android build of *Minecraft: Story Mode* on the PS Vita. Loader code only — **no game code or assets**; bring your own legally-owned copy. Built on [soloader-boilerplate](https://github.com/v-atamanenko/soloader-boilerplate), rendered with [vitaGL](https://github.com/Rinnegatamante/vitaGL).
 
-> **WIP.**
+> **Public testing release.** Expect rough edges and keep backups of your saves.
+
+## Download
+
+The [latest GitHub release](../../releases/latest) contains both files needed for setup:
+
+- **`MCSM-1.10.vpk`** — install with VitaShell.
+- **`MCSM-Vita-Data-Builder-v1.6.exe`** — creates the required `ux0:data/mcsm` folder from your legally owned Android files.
+
+The release does not contain the Android game, APK, OBBs, episodes, or other retail data.
 
 ## Videos
 
@@ -17,35 +26,55 @@ Development progress, oldest to newest:
 
 ## Legal
 
-No *Minecraft: Story Mode* code or assets are included or linked — supply your own `.apk` + `.obb`. Unofficial fan project, not affiliated with Mojang, Microsoft, Telltale/LCG, Skybound, or Netflix. Trademarks belong to their owners.
+No *Minecraft: Story Mode* code or assets are included or linked — supply your own `.apk`, main `.obb`, and patch `.obb`. Unofficial fan project, not affiliated with Mojang, Microsoft, Telltale/LCG, Skybound, or Netflix. Trademarks belong to their owners.
 
 ## Requirements
 
 - Homebrew-enabled Vita / PS TV (HENkaku ensō, 3.60 / 3.65) with **VitaShell**.
 - `kubridge.skprx` and `fd_fix.skprx` in `ur0:tai/` (both listed under `*KERNEL` in `config.txt`), and `libshacccg.suprx` in `ur0:data/`. `fd_fix.skprx` raises the open-file limit the loader needs to stream the game archives — without it, archive reads thrash on `EMFILE`. (Don't use it alongside the rePatch plugin.)
-- Your own legally-owned game: the `com.telltalegames.minecraft100` APK + its OBB. Target **v1.37** (`40137`).
+- Your own legally-owned game: the `com.telltalegames.minecraft100` APK plus its matching main and patch OBBs. The supported set is **PowerVR v1.37** (`40137`).
 
-## Data folder
+## Easy data setup
 
-> ⚠️ **Setup guide coming soon.** You supply your own game data (APK + OBB); none ships in this repo.
+The Windows [MCSM Vita Data Builder](data-builder/README.md) turns user-owned Android files into the exact ready-to-copy Vita folder. It does not download or contain game data.
 
-## Known issues
+1. Open `MCSM-Vita-Data-Builder.exe`.
+2. Press **Scan folder** and choose the folder containing your Android files. The builder finds the exact PowerVR v1.37 APK, both matching base OBBs, and recognizable Episodes 2–8 automatically. You can still browse for each file manually.
+3. Keep **Balanced — recommended**, choose another preset, press **View profiles** for a quick comparison, or press **Make custom** for an Easy/Advanced profile editor.
+4. Optionally add Episode 2–8 folders, chapter OBBs, ZIPs, or full nested chapter bundles.
+5. Press **Build Data Folder**, then copy the resulting `mcsm` folder to `ux0:data/` with VitaShell.
 
-- Stutters and fluctuating frame rate.
-- Your choices don't display in the menu.
-- Can't change the save file title.
+The final required path is `ux0:data/mcsm/assets`. The compact builder keeps version, renderer, OBB, bundled-fix, profile, and readiness information visible without exposing unnecessary setup controls. It reads `AndroidManifest.xml`, verifies the exact known PowerVR fingerprint, and accepts only the supported v1.37 APK (`versionCode 40137`); renaming an older or Mali/Adreno APK does not bypass the check. Both fingerprint-matched PowerVR OBBs are required. Extra chapter `.ttarch2` and descriptor `.lua` files are detected, validated, and put in the correct shared assets folder.
+
+To build the self-contained Windows EXE from source:
+
+```powershell
+.\data-builder\build.ps1
+```
+
+The app also creates `settings/graphics.txt` and `settings/game.txt`. **Balanced** is the recommended starting profile. The profile guide shows every preset's resolution, FPS cap, reported PowerVR GPU, detail, distance, and main tradeoff. The built-in Custom Profile maker exposes six simple Easy choices or exact Advanced resolution, FPS, PowerVR GPU name, effects, detail, distance, clock, filtering, and compatibility fixes. The generated text remains editable afterward. Advanced mode includes a 60 FPS cap, but that is a maximum target rather than a guaranteed lock—crowded scenes with many characters can fall to around 20 FPS.
+
+The **Fix & mods** panel can install a supplied controller-button asset fix and merge extra folders/ZIPs into the generated data directory. Locally distributed builds can also include the supported offline `choice.prop` dataset required by the crowd-choice statistics screen. General mod installation is experimental and has not been tested on Vita; add-ons are applied last, while the canonical OBBs and native runtime libraries remain protected.
+
+## Known limitations
+
+- Crowded scenes can become CPU-heavy and fall to around 20 FPS.
+- The first boot can remain black for roughly 30 seconds while caches are created.
+- Save-slot titles cannot currently be renamed.
+- Experimental data add-ons/mods have not been validated on Vita hardware.
 
 ## Building
 
-softfp VitaSDK with vitaGL, vitaShaRK, mathneon, OpenSLES, kubridge.
+The Vita loader requires the **softfp** VitaSDK with vitaGL, vitaShaRK, mathneon, OpenSLES, and kubridge. The build script rejects a hard-float SDK instead of producing an ABI-unsafe package.
 
-```bash
-export VITASDK=/path/to/vitasdk-softfp
-cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-cmake --build build
+```powershell
+$env:VITASDK = "C:\path\to\vitasdk-softfp"
+.\build_vpk.ps1
 ```
 
-VPK lands in `build/`. Windows: `build_vpk.ps1`.
+The production package is written to `build_local/MCSM-1.10.vpk` with telemetry disabled by default. Build the Windows data preparer with `data-builder/build.ps1`.
+
+VPKs and extracted game data are intentionally excluded from this source repository.
 
 ## Credits
 

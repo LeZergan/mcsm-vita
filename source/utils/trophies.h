@@ -46,6 +46,11 @@ void mcsm_trophies_unlock_by_name(const char *name);
 /* 1 if the trophy system came up and unlocks will actually be delivered. */
 int mcsm_trophies_available(void);
 
+/* Drive the first-boot setup dialog from the presenter. Call once per
+ * present; returns 1 while the dialog is up (composite it). */
+int mcsm_trophies_setup_poll(void);
+int mcsm_trophies_setup_active(void);
+
 /* 1 if this trophy is already held -- seeded at init from the SYSTEM's own store, so
  * it covers earlier sessions, not just this one. Used to drop the engine's repeated
  * unlock calls silently when a story beat replays. */
