@@ -33,7 +33,7 @@ No Android game executable, native library, OBB, episode, or gameplay archive is
 - Homebrew-enabled Vita / PS TV (HENkaku ensō, 3.60 / 3.65) with [VitaShell](https://github.com/TheOfficialFloW/VitaShell/releases).
 - [kubridge](https://github.com/TheOfficialFloW/kubridge/releases/tag/v0.1) and [FdFix](https://github.com/TheOfficialFloW/FdFix/releases/tag/v1.0) in `ur0:tai/`, both listed under `*KERNEL`. FdFix raises the open-file limit needed by the game archives. Do not use FdFix alongside rePatch.
 - `libshacccg.suprx` in `ur0:data/`; [ShaRKBR33D](https://github.com/Rinnegatamante/ShaRKBR33D/releases) is the one-click installer.
-- [NoTrpDrm](https://github.com/Rinnegatamante/NoTrpDrm/releases/tag/v.1.1) installed under `*KERNEL` and enabled. It is required for this homebrew trophy pack to register and unlock.
+- **NoTrpDrm is optional for the game and required only for trophies.** The game launches and plays without it. Install [NoTrpDrm](https://github.com/Rinnegatamante/NoTrpDrm/releases/tag/v.1.1) under `*KERNEL` only if you want the bundled trophy set to register and unlock.
 - **CapUnlocker is optional.** [CapUnlocker v1.4](https://github.com/GrapheneCt/CapUnlocker/releases/tag/v1.4) exposes the reserved fourth core. Without it, the loader detects the rejection and safely uses the three normal user cores; no manual compatibility file is required.
 - Your own legally-owned game: the `com.telltalegames.minecraft100` APK plus its matching main and patch OBBs. The supported set is **PowerVR v1.37** (`40137`).
 
@@ -43,7 +43,7 @@ Use one overclock menu, not several at the same time. Good options are [PSVshell
 
 ### Trophy setup and repair
 
-MCSM 1.10 packages the trophy set under `MCSM00001_00`, creates the matching runtime context, and performs first-run registration without blocking the game forever. NoTrpDrm is still mandatory.
+MCSM 1.10 packages the trophy set under `MCSM00001_00`, creates the matching runtime context, and performs first-run registration without blocking the game forever. NoTrpDrm is required for trophy support, but it is not required to launch or play the game.
 
 If trophies work normally, do nothing. If an older test VPK left a broken registration and Vita reports an NP preparation/corruption error:
 
