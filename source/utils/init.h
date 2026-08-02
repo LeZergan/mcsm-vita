@@ -25,6 +25,10 @@ void so_patch();
 
 void soloader_init_all();
 
+/* Keep native and Lua preference-resource locations synchronized. */
+void mcsm_sync_prefs_files(void);
+void mcsm_sync_prefs_after_save(void);
+
 #ifdef __cplusplus
 };
 #endif

@@ -26,6 +26,7 @@
 
 #include "reimpl/mem.h"
 #include "utils/glutil.h"
+#include "utils/init.h"
 #include "utils/launch_state.h"
 #include "utils/logger.h"
 #include "utils/utils.h"
@@ -1218,17 +1219,17 @@ static void metrics_diag_tick(uint32_t loop_count, const char *phase) {
 
 static int playback_dt_is_usable(float value);
 
-/* SLOW-ANIMATION FIX 2026-06-29: the animation dt was clamped to a max of 1/30s
+/* SLOW-ANIMATION FIX: the animation dt was clamped to a max of 1/30s
  * (33ms). The governor uses REAL elapsed time as the dt, so any frame slower than
  * 30fps (every heavy cutscene/gameplay scene) got its animation advance capped at
  * 33ms while real time advanced much more -> animations crawled in slow motion
  * (log proof: elapsed=310ms -> out=33ms = 0.1x speed). Widen the window so the
- * animation advances at the TRUE frame delta down to ~10fps; only genuine
- * multi-100ms stalls get clamped (so a scene-load freeze can't fling the pose).
+ * animation advances at the TRUE frame delta through heavy frames; only genuine
+ * half-second-plus stalls get clamped (so a scene-load freeze can't fling the pose).
  * MIN lowered so >60fps frames don't over-advance (fast motion). */
 #define ANIM_DT_MIN_SECONDS   (1.0f / 240.0f)
-#define ANIM_DT_MAX_SECONDS   (1.0f / 10.0f)
-#define ANIM_STALL_RESET_US   120000ULL
+#define ANIM_DT_MAX_SECONDS   (1.0f / 4.0f)
+#define ANIM_STALL_RESET_US   500000ULL
 
 static float clamp_animation_dt(float value) {
     if (!float_bits_finite(value) || value <= 0.0f) {
@@ -1264,30 +1265,24 @@ static float animation_governor_update(float engine_frame_time,
     }
     g_anim_governor_last_us = now;
 
-    if (elapsed_us >= 8000ULL && elapsed_us <= ANIM_STALL_RESET_US) {
+    if (elapsed_us >= 4000ULL && elapsed_us <= ANIM_STALL_RESET_US) {
         target = clamp_animation_dt((float)elapsed_us / 1000000.0f);
     } else if (elapsed_us > ANIM_STALL_RESET_US) {
-        /* STALL (scene-load hitch / pause): do NOT fold this big gap into the
-         * smoothed dt. Folding MAX in here spiked the animation speed for several
-         * frames AFTER every hitch (the "trip a lot" jerk). Keep the last good
-         * smoothed value so animation resumes at the true frame rate, smoothly. */
-        if (g_anim_governor_initialized) {
-            return clamp_animation_dt(g_anim_governed_dt);
-        }
-        target = ANIM_DT_MIN_SECONDS;
+        /* Never feed a multi-second load pause directly into simulation, but do
+         * account for a useful slice of it. Reusing the previous small dt dropped
+         * the whole pause while audio continued and permanently moved mouths and
+         * animation behind the soundtrack. */
+        target = ANIM_DT_MAX_SECONDS;
     } else if (playback_dt_is_usable(engine_frame_time)) {
         target = clamp_animation_dt(engine_frame_time);
     } else if (playback_dt_is_usable(engine_actual_frame_time)) {
         target = clamp_animation_dt(engine_actual_frame_time);
     }
 
-    if (!g_anim_governor_initialized) {
-        g_anim_governed_dt = target;
-        g_anim_governor_initialized = 1;
-    } else {
-        g_anim_governed_dt = (g_anim_governed_dt * 0.50f) + (target * 0.50f);
-        g_anim_governed_dt = clamp_animation_dt(g_anim_governed_dt);
-    }
+    /* Animation and audio must see the same wall-clock cadence. The old 50% EMA
+     * intentionally lagged variable-rate scenes by one or more frames. */
+    g_anim_governed_dt = target;
+    g_anim_governor_initialized = 1;
 
     if (count <= 16U ||
         elapsed_us > ANIM_STALL_RESET_US ||
@@ -1345,26 +1340,15 @@ static void metrics_force_animation_dt(float dt, const char *phase, uint32_t cou
         *g_metrics_diag.actual_frame_time = fixed_dt;
         changed = 1;
     }
-    if (g_metrics_diag.average_frame_time &&
-        abs_float_delta(*g_metrics_diag.average_frame_time, fixed_dt) > 0.0005f) {
-        *g_metrics_diag.average_frame_time = fixed_dt;
-        changed = 1;
-    }
-    if (g_metrics_diag.fixed_time_step &&
-        abs_float_delta(*g_metrics_diag.fixed_time_step, fixed_dt) > 0.0005f) {
-        *g_metrics_diag.fixed_time_step = fixed_dt;
-        changed = 1;
-    }
-    if (g_metrics_diag.delay && *g_metrics_diag.delay != 0.0f) {
-        *g_metrics_diag.delay = 0.0f;
-        changed = 1;
-    }
-
+    /* averageFrameTime, fixedTimeStep and delay have separate engine meanings;
+     * flattening them to one value destabilizes pacing and simulation. */
     if (g_metrics_diag.total_time &&
         playback_dt_is_usable(old_ft) &&
-        old_ft > fixed_dt &&
         old_ft <= 1.0f &&
         *g_metrics_diag.total_time >= old_ft) {
+        /* Metrics::NewFrame already added old_ft. Apply the difference in both
+         * directions; the previous one-sided correction never added missing time
+         * for a 60-120ms frame reported by the engine as 33ms. */
         *g_metrics_diag.total_time += (fixed_dt - old_ft);
         changed = 1;
     }
@@ -4103,19 +4087,25 @@ static int hook_lua_set_download_completed_cb(void *L) {
     l_info("CHOICEIO: SetDownloadCompletedCallback registered");
     return SO_CONTINUE(int, g_hook_lua_set_download_completed_cb, L);
 }
+#endif /* DEBUG_SOLOADER */
 
-/* Diagnostic: confirm SavePrefs actually runs + bracket it so the SAVEIO
- * lines (io.c) for the prefs.prop write land between these markers. */
+/* Keep this hook in production: SavePrefs is synchronous, so immediately after
+ * it returns we can reconcile its native bare-resource output with the Lua-facing
+ * <Temp> copy. Diagnostics remain conditional. */
 static so_hook g_hook_lua_save_prefs;
 static int hook_lua_save_prefs(void *L) {
+#ifdef DEBUG_SOLOADER
     static uint32_t count = 0;
     count++;
     l_info("SAVETRACE: SavePrefs ENTER #%u", count);
+#endif
     int ret = SO_CONTINUE(int, g_hook_lua_save_prefs, L);
+#ifdef DEBUG_SOLOADER
     l_info("SAVETRACE: SavePrefs RETURN #%u", count);
+#endif
+    mcsm_sync_prefs_after_save();
     return ret;
 }
-#endif /* DEBUG_SOLOADER */
 
 static so_hook g_hook_lua_resource_exists_redirect;
 static int hook_lua_resource_exists_redirect(void *L) {
@@ -6481,6 +6471,11 @@ static void patch_dlc_fast_path_hooks(void) {
                               "luaDownloadDocumentRetrieve",
                               (uintptr_t)&hook_lua_download_doc_retrieve,
                               &g_hook_lua_download_doc_retrieve);
+    (void)hook_symbol_checked(&so_mod_gameengine,
+                              "_Z12luaSavePrefsP9lua_State",
+                              "luaSavePrefs",
+                              (uintptr_t)&hook_lua_save_prefs,
+                              &g_hook_lua_save_prefs);
 #ifdef DEBUG_SOLOADER
     (void)hook_symbol_checked(&so_mod_gameengine,
                               "_Z30luaDownloadDocumentsFromServerP9lua_State",
@@ -6492,11 +6487,6 @@ static void patch_dlc_fast_path_hooks(void) {
                               "luaSetDownloadCompletedCallback",
                               (uintptr_t)&hook_lua_set_download_completed_cb,
                               &g_hook_lua_set_download_completed_cb);
-    (void)hook_symbol_checked(&so_mod_gameengine,
-                              "_Z12luaSavePrefsP9lua_State",
-                              "luaSavePrefs",
-                              (uintptr_t)&hook_lua_save_prefs,
-                              &g_hook_lua_save_prefs);
     (void)hook_symbol_checked(&so_mod_gameengine,
                               "_Z20luaResourceSetEnableP9lua_State",
                               "luaResourceSetEnable",

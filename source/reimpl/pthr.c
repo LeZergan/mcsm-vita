@@ -201,14 +201,21 @@ PTHR_INLINE int _cond_t_static_init(pthread_cond_t_bionic * cond, const pthread_
  * the kernel rejects the system core and we fall back to 0-2 (0x70000) so we
  * never break thread startup. Read the toggle once: settings/no_core3.txt
  * forces the 3-core mask. */
-static int g_core3_mask = -1; /* -1=unresolved, else the mask to apply */
+static atomic_int g_core3_mask = ATOMIC_VAR_INIT(-1); /* -1=unresolved */
 static int mcsm_resolve_core_mask(void) {
-    if (g_core3_mask >= 0) return g_core3_mask;
+    int cached = atomic_load_explicit(&g_core3_mask, memory_order_acquire);
+    if (cached >= 0) return cached;
     int want4 = 1;
     FILE *f = mcsm_open_setting("no_core3.txt", "r");
     if (f) { want4 = 0; fclose(f); }
-    g_core3_mask = want4 ? 0x000F0000 : 0x00070000;
-    return g_core3_mask;
+    const int resolved = want4 ? 0x000F0000 : 0x00070000;
+    int expected = -1;
+    (void)atomic_compare_exchange_strong_explicit(&g_core3_mask,
+                                                   &expected,
+                                                   resolved,
+                                                   memory_order_release,
+                                                   memory_order_acquire);
+    return atomic_load_explicit(&g_core3_mask, memory_order_acquire);
 }
 
 /* Affinity mask for auxiliary threads we ask vitaGL to spawn (the GC thread).
@@ -218,15 +225,18 @@ static int mcsm_resolve_core_mask(void) {
  * WITHOUT capUnlocker -> vitaGL's GC never runs -> the GPU present wedges. Honors
  * no_core3.txt via mcsm_resolve_core_mask(). */
 int mcsm_gc_core_mask(void) {
-    if (g_core3_mask < 0) {
+    int mask = atomic_load_explicit(&g_core3_mask, memory_order_acquire);
+    if (mask < 0) {
         /* Not yet resolved by a loader thread's probe — resolve + confirm now. */
-        if (mcsm_resolve_core_mask() & 0x00080000) {
+        mask = mcsm_resolve_core_mask();
+        if (mask & 0x00080000) {
             SceUID self = sceKernelGetThreadId();
             if (sceKernelChangeThreadCpuAffinityMask(self, 0x000F0000) < 0)
-                g_core3_mask = 0x00070000;   /* capUnlocker absent */
+                atomic_store_explicit(&g_core3_mask, 0x00070000, memory_order_release);
         }
     }
-    return (g_core3_mask & 0x00080000) ? 0x00080000 : 0x00070000;
+    mask = atomic_load_explicit(&g_core3_mask, memory_order_acquire);
+    return (mask & 0x00080000) ? 0x00080000 : 0x00070000;
 }
 
 typedef struct { void *(*start)(void *); void *param; } mcsm_thr_wrap;
@@ -240,7 +250,7 @@ static void *mcsm_thr_entry(void *arg) {
     int rc = sceKernelChangeThreadCpuAffinityMask(self, mask);
     if (rc < 0 && mask != 0x00070000) {
         /* capUnlocker not granting core 3 -> fall back to the 3 user cores. */
-        g_core3_mask = 0x00070000;
+        atomic_store_explicit(&g_core3_mask, 0x00070000, memory_order_release);
         rc = sceKernelChangeThreadCpuAffinityMask(self, 0x00070000);
         mask = 0x00070000;
     }

@@ -58,7 +58,6 @@ int obb_is_fd(int fd) { (void)fd; return 0; }
 
 typedef struct SaveDataFd {
     int fd;
-    int flags;
     int wrote;
     char path[1024];
 } SaveDataFd;
@@ -85,10 +84,6 @@ static int path_is_savedata_bundle(const char *path) {
            strstr(path, "choicestats.prop");
 }
 
-static int savedata_flags_can_write(int flags) {
-    return (flags & (O_WRONLY | O_RDWR | O_CREAT | O_TRUNC | O_APPEND)) != 0;
-}
-
 static int savedata_find_fd(int fd) {
     for (int i = 0; i < g_savedata_fd_count; ++i) {
         if (g_savedata_fds[i].fd == fd) {
@@ -104,7 +99,6 @@ static void savedata_track_fd(const char *path, int fd, int flags) {
     }
     int existing = savedata_find_fd(fd);
     if (existing >= 0) {
-        g_savedata_fds[existing].flags = flags;
         g_savedata_fds[existing].wrote = 0;
         sceClibSnprintf(g_savedata_fds[existing].path, sizeof(g_savedata_fds[existing].path), "%s", path);
         l_info("SAVEIO open existing fd=%d flags=0x%X path=%s", fd, flags, path);
@@ -113,7 +107,6 @@ static void savedata_track_fd(const char *path, int fd, int flags) {
     if (g_savedata_fd_count < (int)(sizeof(g_savedata_fds) / sizeof(g_savedata_fds[0]))) {
         SaveDataFd *slot = &g_savedata_fds[g_savedata_fd_count++];
         slot->fd = fd;
-        slot->flags = flags;
         slot->wrote = 0;
         sceClibSnprintf(slot->path, sizeof(slot->path), "%s", path);
     }
@@ -140,7 +133,9 @@ static int savedata_snapshot_fd(int fd, char *path, size_t path_size, int *shoul
         sceClibSnprintf(path, path_size, "%s", g_savedata_fds[idx].path);
     }
     if (should_flush) {
-        *should_flush = g_savedata_fds[idx].wrote || savedata_flags_can_write(g_savedata_fds[idx].flags);
+        /* A writable open that did not write has nothing to persist. Fsyncing it
+         * anyway can block the game thread during resource probes. */
+        *should_flush = g_savedata_fds[idx].wrote;
     }
     if (did_write) {
         *did_write = g_savedata_fds[idx].wrote;
@@ -1233,6 +1228,11 @@ int close_soloader(int fd) {
     int should_flush = 0;
     int did_write = 0;
     int is_savedata = savedata_snapshot_fd(fd, savedata_path, sizeof(savedata_path), &should_flush, &did_write);
+    if (is_savedata) {
+        /* Untrack before close: once close returns another thread may immediately
+         * reuse this integer fd, and late cleanup would delete the new record. */
+        savedata_untrack_fd(fd);
+    }
     if (is_savedata && should_flush) {
         int frc = fsync(fd);
         l_info("SAVEIO fsync before close fd=%d rc=%d errno=%d", fd, frc, errno);
@@ -1247,7 +1247,6 @@ int close_soloader(int fd) {
          * real <User>/saveSlot1.bundle + sub-bundles itself. */
         (void)did_write;
         (void)savedata_path;
-        savedata_untrack_fd(fd);
     }
     l_debug("close(%i): %i", fd, ret);
     return ret;

@@ -32,6 +32,7 @@ No Android game executable, native library, OBB, episode, or gameplay archive is
 
 - Homebrew-enabled Vita / PS TV (HENkaku ensō, 3.60 / 3.65) with **VitaShell**.
 - `kubridge.skprx` and `fd_fix.skprx` in `ur0:tai/` (both listed under `*KERNEL` in `config.txt`), and `libshacccg.suprx` in `ur0:data/`. `fd_fix.skprx` raises the open-file limit the loader needs to stream the game archives — without it, archive reads thrash on `EMFILE`. (Don't use it alongside the rePatch plugin.)
+- **capUnlocker is optional.** When core 3 is unavailable, the loader detects that at runtime and keeps engine and vitaGL worker threads on the three normal user cores; no setting file is required.
 - **NoTrpDrm** installed and enabled. The bundled homebrew trophy set cannot register without it.
 - Your own legally-owned game: the `com.telltalegames.minecraft100` APK plus its matching main and patch OBBs. The supported set is **PowerVR v1.37** (`40137`).
 
@@ -67,7 +68,7 @@ The **Fix & mods** panel can install a supplied controller-button asset fix and 
 
 ## Building
 
-The Vita loader requires the **softfp** VitaSDK with vitaGL, vitaShaRK, mathneon, OpenSLES, and kubridge. The build script rejects a hard-float SDK instead of producing an ABI-unsafe package.
+The Vita loader requires the **softfp** VitaSDK with vitaGL, vitaShaRK, mathneon, and kubridge. The build script rejects a hard-float SDK instead of producing an ABI-unsafe package. OpenSL ES is not required; audio uses the loader's native FMOD-to-`sceAudioOut` output path.
 
 ```powershell
 $env:VITASDK = "C:\path\to\vitasdk-softfp"

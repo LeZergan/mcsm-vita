@@ -438,6 +438,74 @@ static void seed_empty_prefs_files(void) {
     }
 }
 
+/* Native SavePrefs locates a bare preference resource at the data root, while
+ * the Lua save hooks resolve that same bare name through <Temp>. Independent
+ * placeholders made a successful write invisible to the next reader. Mirror
+ * the newest non-empty copy so existing installs are repaired without losing
+ * either side's settings. */
+static void sync_prefs_files(int native_save_completed) {
+    static const char *const k_names[] = {
+        "prefs.prop",
+        "user.prop",
+        "game_prefs.prop",
+    };
+
+    for (int i = 0; i < (int)(sizeof(k_names) / sizeof(k_names[0])); ++i) {
+        char root[256];
+        char temp[256];
+        struct stat root_st;
+        struct stat temp_st;
+        sceClibSnprintf(root, sizeof(root), DATA_PATH "%s", k_names[i]);
+        sceClibSnprintf(temp, sizeof(temp), DATA_PATH "Temp/%s", k_names[i]);
+
+        const int have_root = stat(root, &root_st) == 0 && root_st.st_size > 0;
+        const int have_temp = stat(temp, &temp_st) == 0 && temp_st.st_size > 0;
+        const char *src = NULL;
+        const char *dst = NULL;
+
+        if (native_save_completed && have_root) {
+            /* SavePrefs is native and writes the bare resource discovered at the
+             * data root. Prefer it even when FAT's coarse timestamp and serialized
+             * size cannot reveal that its contents changed. */
+            src = root;
+            dst = temp;
+        } else if (have_root && !have_temp) {
+            src = root;
+            dst = temp;
+        } else if (have_temp && !have_root) {
+            src = temp;
+            dst = root;
+        } else if (have_root && have_temp) {
+            if (root_st.st_mtime > temp_st.st_mtime) {
+                src = root;
+                dst = temp;
+            } else if (temp_st.st_mtime > root_st.st_mtime) {
+                src = temp;
+                dst = root;
+            } else if (root_st.st_size != temp_st.st_size) {
+                /* FAT timestamps are coarse; preserve the larger serialized set
+                 * when two writes land in the same timestamp tick. */
+                src = (root_st.st_size > temp_st.st_size) ? root : temp;
+                dst = (src == root) ? temp : root;
+            }
+        }
+
+        if (src && file_copy(src, dst)) {
+            l_info("PREFSYNC: mirrored %s -> %s", src, dst);
+        } else if (src) {
+            l_warn("PREFSYNC: failed to mirror %s -> %s", src, dst);
+        }
+    }
+}
+
+void mcsm_sync_prefs_files(void) {
+    sync_prefs_files(0);
+}
+
+void mcsm_sync_prefs_after_save(void) {
+    sync_prefs_files(1);
+}
+
 /* ★ CROWD-CHOICE DATA IS READ FROM <Temp>, BUT SHIPS AT THE DATA ROOT.
  *
  * The "how your choices compare" screen reads a pre-baked ~114KB choice.prop. All of
@@ -690,7 +758,8 @@ void soloader_init_all() {
      *    dialog only runs when the system does not already know the set. The comm
      *    id also agreed with nothing before -- packaged as MCSM00002_00, requested
      *    as MCSM00001, declared as MCSM00001_00 inside the pack -- which meant no
-     *    trophies at all on a fresh install. All three are MCSM00002 now. */
+     *    trophies at all on a fresh install. All shipping paths now derive from the
+     *    single MCSM_NP_COMM_ID definition (currently MCSM00001). */
     telemetry_log("BOOT", "soloader_init_all start");
 
 	// Launch `app0:configurator.bin` on `-config` init param
@@ -766,6 +835,7 @@ void soloader_init_all() {
     ensure_all_chapter_descriptors();   /* CH3-CH8: auto-detect any chapter whose archives are present */
     migrate_stranded_saves();
     mirror_crowd_choice_data();   /* MUST precede the empty seed — see there */
+    mcsm_sync_prefs_files();      /* recover whichever side has real settings */
     seed_empty_prefs_files();
     seed_shader_cache();
 

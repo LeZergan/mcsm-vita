@@ -1318,9 +1318,10 @@ void gl_init() {
      * VRAM-first ON, and newlib mem as a final texture fallback (vglUseExtraMem) ON —
      * so those are not free wins. These two ARE untapped but carry risk, so they are
      * Baked-in defaults: the workload is CPU-bound + upload-heavy, so cached GL pools
-     * (faster CPU->GPU uploads; vitaGL flushes caches before GPU reads) and pinning
-     * vitaGL's GC thread to core 3 (0x80000, freed by the shipped capUnlocker) so it
-     * doesn't steal render cycles are both real wins. vglUseCachedMem must precede vglInit. */
+     * (faster CPU->GPU uploads; vitaGL flushes caches before GPU reads) and a safe GC
+     * affinity are both real wins. Core 3 is used only when runtime probing proves a
+     * capUnlocker made it available; otherwise all user cores are used automatically.
+     * vglUseCachedMem must precede vglInit. */
     vglUseCachedMem(GL_TRUE);                    /* faster CPU->GPU uploads (baked-in default) */
     /* GC thread affinity: core 3 ONLY if capUnlocker actually freed it this boot,
      * else the 3 user cores. A hardcoded core-3 pin makes the GC unschedulable on
