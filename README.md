@@ -92,4 +92,8 @@ Built with AI assistance from **Codex 5.5**, **Claude 4.8**, and **DeepSeek 4 Pr
 
 ## License
 
-MIT (see [LICENSE](LICENSE)). Links vitaGL/vitaShaRK (LGPL-3.0), not redistributed here.
+Copyright © 2026 LeZergan.
+
+This project is licensed under the [GNU General Public License v3.0](LICENSE).
+Inherited and third-party components retain their original notices; see
+[THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md) and the `LICENSES` directory.

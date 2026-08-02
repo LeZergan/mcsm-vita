@@ -1,8 +1,10 @@
 # Third-Party Licenses
 
-The loader code in this repo is MIT (see [LICENSE](LICENSE)). It bundles or links a
-few third-party pieces that keep their own licenses. Full text lives in each
-component's own files/headers — this is just the summary and the links.
+The project's original code and combined distribution are licensed under GPL-3.0
+(see [LICENSE](LICENSE)). Inherited loader portions and third-party components keep
+their original notices. The prior loader-level MIT notice is preserved at
+`LICENSES/Loader-MIT.txt`; component texts also remain in their source trees and the
+`LICENSES` directory.
 
 ## Bundled in this repo
 
