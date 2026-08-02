@@ -20,6 +20,14 @@ public sealed class DataBuilderService
         "libfmodstudio.so"
     ];
 
+    private static readonly string[] RequiredButtonMeshes =
+    [
+        "ui_action_promptFacebuttonDown.d3dmesh",
+        "ui_action_promptFacebuttonLeft.d3dmesh",
+        "ui_action_promptFacebuttonRight.d3dmesh",
+        "ui_action_promptFacebuttonUp.d3dmesh"
+    ];
+
     public async Task<BuildResult> BuildAsync(
         BuildRequest request,
         IProgress<BuildProgress>? progress = null,
@@ -28,6 +36,7 @@ public sealed class DataBuilderService
         ValidateRequest(request);
         ApkLayout apkLayout = InspectApk(request.ApkPath);
         string? patchObbPath = FindPatchObb(request.MainObbPath);
+        ButtonFixBundle? buttonFix = ResolveButtonFix(request.ButtonFixPath);
 
         string outputDirectory = Path.GetFullPath(request.OutputDirectory.Trim());
         if (!Path.GetFileName(outputDirectory.TrimEnd(Path.DirectorySeparatorChar))
@@ -46,7 +55,9 @@ public sealed class DataBuilderService
         long totalBytes = apkLayout.TotalBytes
             + new FileInfo(request.MainObbPath).Length
             + (patchObbPath is null ? 0 : new FileInfo(patchObbPath).Length)
-            + request.ChapterSources.Sum(source => source.TotalBytes);
+            + (buttonFix?.TotalBytes ?? 0)
+            + request.ChapterSources.Sum(source => source.TotalBytes)
+            + request.DataAddons.Sum(source => source.TotalBytes);
         EnsureFreeSpace(outputDirectory, totalBytes);
 
         string stagingDirectory = Path.Combine(parent, $".mcsm-building-{Guid.NewGuid():N}");
@@ -97,6 +108,18 @@ public sealed class DataBuilderService
                 }
             }
 
+            int buttonFixFileCount = 0;
+            if (buttonFix is not null)
+            {
+                Report("Installing the controller button fix…");
+                buttonFixFileCount = await CopyButtonFixAsync(
+                    buttonFix,
+                    Path.Combine(stagingDirectory, "assets"),
+                    bytes => copiedBytes += bytes,
+                    status => Report(status),
+                    cancellationToken);
+            }
+
             Report("Copying the main game data…");
             await CopyFileAsync(
                 request.MainObbPath,
@@ -144,8 +167,22 @@ public sealed class DataBuilderService
                 chapterFileCount += copied;
             }
 
-            await WriteDefaultsAsync(stagingDirectory, request, includedEpisodes, cancellationToken);
-            VerifyOutput(stagingDirectory, includedEpisodes);
+            await WriteSettingsAsync(stagingDirectory, request, cancellationToken);
+            (int dataAddonFileCount, int dataAddonOverwriteCount) = await CopyDataAddonsAsync(
+                request.DataAddons,
+                stagingDirectory,
+                bytes => copiedBytes += bytes,
+                status => Report(status),
+                cancellationToken);
+            await WriteReadyMarkerAsync(
+                stagingDirectory,
+                request,
+                includedEpisodes,
+                buttonFix,
+                dataAddonFileCount,
+                dataAddonOverwriteCount,
+                cancellationToken);
+            VerifyOutput(stagingDirectory, includedEpisodes, buttonFix);
 
             Report("Finalizing the ready-to-copy folder…");
             if (Directory.Exists(outputDirectory))
@@ -177,6 +214,9 @@ public sealed class DataBuilderService
                 backupDirectory,
                 includedEpisodes.ToList(),
                 chapterFileCount,
+                buttonFixFileCount,
+                dataAddonFileCount,
+                dataAddonOverwriteCount,
                 totalBytes);
         }
         catch
@@ -222,6 +262,105 @@ public sealed class DataBuilderService
         {
             throw new InvalidDataException("The selected APK could not be opened as an Android package.", exception);
         }
+    }
+
+    public static ButtonFixBundle? InspectBundledButtonFix()
+    {
+        Assembly assembly = typeof(DataBuilderService).Assembly;
+        string? resourceName = assembly.GetManifestResourceNames()
+            .SingleOrDefault(name => name.EndsWith("LocalAssets.button-fix.zip", StringComparison.OrdinalIgnoreCase));
+        if (resourceName is null)
+        {
+            return null;
+        }
+
+        using Stream stream = assembly.GetManifestResourceStream(resourceName)
+            ?? throw new InvalidDataException("The embedded controller button-fix package could not be opened.");
+        return InspectButtonFixArchive(stream, ButtonFixSourceKind.Embedded, null);
+    }
+
+    public static ButtonFixBundle? ResolveButtonFix(string? selectedPath)
+    {
+        return string.IsNullOrWhiteSpace(selectedPath)
+            ? InspectBundledButtonFix()
+            : InspectButtonFixSource(selectedPath);
+    }
+
+    public static ButtonFixBundle InspectButtonFixSource(string path)
+    {
+        if (Directory.Exists(path))
+        {
+            var assets = Directory.EnumerateFiles(path, "*", SearchOption.AllDirectories)
+                .Where(IsButtonAsset)
+                .Select(file => new BundledAsset(Path.GetFileName(file), new FileInfo(file).Length))
+                .ToList();
+            return CreateButtonFixBundle(
+                assets,
+                ButtonFixSourceKind.Folder,
+                Path.GetFullPath(path));
+        }
+
+        if (File.Exists(path) && Path.GetExtension(path).Equals(".zip", StringComparison.OrdinalIgnoreCase))
+        {
+            using FileStream stream = File.OpenRead(path);
+            return InspectButtonFixArchive(
+                stream,
+                ButtonFixSourceKind.ZipArchive,
+                Path.GetFullPath(path));
+        }
+
+        throw new InvalidDataException("Choose the controller button-fix folder or a .zip made from it.");
+    }
+
+    private static ButtonFixBundle InspectButtonFixArchive(
+        Stream stream,
+        ButtonFixSourceKind kind,
+        string? path)
+    {
+        using ZipArchive zip = new(stream, ZipArchiveMode.Read, leaveOpen: true);
+        var assets = zip.Entries
+            .Where(entry => !string.IsNullOrEmpty(entry.Name) && IsButtonAsset(entry.Name))
+            .Select(entry => new BundledAsset(entry.Name, entry.Length))
+            .ToList();
+        return CreateButtonFixBundle(assets, kind, path);
+    }
+
+    private static ButtonFixBundle CreateButtonFixBundle(
+        IReadOnlyList<BundledAsset> assets,
+        ButtonFixSourceKind kind,
+        string? path)
+    {
+        if (assets.Count == 0)
+        {
+            throw new InvalidDataException("The controller button-fix source contains no .d3dtx or .d3dmesh assets.");
+        }
+
+        string? duplicate = assets
+            .GroupBy(asset => asset.Name, StringComparer.OrdinalIgnoreCase)
+            .FirstOrDefault(group => group.Count() > 1)
+            ?.Key;
+        if (duplicate is not null)
+        {
+            throw new InvalidDataException($"The controller fix contains two files named '{duplicate}'.");
+        }
+
+        BundledAsset? empty = assets.FirstOrDefault(asset => asset.Size <= 0);
+        if (empty is not null)
+        {
+            throw new InvalidDataException($"The controller fix contains an empty file: {empty.Name}");
+        }
+
+        string[] missingMeshes = RequiredButtonMeshes
+            .Where(required => !assets.Any(asset => asset.Name.Equals(required, StringComparison.OrdinalIgnoreCase)))
+            .ToArray();
+        if (missingMeshes.Length > 0)
+        {
+            throw new InvalidDataException(
+                "The selected folder is not the complete controller button fix. Missing: " +
+                string.Join(", ", missingMeshes));
+        }
+
+        return new ButtonFixBundle(assets, assets.Sum(asset => asset.Size), kind, path);
     }
 
     public static string? FindPatchObb(string mainObbPath)
@@ -319,6 +458,66 @@ public sealed class DataBuilderService
         return copied;
     }
 
+    private static async Task<int> CopyButtonFixAsync(
+        ButtonFixBundle bundle,
+        string assetsDirectory,
+        Action<int> addBytes,
+        Action<string> report,
+        CancellationToken cancellationToken)
+    {
+        if (bundle.Kind == ButtonFixSourceKind.Folder)
+        {
+            int copiedFolderFiles = 0;
+            foreach (string file in Directory.EnumerateFiles(bundle.Path!, "*", SearchOption.AllDirectories)
+                         .Where(IsButtonAsset))
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                string name = Path.GetFileName(file);
+                await CopyFileAsync(
+                    file,
+                    Path.Combine(assetsDirectory, name),
+                    addBytes,
+                    cancellationToken);
+                copiedFolderFiles++;
+                report($"Installed controller asset {name}");
+            }
+            return copiedFolderFiles;
+        }
+
+        Stream stream;
+        if (bundle.Kind == ButtonFixSourceKind.Embedded)
+        {
+            Assembly assembly = typeof(DataBuilderService).Assembly;
+            string resourceName = assembly.GetManifestResourceNames()
+                .Single(name => name.EndsWith("LocalAssets.button-fix.zip", StringComparison.OrdinalIgnoreCase));
+            stream = assembly.GetManifestResourceStream(resourceName)
+                ?? throw new InvalidDataException("The embedded controller button-fix package could not be opened.");
+        }
+        else
+        {
+            stream = File.OpenRead(bundle.Path!);
+        }
+
+        await using (stream)
+        using (ZipArchive zip = new(stream, ZipArchiveMode.Read, leaveOpen: false))
+        {
+            int copied = 0;
+            foreach (ZipArchiveEntry entry in zip.Entries
+                         .Where(entry => !string.IsNullOrEmpty(entry.Name) && IsButtonAsset(entry.Name)))
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                BundledAsset expected = bundle.Assets.Single(asset =>
+                    asset.Name.Equals(entry.Name, StringComparison.OrdinalIgnoreCase));
+                string destination = Path.Combine(assetsDirectory, expected.Name);
+                using Stream input = entry.Open();
+                await CopyStreamAsync(input, destination, expected.Size, addBytes, cancellationToken);
+                copied++;
+                report($"Installed controller asset {expected.Name}");
+            }
+            return copied;
+        }
+    }
+
     private static async Task<int> CopyChapterZipAsync(
         ChapterSource source,
         string assetsDirectory,
@@ -392,10 +591,56 @@ public sealed class DataBuilderService
             $"Two selected chapter sources contain different versions of '{fileName}'. " +
             $"Remove one source and build again.\n\nFirst: {first ?? "APK assets"}\nSecond: {second}");
 
-    private static async Task WriteDefaultsAsync(
+    private static async Task<(int Files, int Overwrites)> CopyDataAddonsAsync(
+        IReadOnlyList<DataAddonSource> addons,
+        string stagingDirectory,
+        Action<int> addBytes,
+        Action<string> report,
+        CancellationToken cancellationToken)
+    {
+        int files = 0;
+        int overwrites = 0;
+        foreach (DataAddonSource addon in addons)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (addon.Kind == DataAddonSourceKind.Folder)
+            {
+                string root = DataAddonScanner.NormalizeFolderRoot(addon.Path);
+                foreach (string source in Directory.EnumerateFiles(root, "*", SearchOption.AllDirectories))
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    string relative = DataAddonScanner.NormalizeRelativePath(Path.GetRelativePath(root, source));
+                    DataAddonScanner.EnsureNotCritical(relative);
+                    string destination = SafeDestination(stagingDirectory, relative);
+                    if (File.Exists(destination)) overwrites++;
+                    await CopyFileAsync(source, destination, addBytes, cancellationToken);
+                    files++;
+                    report($"Applied data add-on file {relative}");
+                }
+            }
+            else
+            {
+                using ZipArchive zip = ZipFile.OpenRead(addon.Path);
+                foreach (ZipArchiveEntry entry in zip.Entries.Where(entry => !string.IsNullOrEmpty(entry.Name)))
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    string relative = DataAddonScanner.NormalizeArchivePath(entry.FullName);
+                    DataAddonScanner.EnsureNotCritical(relative);
+                    string destination = SafeDestination(stagingDirectory, relative);
+                    if (File.Exists(destination)) overwrites++;
+                    using Stream input = entry.Open();
+                    await CopyStreamAsync(input, destination, entry.Length, addBytes, cancellationToken);
+                    files++;
+                    report($"Applied data add-on file {relative}");
+                }
+            }
+        }
+        return (files, overwrites);
+    }
+
+    private static async Task WriteSettingsAsync(
         string stagingDirectory,
         BuildRequest request,
-        IEnumerable<int> includedEpisodes,
         CancellationToken cancellationToken)
     {
         string graphics = await ReadEmbeddedTextAsync("graphics.txt", cancellationToken);
@@ -415,7 +660,17 @@ public sealed class DataBuilderService
         string settings = Path.Combine(stagingDirectory, "settings");
         await File.WriteAllTextAsync(Path.Combine(settings, "graphics.txt"), graphics, new UTF8Encoding(false), cancellationToken);
         await File.WriteAllTextAsync(Path.Combine(settings, "game.txt"), game, new UTF8Encoding(false), cancellationToken);
+    }
 
+    private static async Task WriteReadyMarkerAsync(
+        string stagingDirectory,
+        BuildRequest request,
+        IEnumerable<int> includedEpisodes,
+        ButtonFixBundle? buttonFix,
+        int dataAddonFileCount,
+        int dataAddonOverwriteCount,
+        CancellationToken cancellationToken)
+    {
         string episodeText = string.Join(", ", includedEpisodes.Order());
         string readyText =
             "MCSM VITA DATA FOLDER — READY\r\n" +
@@ -424,8 +679,11 @@ public sealed class DataBuilderService
             "The final Vita path must be: ux0:data\\mcsm\\assets\r\n\r\n" +
             $"Detected episodes: {episodeText}\r\n" +
             $"Graphics profile: {request.GraphicsProfile}\r\n" +
-            $"Language: {request.LanguageCode}\r\n\r\n" +
+            $"Language: {request.LanguageCode}\r\n" +
+            $"Controller button fix: {(buttonFix is null ? "not supplied" : $"included ({buttonFix.FileCount} assets)")}\r\n" +
+            $"Experimental data add-ons: {dataAddonFileCount} files ({dataAddonOverwriteCount} replacements)\r\n\r\n" +
             "Advanced graphics and episode controls are in the settings folder.\r\n" +
+            "Data add-on / mod installation is experimental and has not been tested on Vita.\r\n" +
             "This folder was built from files you selected; no game data is included with the tool.\r\n";
         await File.WriteAllTextAsync(
             Path.Combine(stagingDirectory, "DATA_FOLDER_READY.txt"),
@@ -436,7 +694,7 @@ public sealed class DataBuilderService
 
     private static async Task<string> ReadEmbeddedTextAsync(string fileName, CancellationToken cancellationToken)
     {
-        Assembly assembly = Assembly.GetExecutingAssembly();
+        Assembly assembly = typeof(DataBuilderService).Assembly;
         string resourceName = assembly.GetManifestResourceNames()
             .Single(name => name.EndsWith($"Defaults.{fileName}", StringComparison.OrdinalIgnoreCase));
         await using Stream stream = assembly.GetManifestResourceStream(resourceName)
@@ -445,7 +703,10 @@ public sealed class DataBuilderService
         return await reader.ReadToEndAsync(cancellationToken);
     }
 
-    private static void VerifyOutput(string output, IEnumerable<int> episodes)
+    private static void VerifyOutput(
+        string output,
+        IEnumerable<int> episodes,
+        ButtonFixBundle? buttonFix)
     {
         var required = RequiredLibraries
             .Select(library => Path.Combine(output, library))
@@ -466,6 +727,20 @@ public sealed class DataBuilderService
             {
                 throw new InvalidDataException(
                     $"Episode {episode} was detected, but its required marker archive is missing: {Path.GetFileName(marker)}");
+            }
+        }
+
+
+        if (buttonFix is not null)
+        {
+            foreach (BundledAsset asset in buttonFix.Assets)
+            {
+                string path = Path.Combine(output, "assets", asset.Name);
+                if (!File.Exists(path) || new FileInfo(path).Length <= 0)
+                {
+                    throw new IOException(
+                        $"Controller button-fix verification failed: '{asset.Name}' is missing or incomplete.");
+                }
             }
         }
     }
@@ -498,6 +773,13 @@ public sealed class DataBuilderService
     private static bool IsApkAsset(ZipArchiveEntry entry) =>
         !string.IsNullOrEmpty(entry.Name)
         && entry.FullName.StartsWith("assets/", StringComparison.OrdinalIgnoreCase);
+
+    private static bool IsButtonAsset(string path)
+    {
+        string extension = Path.GetExtension(path);
+        return extension.Equals(".d3dtx", StringComparison.OrdinalIgnoreCase)
+            || extension.Equals(".d3dmesh", StringComparison.OrdinalIgnoreCase);
+    }
 
     private static string SafeDestination(string root, string relativePath)
     {

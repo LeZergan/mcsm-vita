@@ -21,6 +21,7 @@ public sealed class MainForm : Form
     private readonly TextBox _obbBox = new();
     private readonly TextBox _outputBox = new();
     private readonly Label _patchLabel = new();
+    private readonly Label _extrasSummaryLabel = new();
     private readonly ListBox _chapterList = new();
     private readonly ComboBox _profileBox = new();
     private readonly ComboBox _languageBox = new();
@@ -34,6 +35,10 @@ public sealed class MainForm : Form
     private readonly List<Control> _inputs = [];
     private readonly DataBuilderService _builder = new();
     private readonly ToolTip _toolTip = new();
+    private ButtonFixBundle? _buttonFixBundle;
+    private string? _buttonFixError;
+    private string? _selectedButtonFixPath;
+    private readonly List<DataAddonSource> _dataAddons = [];
     private CancellationTokenSource? _buildCancellation;
     private BuildResult? _lastResult;
 
@@ -50,6 +55,15 @@ public sealed class MainForm : Form
         DragEnter += OnDragEnter;
         DragDrop += OnDragDrop;
 
+        try
+        {
+            _buttonFixBundle = DataBuilderService.InspectBundledButtonFix();
+        }
+        catch (Exception exception)
+        {
+            _buttonFixError = exception.Message;
+        }
+
         ConfigurePage();
         BuildHeader();
         BuildSourceCard();
@@ -62,6 +76,7 @@ public sealed class MainForm : Form
         _profileBox.SelectedIndex = 0;
         _languageBox.SelectedIndex = 0;
         UpdatePatchStatus();
+        UpdateOptionalSummary();
         UpdateReadyState();
 
         Resize += (_, _) => ResizeWidePanels();
@@ -169,8 +184,8 @@ public sealed class MainForm : Form
     {
         Panel card = CreateCard(
             "2",
-            "Add extra episodes",
-            "Optional. Choose an episode's Android files/Net folder or a ZIP containing its .ttarch2 and .lua files.",
+            "Add optional content",
+            "Episodes go here. Controller fixes and experimental mods are available under Fix & mods.",
             216);
 
         _chapterList.Location = new Point(24, 78);
@@ -191,18 +206,21 @@ public sealed class MainForm : Form
             if (_chapterList.SelectedItem is not null)
             {
                 _chapterList.Items.Remove(_chapterList.SelectedItem);
+                UpdateOptionalSummary();
                 UpdateReadyState();
             }
         };
 
-        Label hint = new()
-        {
-            AutoSize = true,
-            Text = "No extra episode selected = Episode 1 only",
-            ForeColor = TextSoft,
-            Font = new Font("Segoe UI", 8.5f),
-            Location = new Point(24, 197)
-        };
+        _extrasSummaryLabel.AutoSize = false;
+        _extrasSummaryLabel.Text = "Episode 1 only";
+        _extrasSummaryLabel.ForeColor = TextSoft;
+        _extrasSummaryLabel.Font = new Font("Segoe UI", 8.5f);
+        _extrasSummaryLabel.Location = new Point(24, 197);
+        _extrasSummaryLabel.Height = 18;
+
+        Button extras = CreateGhostButton("Fix + mods…", 0, 184, 116);
+        extras.ForeColor = Warning;
+        extras.Click += (_, _) => OpenExtrasDialog();
 
         void ResizeFields()
         {
@@ -211,11 +229,13 @@ public sealed class MainForm : Form
             addFolder.Left = buttonX;
             addZip.Left = buttonX;
             remove.Left = buttonX;
+            extras.Left = buttonX;
+            _extrasSummaryLabel.Width = Math.Max(250, buttonX - 42);
         }
         card.SizeChanged += (_, _) => ResizeFields();
 
-        _inputs.AddRange([_chapterList, addFolder, addZip, remove]);
-        card.Controls.AddRange([_chapterList, addFolder, addZip, remove, hint]);
+        _inputs.AddRange([_chapterList, addFolder, addZip, remove, extras]);
+        card.Controls.AddRange([_chapterList, addFolder, addZip, remove, extras, _extrasSummaryLabel]);
         ResizeFields();
     }
 
@@ -556,6 +576,7 @@ public sealed class MainForm : Form
             ChapterSource source = await Task.Run(() => ChapterScanner.Inspect(path));
             _chapterList.Items.Add(source);
             SetStatus($"Added {source.DisplayName}", Primary);
+            UpdateOptionalSummary();
             UpdateReadyState();
         }
         catch (Exception exception)
@@ -563,6 +584,42 @@ public sealed class MainForm : Form
             SetStatus("That chapter source could not be used.", Warning);
             MessageBox.Show(this, exception.Message, "Chapter not added", MessageBoxButtons.OK, MessageBoxIcon.Warning);
         }
+    }
+
+    private void OpenExtrasDialog()
+    {
+        using ExtrasDialog dialog = new(
+            _buttonFixBundle,
+            _buttonFixError,
+            _selectedButtonFixPath,
+            _dataAddons);
+        if (dialog.ShowDialog(this) != DialogResult.OK)
+        {
+            return;
+        }
+
+        _selectedButtonFixPath = dialog.ButtonFixPath;
+        _dataAddons.Clear();
+        _dataAddons.AddRange(dialog.DataAddons);
+        UpdateOptionalSummary();
+        UpdatePatchStatus();
+    }
+
+    private void UpdateOptionalSummary()
+    {
+        string episodes = _chapterList.Items.Count == 0
+            ? "Episode 1 only"
+            : $"{_chapterList.Items.Count} episode source(s)";
+        string buttonFix = _selectedButtonFixPath is not null
+            ? "custom button fix"
+            : _buttonFixBundle is not null
+                ? $"button fix built in ({_buttonFixBundle.FileCount})"
+                : "button fix not supplied";
+        string mods = _dataAddons.Count == 0
+            ? "no mods"
+            : $"{_dataAddons.Count} mod/data add-on(s) — UNTESTED";
+        _extrasSummaryLabel.Text = $"{episodes}  ·  {buttonFix}  ·  {mods}";
+        _extrasSummaryLabel.ForeColor = _dataAddons.Count > 0 ? Warning : TextSoft;
     }
 
     private async Task BuildDataAsync()
@@ -573,6 +630,22 @@ public sealed class MainForm : Form
         }
 
         string output = _outputBox.Text.Trim();
+        if (_dataAddons.Count > 0)
+        {
+            DialogResult modAnswer = MessageBox.Show(
+                this,
+                "Data add-on / mod installation is experimental and has not been tested on Vita. " +
+                "Selected add-ons are applied last and may replace files in the prepared data folder.\n\nContinue?",
+                "Experimental mod installation",
+                MessageBoxButtons.YesNo,
+                MessageBoxIcon.Warning,
+                MessageBoxDefaultButton.Button2);
+            if (modAnswer != DialogResult.Yes)
+            {
+                return;
+            }
+        }
+
         if (Directory.Exists(output) && Directory.EnumerateFileSystemEntries(output).Any())
         {
             DialogResult answer = MessageBox.Show(
@@ -604,7 +677,9 @@ public sealed class MainForm : Form
                 output,
                 chapters,
                 profile.Value,
-                language.Value);
+                language.Value,
+                _selectedButtonFixPath,
+                _dataAddons.ToList());
 
             var progress = new Progress<BuildProgress>(update =>
             {
@@ -618,7 +693,9 @@ public sealed class MainForm : Form
             _progress.Value = 100;
             SetStatus("Ready — copy the whole mcsm folder to ux0:data\\", Primary);
             _progressDetail.Text =
-                $"Episodes {string.Join(", ", _lastResult.IncludedEpisodes)} · {FormatBytes(_lastResult.TotalBytes)}";
+                $"Episodes {string.Join(", ", _lastResult.IncludedEpisodes)} · " +
+                $"button fix {_lastResult.ButtonFixFileCount} · " +
+                $"mods {_lastResult.DataAddonFileCount} files · {FormatBytes(_lastResult.TotalBytes)}";
             _openButton.Enabled = true;
 
             string backup = _lastResult.BackupDirectory is null
@@ -689,22 +766,38 @@ public sealed class MainForm : Form
 
     private void UpdatePatchStatus()
     {
+        string? activeFixError = _selectedButtonFixPath is null ? _buttonFixError : null;
+        bool hasButtonFix = _selectedButtonFixPath is not null || _buttonFixBundle is not null;
+        string fixText = _selectedButtonFixPath is not null
+            ? $"custom controller fix selected ({Path.GetFileName(_selectedButtonFixPath.TrimEnd(Path.DirectorySeparatorChar))})"
+            : activeFixError is not null
+            ? "controller fix package invalid"
+            : _buttonFixBundle is null
+                ? "controller fix not bundled"
+                : $"controller fix built in ({_buttonFixBundle.FileCount} assets)";
         string path = _obbBox.Text.Trim();
         if (!File.Exists(path))
         {
-            _patchLabel.Text = "Patch OBB: optional — auto-detected beside the main OBB";
-            _patchLabel.ForeColor = TextSoft;
+            _patchLabel.Text = $"Patch OBB: optional — auto-detected  ·  {fixText}";
+            _patchLabel.ForeColor = activeFixError is not null
+                ? Warning
+                : hasButtonFix ? Primary : TextSoft;
+            _toolTip.SetToolTip(_patchLabel, activeFixError ?? "The controller fix is copied into mcsm/assets automatically.");
             return;
         }
 
         try
         {
             string? patch = DataBuilderService.FindPatchObb(path);
-            _patchLabel.Text = patch is null
+            string patchText = patch is null
                 ? "Patch OBB: not found (main-only build is supported)"
                 : $"Patch OBB: found automatically — {Path.GetFileName(patch)}";
-            _patchLabel.ForeColor = patch is null ? TextSoft : Primary;
-            _toolTip.SetToolTip(_patchLabel, patch ?? "Place one matching patch.*.obb beside the main OBB to include it.");
+            _patchLabel.Text = $"{patchText}  ·  {fixText}";
+            _patchLabel.ForeColor = activeFixError is not null
+                ? Warning
+                : patch is not null || hasButtonFix ? Primary : TextSoft;
+            string patchTip = patch ?? "Place one matching patch.*.obb beside the main OBB to include it.";
+            _toolTip.SetToolTip(_patchLabel, $"{patchTip}\n{activeFixError ?? fixText}");
         }
         catch (Exception exception)
         {

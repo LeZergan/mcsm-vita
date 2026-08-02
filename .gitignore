@@ -88,5 +88,6 @@ tools/maintenance_legacy/
 data-builder/bin/
 data-builder/obj/
 data-builder/dist/
+data-builder/LocalAssets/
 data-builder/tests/bin/
 data-builder/tests/obj/

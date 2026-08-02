@@ -4,8 +4,17 @@ using McsmVitaDataBuilder;
 
 if (args.Length == 2 && args[0].Equals("--render", StringComparison.OrdinalIgnoreCase))
 {
-    RenderPreview(args[1]);
+    RenderForm(args[1], () => new MainForm());
     Console.WriteLine($"Rendered UI preview: {args[1]}");
+    return 0;
+}
+
+if (args.Length == 2 && args[0].Equals("--render-extras", StringComparison.OrdinalIgnoreCase))
+{
+    RenderForm(
+        args[1],
+        () => new ExtrasDialog(DataBuilderService.InspectBundledButtonFix(), null, null, []));
+    Console.WriteLine($"Rendered extras UI preview: {args[1]}");
     return 0;
 }
 
@@ -54,8 +63,50 @@ try
         WriteEntry(zip, "nested/Net/readme.txt", "ignored");
     }
 
+    string buttonFix = Path.Combine(inputs, "button-fix");
+    Directory.CreateDirectory(buttonFix);
+    foreach (string mesh in new[]
+             {
+                 "ui_action_promptFacebuttonDown.d3dmesh",
+                 "ui_action_promptFacebuttonLeft.d3dmesh",
+                 "ui_action_promptFacebuttonRight.d3dmesh",
+                 "ui_action_promptFacebuttonUp.d3dmesh"
+             })
+    {
+        await File.WriteAllTextAsync(Path.Combine(buttonFix, mesh), $"synthetic {mesh}");
+    }
+
+    string modFolder = Path.Combine(inputs, "folder-mod", "mcsm");
+    Directory.CreateDirectory(Path.Combine(modFolder, "assets"));
+    Directory.CreateDirectory(Path.Combine(modFolder, "settings"));
+    await File.WriteAllTextAsync(Path.Combine(modFolder, "assets", "folder-mod.asset"), "folder mod");
+    await File.WriteAllTextAsync(Path.Combine(modFolder, "settings", "folder-mod.txt"), "enabled");
+
+    string modZip = Path.Combine(inputs, "zip-mod.zip");
+    using (ZipArchive zip = ZipFile.Open(modZip, ZipArchiveMode.Create))
+    {
+        WriteEntry(zip, "package/mcsm/assets/feedInfo.dat", "modded feed");
+        WriteEntry(zip, "package/mcsm/User/zip-mod.cfg", "enabled");
+    }
+
+    string unsafeMod = Path.Combine(inputs, "unsafe-mod");
+    Directory.CreateDirectory(unsafeMod);
+    await File.WriteAllTextAsync(Path.Combine(unsafeMod, "libmain.so"), "must be blocked");
+    bool protectedFileRejected = false;
+    try
+    {
+        _ = DataAddonScanner.Inspect(unsafeMod);
+    }
+    catch (InvalidDataException)
+    {
+        protectedFileRejected = true;
+    }
+    Assert(protectedFileRejected, "A data add-on was allowed to replace a protected native library.");
+
     ChapterSource source2 = ChapterScanner.Inspect(Path.Combine(inputs, "episode2"));
     ChapterSource source3 = ChapterScanner.Inspect(episode3Zip);
+    DataAddonSource addonFolder = DataAddonScanner.Inspect(Path.Combine(inputs, "folder-mod"));
+    DataAddonSource addonZip = DataAddonScanner.Inspect(modZip);
     Assert(source2.Episodes.SequenceEqual([2]), "Episode 2 folder detection failed.");
     Assert(source3.Episodes.SequenceEqual([3]), "Episode 3 ZIP detection failed.");
     Assert(
@@ -72,11 +123,16 @@ try
         output,
         [source2, source3],
         "balanced",
-        "ru");
+        "ru",
+        buttonFix,
+        [addonFolder, addonZip]);
 
     DataBuilderService builder = new();
     BuildResult first = await builder.BuildAsync(request);
     Assert(first.IncludedEpisodes.SequenceEqual([1, 2, 3]), "Included episode list is wrong.");
+    Assert(first.ButtonFixFileCount == 4, "User-supplied controller fix was not installed.");
+    Assert(first.DataAddonFileCount == 4, "Experimental data add-on file count is wrong.");
+    Assert(first.DataAddonOverwriteCount == 1, "Data add-on replacement count is wrong.");
     Assert(File.Exists(Path.Combine(output, DataBuilderService.MainObbName)), "Canonical main OBB is missing.");
     Assert(File.Exists(Path.Combine(output, DataBuilderService.PatchObbName)), "Auto-detected patch OBB is missing.");
     Assert(File.Exists(Path.Combine(output, "assets", "feedInfo.dat")), "APK asset is missing.");
@@ -84,6 +140,10 @@ try
     Assert(File.Exists(Path.Combine(output, "assets", "MCSM_android_Minecraft102_data.ttarch2")), "Episode 2 marker is missing.");
     Assert(File.Exists(Path.Combine(output, "assets", "MCSM_android_Minecraft103_data.ttarch2")), "Episode 3 marker is missing.");
     Assert(!File.Exists(Path.Combine(output, "assets", "do-not-copy.txt")), "Unrelated chapter file was copied.");
+    Assert(File.Exists(Path.Combine(output, "assets", "ui_action_promptFacebuttonDown.d3dmesh")), "Controller fix mesh is missing.");
+    Assert(File.Exists(Path.Combine(output, "assets", "folder-mod.asset")), "Folder data add-on is missing.");
+    Assert(File.Exists(Path.Combine(output, "User", "zip-mod.cfg")), "ZIP data add-on is missing.");
+    Assert(await File.ReadAllTextAsync(Path.Combine(output, "assets", "feedInfo.dat")) == "modded feed", "Data add-on was not applied last.");
     Assert(Directory.Exists(Path.Combine(output, "Temp")), "Temp runtime folder is missing.");
     Assert(Directory.Exists(Path.Combine(output, "User")), "User runtime folder is missing.");
 
@@ -95,11 +155,22 @@ try
     Assert(game.Contains("language = ru"), "Selected language was not written.");
     Assert(game.Contains("chapters = auto"), "Episode auto-detection is not enabled.");
 
-    BuildResult second = await builder.BuildAsync(request);
+    ButtonFixBundle? embeddedFix = DataBuilderService.InspectBundledButtonFix();
+    BuildRequest embeddedRequest = request with
+    {
+        ButtonFixPath = null,
+        DataAddons = []
+    };
+    BuildResult second = await builder.BuildAsync(embeddedRequest);
     Assert(second.BackupDirectory is not null && Directory.Exists(second.BackupDirectory), "Existing output was not preserved as a backup.");
+    Assert(second.ButtonFixFileCount == (embeddedFix?.FileCount ?? 0), "Built-in controller fix count is wrong.");
+    if (embeddedFix is not null)
+    {
+        Assert(File.Exists(Path.Combine(output, "assets", embeddedFix.Assets[0].Name)), "Built-in controller fix was not extracted.");
+    }
     Assert(File.Exists(Path.Combine(output, "DATA_FOLDER_READY.txt")), "Final ready marker is missing.");
 
-    Console.WriteLine("PASS: APK extraction, OBB naming, patch detection, folder/ZIP chapters, settings, validation, and backup replacement.");
+    Console.WriteLine("PASS: APK/OBB extraction, chapters, supplied/built-in controller fixes, experimental folder/ZIP data add-ons, settings, validation, and backups.");
     return 0;
 }
 catch (Exception exception)
@@ -130,7 +201,7 @@ static void Assert(bool condition, string message)
     }
 }
 
-static void RenderPreview(string outputPath)
+static void RenderForm(string outputPath, Func<Form> formFactory)
 {
     Exception? failure = null;
     Thread thread = new(() =>
@@ -139,7 +210,7 @@ static void RenderPreview(string outputPath)
         {
             Application.SetHighDpiMode(HighDpiMode.PerMonitorV2);
             Application.EnableVisualStyles();
-            using MainForm form = new();
+            using Form form = formFactory();
             form.Show();
             Application.DoEvents();
             form.Refresh();

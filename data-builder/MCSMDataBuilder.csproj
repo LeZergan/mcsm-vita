@@ -18,6 +18,9 @@
 
   <ItemGroup>
     <EmbeddedResource Include="Defaults\*.txt" />
+    <EmbeddedResource Include="LocalAssets\button-fix.zip" Condition="Exists('LocalAssets\button-fix.zip')">
+      <LogicalName>McsmVitaDataBuilder.LocalAssets.button-fix.zip</LogicalName>
+    </EmbeddedResource>
     <Compile Remove="tests\**\*.cs" />
   </ItemGroup>
 </Project>

@@ -45,6 +45,8 @@ To build the self-contained Windows EXE from source:
 
 The app also creates `settings/graphics.txt` and `settings/game.txt`. The recommended Performance preset is selected by default; Easy and Advanced Custom sections remain editable. Advanced mode includes a 60 FPS cap, but that is a maximum target rather than a guaranteed lock—crowded scenes with many characters can fall to around 20 FPS.
 
+The **Fix & mods** panel can install a supplied controller-button asset fix and merge extra folders/ZIPs into the generated data directory. General mod installation is experimental and has not been tested on Vita; add-ons are applied last, while the canonical OBBs and native runtime libraries remain protected.
+
 ## Known issues
 
 - Stutters and fluctuating frame rate.
