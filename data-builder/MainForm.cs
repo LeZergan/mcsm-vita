@@ -29,6 +29,8 @@ public sealed class MainForm : Form
     private readonly ListBox _chapterList = new();
     private readonly ComboBox _profileBox = new();
     private readonly ComboBox _languageBox = new();
+    private readonly Button _customizeProfileButton = new();
+    private readonly Label _customProfileSummaryLabel = new();
     private readonly Label _statusLabel = new();
     private readonly Label _progressDetail = new();
     private readonly SlimProgressBar _progress = new();
@@ -48,12 +50,13 @@ public sealed class MainForm : Form
     private string? _validatedApkPath;
     private string? _validatedMainObbPath;
     private string? _validatedPatchObbPath;
+    private CustomProfileSettings _customProfile = new();
     private CancellationTokenSource? _buildCancellation;
     private BuildResult? _lastResult;
 
     public MainForm()
     {
-        Text = "MCSM Vita Data Builder  •  v1.3";
+        Text = "MCSM Vita Data Builder  •  v1.4";
         StartPosition = FormStartPosition.CenterScreen;
         MinimumSize = new Size(900, 760);
         Size = new Size(1040, 950);
@@ -131,7 +134,7 @@ public sealed class MainForm : Form
         Label badge = new()
         {
             AutoSize = true,
-            Text = "  MCSM VITA BUILDER 1.3  ",
+            Text = "  MCSM VITA BUILDER 1.4  ",
             Font = new Font("Segoe UI Semibold", 8.5f),
             ForeColor = Primary,
             BackColor = Color.FromArgb(18, 64, 54),
@@ -326,16 +329,21 @@ public sealed class MainForm : Form
         outputButton.Click += (_, _) => BrowseOutput();
 
         Label profileLabel = CreateFieldLabel("STARTING PROFILE", 24, 138);
-        ConfigureCombo(_profileBox, 24, 158, 250);
+        ConfigureCombo(_profileBox, 24, 158, 220);
         _profileBox.Items.AddRange([
-            new Choice("Performance — recommended", "performance"),
+            new Choice("Default — recommended", "default"),
+            new Choice("Performance — fastest", "performance"),
             new Choice("Balanced", "balanced"),
             new Choice("Quality", "quality"),
-            new Choice("Battery", "battery")
+            new Choice("Battery", "battery"),
+            new Choice("Custom — make your own", "custom")
         ]);
 
-        Label languageLabel = CreateFieldLabel("TEXT LANGUAGE", 302, 138);
-        ConfigureCombo(_languageBox, 302, 158, 180);
+        ConfigureSecondaryButton(_customizeProfileButton, "Make custom", 252, 156, 124);
+        _customizeProfileButton.Click += (_, _) => OpenCustomProfileDialog();
+
+        Label languageLabel = CreateFieldLabel("TEXT LANGUAGE", 398, 138);
+        ConfigureCombo(_languageBox, 398, 158, 166);
         _languageBox.Items.AddRange([
             new Choice("English", "en"),
             new Choice("French", "fr"),
@@ -346,21 +354,70 @@ public sealed class MainForm : Form
             new Choice("Chinese", "zh")
         ]);
 
+        _customProfileSummaryLabel.AutoSize = false;
+        _customProfileSummaryLabel.Location = new Point(586, 151);
+        _customProfileSummaryLabel.Size = new Size(320, 36);
+        _customProfileSummaryLabel.TextAlign = ContentAlignment.MiddleLeft;
+        _customProfileSummaryLabel.Font = new Font("Segoe UI Semibold", 8.2f);
+        _customProfileSummaryLabel.ForeColor = TextSoft;
+
         void ResizeFields()
         {
             int buttonX = card.ClientSize.Width - 140;
             _outputBox.Width = Math.Max(300, buttonX - 42);
             outputButton.Left = buttonX;
+            _customProfileSummaryLabel.Width = Math.Max(150, card.ClientSize.Width - 610);
         }
         card.SizeChanged += (_, _) => ResizeFields();
 
         _outputBox.TextChanged += (_, _) => UpdateReadyState();
-        _inputs.AddRange([_outputBox, outputButton, _profileBox, _languageBox]);
+        _profileBox.SelectedIndexChanged += (_, _) => UpdateCustomProfileUi();
+        _inputs.AddRange([_outputBox, outputButton, _profileBox, _customizeProfileButton, _languageBox]);
         card.Controls.AddRange([
             outputLabel, _outputBox, outputButton,
-            profileLabel, _profileBox, languageLabel, _languageBox
+            profileLabel, _profileBox, _customizeProfileButton,
+            languageLabel, _languageBox, _customProfileSummaryLabel
         ]);
         ResizeFields();
+    }
+
+    private void OpenCustomProfileDialog()
+    {
+        using CustomProfileDialog dialog = new(_customProfile);
+        if (dialog.ShowDialog(this) != DialogResult.OK)
+        {
+            return;
+        }
+
+        _customProfile = dialog.Settings;
+        SelectProfile("custom");
+        UpdateCustomProfileUi();
+    }
+
+    private void SelectProfile(string value)
+    {
+        for (int index = 0; index < _profileBox.Items.Count; index++)
+        {
+            if (_profileBox.Items[index] is Choice choice
+                && choice.Value.Equals(value, StringComparison.Ordinal))
+            {
+                _profileBox.SelectedIndex = index;
+                return;
+            }
+        }
+    }
+
+    private void UpdateCustomProfileUi()
+    {
+        bool customSelected = (_profileBox.SelectedItem as Choice)?.Value == "custom";
+        _customizeProfileButton.Text = customSelected ? "Edit custom" : "Make custom";
+        _customizeProfileButton.BackColor = customSelected ? PrimaryDark : Color.FromArgb(30, 41, 59);
+        _customizeProfileButton.ForeColor = customSelected ? Primary : TextMain;
+        _customizeProfileButton.FlatAppearance.BorderColor = customSelected ? Primary : Border;
+        _customProfileSummaryLabel.Text = customSelected
+            ? _customProfile.Summary
+            : "Custom maker available";
+        _customProfileSummaryLabel.ForeColor = customSelected ? Primary : TextSoft;
     }
 
     private void BuildActionCard()
@@ -938,6 +995,7 @@ public sealed class MainForm : Form
                 output,
                 chapters,
                 profile.Value,
+                _customProfile,
                 language.Value,
                 _selectedButtonFixPath,
                 _dataAddons.ToList());

@@ -47,9 +47,58 @@ public sealed record BuildRequest(
     string OutputDirectory,
     IReadOnlyList<ChapterSource> ChapterSources,
     string GraphicsProfile,
+    CustomProfileSettings? CustomProfile,
     string LanguageCode,
     string? ButtonFixPath,
     IReadOnlyList<DataAddonSource> DataAddons);
+
+public sealed record CustomProfileSettings
+{
+    public string Mode { get; init; } = "easy";
+
+    public string Picture { get; init; } = "sharp";
+    public string Motion { get; init; } = "smooth";
+    public string Gpu { get; init; } = "fastest";
+    public string Effects { get; init; } = "outlines";
+    public string World { get; init; } = "balanced";
+    public string Power { get; init; } = "performance";
+
+    public string Resolution { get; init; } = "720x408";
+    public int FpsCap { get; init; } = 30;
+    public string AdvancedGpu { get; init; } = "sgx540";
+    public string Outlines { get; init; } = "on";
+    public string Shadows { get; init; } = "off";
+    public int Detail { get; init; } = 800;
+    public int DrawDistance { get; init; } = 3500;
+    public string Clock { get; init; } = "444";
+    public string Upscale { get; init; } = "linear";
+    public string Vsync { get; init; } = "on";
+    public string NearestFilter { get; init; } = "off";
+    public string FbfetchZero { get; init; } = "off";
+
+    public string Summary => Mode == "advanced"
+        ? $"Advanced · {Resolution} · {FpsCap} FPS · {AdvancedGpu.ToUpperInvariant()}"
+        : $"Easy · {Cap(Picture)} · {MotionFps(Motion)} FPS · {GpuLabel(Gpu)}";
+
+    private static string Cap(string value) =>
+        string.IsNullOrEmpty(value) ? value : char.ToUpperInvariant(value[0]) + value[1..];
+
+    private static int MotionFps(string motion) => motion switch
+    {
+        "low" => 15,
+        "steady" => 20,
+        _ => 30
+    };
+
+    private static string GpuLabel(string gpu) => gpu switch
+    {
+        "fast" => "SGX541",
+        "medium" => "SGX542",
+        "quality" => "SGX543",
+        "original" => "SGX543MP",
+        _ => "SGX540"
+    };
+}
 
 public sealed record BuildProgress(
     int Percent,

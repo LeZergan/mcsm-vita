@@ -6,13 +6,18 @@ A simple Windows app that creates the exact `ux0:data/mcsm` folder required by t
 
 1. Choose the 32-bit PowerVR `com.telltalegames.minecraft100` v1.37 (`versionCode 40137`) `.apk` file. The manifest and exact supported PowerVR fingerprint are both checked; Mali, Adreno, altered, and older APKs are rejected.
 2. Choose its main `.obb` and patch `.obb`. Both files must match the supported PowerVR data fingerprints. Selecting the main OBB automatically fills the matching `patch.*.obb` beside it, or you can choose the patch manually.
-3. Optionally add Episode 2–8 sources. The app accepts either:
+3. Keep **Default — recommended**, choose a preset, or press **Make custom**. The custom maker offers an Easy mode with six clear choices and an Advanced mode with every supported exact value.
+4. Optionally add Episode 2–8 sources. The app accepts either:
    - the episode folder (including the original `com.telltalegames.minecraft100/files/Net` layout), or
    - a ZIP containing that episode's `.ttarch2` and descriptor `.lua` files.
-4. Choose the output location and press **Build Data Folder**.
-5. Copy the resulting `mcsm` folder to `ux0:data/` with VitaShell.
+5. Choose the output location and press **Build Data Folder**.
+6. Copy the resulting `mcsm` folder to `ux0:data/` with VitaShell.
 
 The app detects episode numbers from their real archive names, flattens episode files into `mcsm/assets`, creates the runtime folders, writes easy-to-edit graphics/game settings, and validates the result before replacing an existing output. Existing output is moved to a timestamped backup instead of being deleted.
+
+### Custom profile maker
+
+The output screen includes **Make custom** beside the profile selector. Saving the dialog automatically selects Custom and writes the chosen Easy or Advanced values into `settings/graphics.txt`. Easy mode covers picture, motion, PowerVR GPU identity, effects, world detail, and CPU power. Advanced mode includes the 60 FPS cap, exact resolution, detail, draw distance, clock, VSync, upscale filter, outlines, shadows, thin-seam filtering, and the white glass/light fix. These remain normal text settings that users can change later.
 
 ### Controller button fix
 
@@ -58,6 +63,7 @@ The self-contained executable is written to `dist/MCSM-Vita-Data-Builder.exe`. T
 
 - APK: the exact supported PowerVR v1.37 (`versionCode 40137`) build of `com.telltalegames.minecraft100`, with all five required ARMv7 libraries.
 - Base data: the exact supported PowerVR main `.obb` plus patch `.obb`; both are required and fingerprint-checked.
+- Graphics: Default (recommended), Performance, Balanced, Quality, Battery, or a builder-created Easy/Advanced Custom profile.
 - Extra episodes: folders or ZIPs containing `.ttarch2` and `.lua` files for Episodes 2–8.
 - Controller fix: a folder/ZIP containing `.d3dtx` files and all four required face-button `.d3dmesh` files.
 - Offline statistics: the supported non-empty `choice.prop` dataset when built into the local EXE.

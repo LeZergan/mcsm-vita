@@ -4,9 +4,10 @@
 #
 #   NORMAL SETUP: change ONE word, save, then restart the game.
 
-profile = performance
+profile = default
 
-#   performance = fastest and recommended
+#   default     = recommended starting point
+#   performance = fastest preset
 #   balanced    = sharper picture with extra visual effects
 #   quality     = best picture; demanding scenes may run slower
 #   battery     = lower power use
@@ -85,6 +86,6 @@ advanced_fbfetch_zero    = off       # on fixes solid-white glass/lights
 #   RESET
 # ============================================================================
 #
-#   Set profile = performance. Both Custom blocks are then ignored.
+#   Set profile = default. Both Custom blocks are then ignored.
 #
 # ============================================================================

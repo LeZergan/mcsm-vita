@@ -615,13 +615,59 @@ public sealed class DataBuilderService
         {
             throw new InvalidDataException("Choose where to create the mcsm folder.");
         }
-        if (!new[] { "performance", "balanced", "quality", "battery" }.Contains(request.GraphicsProfile))
+        if (!new[] { "default", "performance", "balanced", "quality", "battery", "custom" }
+            .Contains(request.GraphicsProfile))
         {
             throw new InvalidDataException("Choose a valid graphics profile.");
         }
+        ValidateCustomProfile(request.CustomProfile ?? new CustomProfileSettings());
         if (!new[] { "en", "fr", "de", "es", "pt", "ru", "zh" }.Contains(request.LanguageCode))
         {
             throw new InvalidDataException("Choose a valid language.");
+        }
+    }
+
+    private static void ValidateCustomProfile(CustomProfileSettings custom)
+    {
+        RequireOption(custom.Mode, ["easy", "advanced"], "custom mode");
+        RequireOption(custom.Picture, ["low", "battery", "fast", "sharp", "quality", "native"], "custom picture");
+        RequireOption(custom.Motion, ["low", "steady", "smooth"], "custom motion");
+        RequireOption(custom.Gpu, ["fastest", "fast", "medium", "quality", "original"], "custom GPU");
+        RequireOption(custom.Effects, ["minimal", "outlines", "full"], "custom effects");
+        RequireOption(custom.World, ["fast", "balanced", "detailed", "unlimited"], "custom world");
+        RequireOption(custom.Power, ["battery", "performance"], "custom power");
+
+        RequireOption(custom.Resolution, ["960x544", "800x452", "720x408", "640x362", "576x326", "480x272"], "advanced resolution");
+        if (custom.FpsCap is not (60 or 30 or 20 or 15))
+        {
+            throw new InvalidDataException("Custom FPS cap must be 60, 30, 20, or 15.");
+        }
+        RequireOption(custom.AdvancedGpu, ["sgx540", "sgx541", "sgx542", "sgx543", "sgx543mp"], "advanced GPU");
+        RequireOnOff(custom.Outlines, "outlines");
+        RequireOnOff(custom.Shadows, "shadows");
+        RequireOnOff(custom.Vsync, "VSync");
+        RequireOnOff(custom.NearestFilter, "seam fix");
+        RequireOnOff(custom.FbfetchZero, "glass/light fix");
+        RequireOption(custom.Clock, ["444", "adaptive"], "clock");
+        RequireOption(custom.Upscale, ["linear", "nearest"], "upscale filter");
+        if (custom.Detail is < 100 or > 1000)
+        {
+            throw new InvalidDataException("Custom detail must be between 100 and 1000.");
+        }
+        if (custom.DrawDistance != 0 && custom.DrawDistance is < 2500 or > 6000)
+        {
+            throw new InvalidDataException("Custom draw distance must be 0 (unlimited) or between 2500 and 6000.");
+        }
+    }
+
+    private static void RequireOnOff(string value, string label) =>
+        RequireOption(value, ["on", "off"], label);
+
+    private static void RequireOption(string value, IReadOnlyCollection<string> allowed, string label)
+    {
+        if (!allowed.Contains(value, StringComparer.Ordinal))
+        {
+            throw new InvalidDataException($"Choose a valid {label} value.");
         }
     }
 
@@ -869,11 +915,35 @@ public sealed class DataBuilderService
         CancellationToken cancellationToken)
     {
         string graphics = await ReadEmbeddedTextAsync("graphics.txt", cancellationToken);
-        graphics = Regex.Replace(
-            graphics,
-            @"(?m)^profile\s*=\s*\S+",
-            $"profile = {request.GraphicsProfile}",
-            RegexOptions.CultureInvariant);
+        graphics = ReplaceSettingValue(graphics, "profile", request.GraphicsProfile);
+
+        CustomProfileSettings custom = request.CustomProfile ?? new CustomProfileSettings();
+        var customValues = new Dictionary<string, string>
+        {
+            ["custom_mode"] = custom.Mode,
+            ["custom_picture"] = custom.Picture,
+            ["custom_motion"] = custom.Motion,
+            ["custom_gpu"] = custom.Gpu,
+            ["custom_effects"] = custom.Effects,
+            ["custom_world"] = custom.World,
+            ["custom_power"] = custom.Power,
+            ["advanced_resolution"] = custom.Resolution,
+            ["advanced_fps_cap"] = custom.FpsCap.ToString(),
+            ["advanced_gpu"] = custom.AdvancedGpu,
+            ["advanced_outlines"] = custom.Outlines,
+            ["advanced_shadows"] = custom.Shadows,
+            ["advanced_detail"] = custom.Detail.ToString(),
+            ["advanced_draw_distance"] = custom.DrawDistance.ToString(),
+            ["advanced_clock"] = custom.Clock,
+            ["advanced_upscale"] = custom.Upscale,
+            ["advanced_vsync"] = custom.Vsync,
+            ["advanced_nearest_filter"] = custom.NearestFilter,
+            ["advanced_fbfetch_zero"] = custom.FbfetchZero
+        };
+        foreach ((string key, string value) in customValues)
+        {
+            graphics = ReplaceSettingValue(graphics, key, value);
+        }
 
         string game = await ReadEmbeddedTextAsync("game.txt", cancellationToken);
         game = Regex.Replace(
@@ -905,7 +975,7 @@ public sealed class DataBuilderService
             "The final Vita path must be: ux0:data\\mcsm\\assets\r\n\r\n" +
             $"Detected episodes: {episodeText}\r\n" +
             $"Base OBBs: main + patch included\r\n" +
-            $"Graphics profile: {request.GraphicsProfile}\r\n" +
+            $"Graphics profile: {FormatGraphicsProfile(request)}\r\n" +
             $"Language: {request.LanguageCode}\r\n" +
             $"Controller button fix: {(buttonFix is null ? "not supplied" : $"included ({buttonFix.FileCount} assets)")}\r\n" +
             $"Offline choice statistics: {(choiceData is null ? "not supplied" : "included")}\r\n" +
@@ -918,6 +988,23 @@ public sealed class DataBuilderService
             readyText,
             new UTF8Encoding(false),
             cancellationToken);
+    }
+
+    private static string ReplaceSettingValue(string text, string key, string value) =>
+        Regex.Replace(
+            text,
+            $@"(?m)^({Regex.Escape(key)}\s*=\s*)\S+",
+            match => match.Groups[1].Value + value,
+            RegexOptions.CultureInvariant);
+
+    private static string FormatGraphicsProfile(BuildRequest request)
+    {
+        if (!request.GraphicsProfile.Equals("custom", StringComparison.Ordinal))
+        {
+            return request.GraphicsProfile;
+        }
+        CustomProfileSettings custom = request.CustomProfile ?? new CustomProfileSettings();
+        return $"custom ({custom.Summary})";
     }
 
     private static async Task<string> ReadEmbeddedTextAsync(string fileName, CancellationToken cancellationToken)

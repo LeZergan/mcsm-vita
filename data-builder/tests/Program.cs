@@ -38,6 +38,22 @@ if (args.Length == 2 && args[0].Equals("--render-extras", StringComparison.Ordin
     return 0;
 }
 
+if (args.Length == 2 && args[0].Equals("--render-custom", StringComparison.OrdinalIgnoreCase))
+{
+    RenderForm(args[1], () => new CustomProfileDialog(new CustomProfileSettings()));
+    Console.WriteLine($"Rendered easy custom-profile preview: {args[1]}");
+    return 0;
+}
+
+if (args.Length == 2 && args[0].Equals("--render-custom-advanced", StringComparison.OrdinalIgnoreCase))
+{
+    RenderForm(
+        args[1],
+        () => new CustomProfileDialog(new CustomProfileSettings { Mode = "advanced" }));
+    Console.WriteLine($"Rendered advanced custom-profile preview: {args[1]}");
+    return 0;
+}
+
 string root = Path.Combine(Path.GetTempPath(), $"mcsm-data-builder-smoke-{Guid.NewGuid():N}");
 try
 {
@@ -243,7 +259,23 @@ try
         patchObb,
         output,
         [source2, source3],
-        "balanced",
+        "custom",
+        new CustomProfileSettings
+        {
+            Mode = "advanced",
+            Resolution = "640x362",
+            FpsCap = 60,
+            AdvancedGpu = "sgx541",
+            Outlines = "off",
+            Shadows = "off",
+            Detail = 650,
+            DrawDistance = 3000,
+            Clock = "444",
+            Upscale = "nearest",
+            Vsync = "off",
+            NearestFilter = "on",
+            FbfetchZero = "on"
+        },
         "ru",
         buttonFix,
         [addonFolder, addonZip]);
@@ -304,8 +336,15 @@ try
 
     string graphics = await File.ReadAllTextAsync(Path.Combine(output, "settings", "graphics.txt"));
     string game = await File.ReadAllTextAsync(Path.Combine(output, "settings", "game.txt"));
-    Assert(graphics.Contains("profile = balanced"), "Selected graphics profile was not written.");
-    Assert(graphics.Contains("advanced_fps_cap         = 30        # 60 | 30 | 20 | 15"), "Advanced 60 FPS choice is missing.");
+    Assert(graphics.Contains("profile = custom"), "Selected custom graphics profile was not written.");
+    Assert(graphics.Contains("custom_mode = advanced"), "Custom profile mode was not written.");
+    Assert(graphics.Contains("advanced_resolution      = 640x362"), "Custom resolution was not written.");
+    Assert(graphics.Contains("advanced_fps_cap         = 60"), "Custom 60 FPS cap was not written.");
+    Assert(graphics.Contains("advanced_gpu             = sgx541"), "Custom PowerVR GPU name was not written.");
+    Assert(graphics.Contains("advanced_detail          = 650"), "Custom detail was not written.");
+    Assert(graphics.Contains("advanced_draw_distance   = 3000"), "Custom draw distance was not written.");
+    Assert(graphics.Contains("advanced_nearest_filter  = on"), "Custom seam fix was not written.");
+    Assert(graphics.Contains("advanced_fbfetch_zero    = on"), "Custom glass/light fix was not written.");
     Assert(!graphics.Contains("toon", StringComparison.OrdinalIgnoreCase), "Removed wording returned.");
     Assert(game.Contains("language = ru"), "Selected language was not written.");
     Assert(game.Contains("chapters = auto"), "Episode auto-detection is not enabled.");
@@ -313,19 +352,22 @@ try
     ButtonFixBundle? embeddedFix = DataBuilderService.InspectBundledButtonFix();
     BuildRequest embeddedRequest = request with
     {
+        GraphicsProfile = "default",
         ButtonFixPath = null,
         DataAddons = []
     };
     BuildResult second = await builder.BuildAsync(embeddedRequest);
     Assert(second.BackupDirectory is not null && Directory.Exists(second.BackupDirectory), "Existing output was not preserved as a backup.");
     Assert(second.ButtonFixFileCount == (embeddedFix?.FileCount ?? 0), "Built-in controller fix count is wrong.");
+    string defaultGraphics = await File.ReadAllTextAsync(Path.Combine(output, "settings", "graphics.txt"));
+    Assert(defaultGraphics.Contains("profile = default"), "Recommended default profile was not written.");
     if (embeddedFix is not null)
     {
         Assert(File.Exists(Path.Combine(output, "assets", embeddedFix.Assets[0].Name)), "Built-in controller fix was not extracted.");
     }
     Assert(File.Exists(Path.Combine(output, "DATA_FOLDER_READY.txt")), "Final ready marker is missing.");
 
-    Console.WriteLine("PASS: exact PowerVR fingerprints + strict v1.37 manifest, OBB validation, extraction, chapters, controller fixes, offline choice data, experimental add-ons, settings, and backups.");
+    Console.WriteLine("PASS: PowerVR/version checks, custom-profile output, recommended default, OBB extraction, chapters, controller fixes, offline choice data, add-ons, settings, and backups.");
     return 0;
 }
 catch (Exception exception)
