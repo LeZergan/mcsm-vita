@@ -51,7 +51,7 @@ public sealed class MainForm : Form
 
     public MainForm()
     {
-        Text = "MCSM Vita Data Builder";
+        Text = "MCSM Vita Data Builder  •  v1.2";
         StartPosition = FormStartPosition.CenterScreen;
         MinimumSize = new Size(900, 760);
         Size = new Size(1040, 1000);
@@ -59,6 +59,8 @@ public sealed class MainForm : Form
         ForeColor = TextMain;
         Font = new Font("Segoe UI", 9.5f);
         AllowDrop = true;
+        DoubleBuffered = true;
+        HandleCreated += (_, _) => WindowStyling.ApplyDarkTitleBar(this);
         DragEnter += OnDragEnter;
         DragDrop += OnDragDrop;
 
@@ -87,7 +89,11 @@ public sealed class MainForm : Form
         UpdateReadyState();
 
         Resize += (_, _) => ResizeWidePanels();
-        Shown += (_, _) => ResizeWidePanels();
+        Shown += (_, _) =>
+        {
+            ResizeWidePanels();
+            WindowStyling.ApplyDarkTitleBar(this);
+        };
         FormClosing += OnFormClosing;
     }
 
@@ -115,7 +121,7 @@ public sealed class MainForm : Form
         Label badge = new()
         {
             AutoSize = true,
-            Text = "  MCSM  •  PS VITA  ",
+            Text = "  MCSM  •  PS VITA  •  BUILDER 1.2  ",
             Font = new Font("Segoe UI Semibold", 8.5f),
             ForeColor = Primary,
             BackColor = Color.FromArgb(18, 64, 54),
@@ -372,9 +378,11 @@ public sealed class MainForm : Form
         _buildButton.Click += async (_, _) => await BuildDataAsync();
         ConfigureGhostButton(_cancelButton, "Cancel", 0, 116, 98);
         _cancelButton.Enabled = false;
+        _cancelButton.Visible = false;
         _cancelButton.Click += (_, _) => _buildCancellation?.Cancel();
         ConfigureGhostButton(_openButton, "Open result", 0, 116, 104);
         _openButton.Enabled = false;
+        _openButton.Visible = false;
         _openButton.Click += (_, _) => OpenLastResult();
 
         void ResizeFields()
@@ -862,6 +870,11 @@ public sealed class MainForm : Form
         {
             return;
         }
+        if (!InputsLookReady())
+        {
+            UpdateReadyState();
+            return;
+        }
 
         string output = _outputBox.Text.Trim();
         if (_dataAddons.Count > 0)
@@ -970,9 +983,11 @@ public sealed class MainForm : Form
         {
             input.Enabled = !busy;
         }
-        _buildButton.Enabled = !busy && InputsLookReady();
+        SetBuildButtonState(!busy && InputsLookReady(), busy);
         _cancelButton.Enabled = busy;
+        _cancelButton.Visible = busy;
         _openButton.Enabled = !busy && _lastResult is not null;
+        _openButton.Visible = !busy && _lastResult is not null;
         UseWaitCursor = false;
     }
 
@@ -983,7 +998,7 @@ public sealed class MainForm : Form
             return;
         }
         bool ready = InputsLookReady();
-        _buildButton.Enabled = ready;
+        SetBuildButtonState(ready, busy: false);
         if (ready)
         {
             SetStatus("All 3 base files passed. Ready to build safely.", Primary);
@@ -1011,6 +1026,24 @@ public sealed class MainForm : Form
         && PathsMatch(_validatedMainObbPath, _obbBox.Text)
         && PathsMatch(_validatedPatchObbPath, _patchObbBox.Text)
         && !string.IsNullOrWhiteSpace(_outputBox.Text);
+
+    private void SetBuildButtonState(bool ready, bool busy)
+    {
+        _buildButton.Enabled = true;
+        _buildButton.Visible = !busy;
+        _buildButton.TabStop = ready;
+        _buildButton.Text = busy
+            ? "BUILDING…"
+            : ready
+                ? "BUILD DATA FOLDER"
+                : "ADD REQUIRED FILES";
+        _buildButton.BackColor = ready ? Primary : Color.FromArgb(30, 41, 59);
+        _buildButton.ForeColor = ready ? Color.FromArgb(5, 46, 22) : TextSoft;
+        _buildButton.Cursor = ready ? Cursors.Hand : Cursors.Default;
+        _buildButton.AccessibleDescription = ready
+            ? "Build the validated Vita data folder"
+            : "Add the required APK, main OBB, and patch OBB first";
+    }
 
     private void UpdateBaseNote()
     {

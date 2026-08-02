@@ -10,6 +10,11 @@ $testProject = Join-Path $projectRoot "tests\MCSMDataBuilder.SmokeTests.csproj"
 $output = Join-Path $projectRoot "dist"
 $localAssets = Join-Path $projectRoot "LocalAssets"
 $buttonFixPack = Join-Path $localAssets "button-fix.zip"
+$appIcon = Join-Path $localAssets "app-icon.ico"
+$iconPreview = Join-Path $output "app-icon-preview.png"
+
+& (Join-Path $projectRoot "generate-icon.ps1") -OutputPath $appIcon -PreviewPath $iconPreview
+Write-Host "Generated the branded builder icon."
 
 if ($ButtonFixPath) {
     $resolvedFix = Resolve-Path -LiteralPath $ButtonFixPath -ErrorAction Stop

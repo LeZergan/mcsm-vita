@@ -41,6 +41,9 @@ public sealed class ExtrasDialog : Form
         BackColor = Page;
         ForeColor = TextMain;
         Font = new Font("Segoe UI", 9.5f);
+        DoubleBuffered = true;
+        HandleCreated += (_, _) => WindowStyling.ApplyDarkTitleBar(this);
+        Shown += (_, _) => WindowStyling.ApplyDarkTitleBar(this);
 
         BuildUi();
         RefreshFixStatus();
