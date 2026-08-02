@@ -56,10 +56,10 @@ public sealed class MainForm : Form
 
     public MainForm()
     {
-        Text = "MCSM Vita Data Builder  •  v1.4";
+        Text = "MCSM Vita Data Builder  •  v1.5";
         StartPosition = FormStartPosition.CenterScreen;
-        MinimumSize = new Size(900, 760);
-        Size = new Size(1040, 950);
+        MinimumSize = new Size(860, 720);
+        Size = new Size(1020, 850);
         BackColor = Page;
         ForeColor = TextMain;
         Font = new Font("Segoe UI", 9.5f);
@@ -116,7 +116,7 @@ public sealed class MainForm : Form
         _page.FlowDirection = FlowDirection.TopDown;
         _page.WrapContents = false;
         _page.AutoScroll = true;
-        _page.Padding = new Padding(30, 18, 30, 18);
+        _page.Padding = new Padding(24, 14, 24, 14);
         _page.BackColor = Page;
         Controls.Add(_page);
     }
@@ -125,87 +125,82 @@ public sealed class MainForm : Form
     {
         Panel header = new()
         {
-            Height = 88,
+            Height = 64,
             Margin = new Padding(0, 0, 0, 8),
             BackColor = Page
         };
         _widePanels.Add(header);
 
-        Label badge = new()
-        {
-            AutoSize = true,
-            Text = "  MCSM VITA BUILDER 1.4  ",
-            Font = new Font("Segoe UI Semibold", 8.5f),
-            ForeColor = Primary,
-            BackColor = Color.FromArgb(18, 64, 54),
-            Location = new Point(2, 2),
-            Padding = new Padding(5, 4, 5, 4)
-        };
         Label title = new()
         {
             AutoSize = true,
-            Text = "Build Vita data",
-            Font = new Font("Segoe UI Semibold", 22f),
+            Text = "Build Vita game data",
+            Font = new Font("Segoe UI Semibold", 21f),
             ForeColor = TextMain,
-            Location = new Point(0, 28)
+            Location = new Point(0, 0)
         };
         Label subtitle = new()
         {
             AutoSize = true,
-            Text = "Choose the APK and two OBBs. The tool checks them and creates the complete mcsm folder.",
-            Font = new Font("Segoe UI", 10f),
+            Text = "Verified PowerVR setup  •  outputs ux0:data\\mcsm",
+            Font = new Font("Segoe UI", 9.2f),
             ForeColor = TextSoft,
-            Location = new Point(3, 68)
+            Location = new Point(2, 39)
         };
         Label localOnly = new()
         {
             AutoSize = true,
-            Text = "OFFLINE  •  NOTHING IS UPLOADED",
+            Text = "v1.5  •  LOCAL / OFFLINE",
             Font = new Font("Segoe UI Semibold", 8f),
             ForeColor = Info,
-            Location = new Point(626, 8),
+            Location = new Point(626, 10),
             Anchor = AnchorStyles.Top | AnchorStyles.Right
         };
         header.SizeChanged += (_, _) => localOnly.Left = Math.Max(420, header.ClientSize.Width - localOnly.Width - 2);
-        header.Controls.AddRange([badge, title, subtitle, localOnly]);
+        header.Controls.AddRange([title, subtitle, localOnly]);
         _page.Controls.Add(header);
     }
 
     private void BuildSourceCard()
     {
         Panel card = CreateCard(
-            "1",
             "Game files",
-            "Only the exact PowerVR v1.37 game set is accepted. Mali and Adreno files are blocked.",
-            236);
+            "Exact PowerVR v1.37 APK + matching main and patch OBB. All checks happen locally.",
+            218);
+        Button scanFolderButton = CreateSecondaryButton("Scan folder", 0, 13, 104);
+        scanFolderButton.ForeColor = Primary;
+        scanFolderButton.Click += async (_, _) => await BrowseSetupFolderAsync();
+        _toolTip.SetToolTip(
+            scanFolderButton,
+            "Find the supported APK, both OBBs, and recognizable Episode 2–8 files inside one folder.");
 
         Label apkLabel = CreateFieldLabel("POWERVR APK  ·  v1.37 ONLY", 24, 68);
         ConfigureInputState(_apkValidationLabel, 250, 66, "NOT SELECTED");
         ConfigurePathBox(_apkBox, 24, 84, "Choose or drop the PowerVR .apk");
-        Button apkButton = CreateSecondaryButton("Choose APK", 0, 82, 116);
+        Button apkButton = CreateSecondaryButton("Browse", 0, 82, 104);
         apkButton.Click += async (_, _) => await BrowseApkAsync();
 
         Label obbLabel = CreateFieldLabel("MAIN OBB", 24, 112);
         ConfigureInputState(_mainObbValidationLabel, 250, 110, "NOT SELECTED");
         ConfigurePathBox(_obbBox, 24, 128, "Choose or drop the main .obb");
-        Button obbButton = CreateSecondaryButton("Choose OBB", 0, 126, 116);
+        Button obbButton = CreateSecondaryButton("Browse", 0, 126, 104);
         obbButton.Click += async (_, _) => await BrowseMainObbAsync();
 
         Label patchObbLabel = CreateFieldLabel("PATCH OBB", 24, 156);
         ConfigureInputState(_patchObbValidationLabel, 250, 154, "NOT SELECTED");
         ConfigurePathBox(_patchObbBox, 24, 172, "Auto-detected beside the main OBB, or choose it");
-        Button patchObbButton = CreateSecondaryButton("Choose OBB", 0, 170, 116);
+        Button patchObbButton = CreateSecondaryButton("Browse", 0, 170, 104);
         patchObbButton.Click += async (_, _) => await BrowsePatchObbAsync();
 
         _baseNoteLabel.AutoSize = false;
         _baseNoteLabel.Font = new Font("Segoe UI", 8.5f);
         _baseNoteLabel.ForeColor = TextSoft;
-        _baseNoteLabel.Location = new Point(24, 208);
+        _baseNoteLabel.Location = new Point(24, 195);
         _baseNoteLabel.Height = 20;
 
         void ResizeFields()
         {
-            int buttonX = card.ClientSize.Width - 140;
+            int buttonX = card.ClientSize.Width - 128;
             int boxWidth = Math.Max(300, buttonX - 42);
             _apkBox.Width = boxWidth;
             _obbBox.Width = boxWidth;
@@ -213,6 +208,7 @@ public sealed class MainForm : Form
             apkButton.Left = buttonX;
             obbButton.Left = buttonX;
             patchObbButton.Left = buttonX;
+            scanFolderButton.Left = buttonX;
             int stateWidth = Math.Max(180, card.ClientSize.Width - 274);
             _apkValidationLabel.Width = stateWidth;
             _mainObbValidationLabel.Width = stateWidth;
@@ -247,8 +243,12 @@ public sealed class MainForm : Form
             UpdateBaseNote();
             UpdateReadyState();
         };
-        _inputs.AddRange([_apkBox, _obbBox, _patchObbBox, apkButton, obbButton, patchObbButton]);
+        _inputs.AddRange([
+            _apkBox, _obbBox, _patchObbBox,
+            scanFolderButton, apkButton, obbButton, patchObbButton
+        ]);
         card.Controls.AddRange([
+            scanFolderButton,
             apkLabel, _apkValidationLabel, _apkBox, apkButton,
             obbLabel, _mainObbValidationLabel, _obbBox, obbButton,
             patchObbLabel, _patchObbValidationLabel, _patchObbBox, patchObbButton,
@@ -260,22 +260,21 @@ public sealed class MainForm : Form
     private void BuildChapterCard()
     {
         Panel card = CreateCard(
-            "2",
-            "Optional content",
-            "Skip this for Episode 1. Add Episodes 2–8 only if you own their Android files.",
-            176);
+            "Episodes and extras",
+            "Episode 1 is included. Add owned Episodes 2–8 only if needed.",
+            166);
 
-        _chapterList.Location = new Point(24, 76);
-        _chapterList.Height = 68;
+        _chapterList.Location = new Point(24, 68);
+        _chapterList.Height = 59;
         _chapterList.BackColor = Field;
         _chapterList.ForeColor = TextMain;
         _chapterList.BorderStyle = BorderStyle.FixedSingle;
         _chapterList.Font = new Font("Segoe UI", 9.5f);
         _chapterList.IntegralHeight = false;
 
-        Button addFolder = CreateSecondaryButton("Episode folder", 0, 76, 116);
-        Button addZip = CreateSecondaryButton("Episode ZIP", 0, 112, 116);
-        Button remove = CreateGhostButton("Remove", 24, 146, 76);
+        Button addFolder = CreateSecondaryButton("Add folder", 0, 68, 104);
+        Button addZip = CreateSecondaryButton("Add ZIP", 0, 103, 104);
+        Button remove = CreateGhostButton("Remove", 24, 132, 72);
         addFolder.Click += async (_, _) => await BrowseChapterFolderAsync();
         addZip.Click += async (_, _) => await BrowseChapterZipAsync();
         remove.Click += (_, _) =>
@@ -292,16 +291,16 @@ public sealed class MainForm : Form
         _extrasSummaryLabel.Text = "Episode 1 only";
         _extrasSummaryLabel.ForeColor = TextSoft;
         _extrasSummaryLabel.Font = new Font("Segoe UI", 8.5f);
-        _extrasSummaryLabel.Location = new Point(108, 150);
+        _extrasSummaryLabel.Location = new Point(102, 136);
         _extrasSummaryLabel.Height = 18;
 
-        Button extras = CreateGhostButton("Fixes / mods", 0, 146, 116);
+        Button extras = CreateGhostButton("Fixes / mods", 0, 132, 104);
         extras.ForeColor = Warning;
         extras.Click += (_, _) => OpenExtrasDialog();
 
         void ResizeFields()
         {
-            int buttonX = card.ClientSize.Width - 140;
+            int buttonX = card.ClientSize.Width - 128;
             _chapterList.Width = Math.Max(300, buttonX - 42);
             addFolder.Left = buttonX;
             addZip.Left = buttonX;
@@ -318,18 +317,17 @@ public sealed class MainForm : Form
     private void BuildOutputCard()
     {
         Panel card = CreateCard(
-            "3",
-            "Output and defaults",
-            "The finished folder is always named mcsm. Copy it to ux0:data\\ on your Vita.",
-            190);
+            "Output and settings",
+            "Choose the destination, graphics profile, and text language.",
+            178);
 
-        Label outputLabel = CreateFieldLabel("OUTPUT FOLDER", 24, 77);
-        ConfigurePathBox(_outputBox, 24, 99, "Choose where the finished mcsm folder should be created");
-        Button outputButton = CreateSecondaryButton("Choose folder", 0, 97, 116);
+        Label outputLabel = CreateFieldLabel("OUTPUT · ALWAYS NAMED MCSM", 24, 68);
+        ConfigurePathBox(_outputBox, 24, 85, "Choose where the finished mcsm folder should be created");
+        Button outputButton = CreateSecondaryButton("Browse", 0, 83, 104);
         outputButton.Click += (_, _) => BrowseOutput();
 
-        Label profileLabel = CreateFieldLabel("STARTING PROFILE", 24, 138);
-        ConfigureCombo(_profileBox, 24, 158, 220);
+        Label profileLabel = CreateFieldLabel("GRAPHICS PROFILE", 24, 123);
+        ConfigureCombo(_profileBox, 24, 142, 220);
         _profileBox.Items.AddRange([
             new Choice("Default — recommended", "default"),
             new Choice("Performance — fastest", "performance"),
@@ -339,11 +337,11 @@ public sealed class MainForm : Form
             new Choice("Custom — make your own", "custom")
         ]);
 
-        ConfigureSecondaryButton(_customizeProfileButton, "Make custom", 252, 156, 124);
+        ConfigureSecondaryButton(_customizeProfileButton, "Make custom", 252, 140, 124);
         _customizeProfileButton.Click += (_, _) => OpenCustomProfileDialog();
 
-        Label languageLabel = CreateFieldLabel("TEXT LANGUAGE", 398, 138);
-        ConfigureCombo(_languageBox, 398, 158, 166);
+        Label languageLabel = CreateFieldLabel("TEXT LANGUAGE", 398, 123);
+        ConfigureCombo(_languageBox, 398, 142, 166);
         _languageBox.Items.AddRange([
             new Choice("English", "en"),
             new Choice("French", "fr"),
@@ -355,7 +353,7 @@ public sealed class MainForm : Form
         ]);
 
         _customProfileSummaryLabel.AutoSize = false;
-        _customProfileSummaryLabel.Location = new Point(586, 151);
+        _customProfileSummaryLabel.Location = new Point(586, 135);
         _customProfileSummaryLabel.Size = new Size(320, 36);
         _customProfileSummaryLabel.TextAlign = ContentAlignment.MiddleLeft;
         _customProfileSummaryLabel.Font = new Font("Segoe UI Semibold", 8.2f);
@@ -363,7 +361,7 @@ public sealed class MainForm : Form
 
         void ResizeFields()
         {
-            int buttonX = card.ClientSize.Width - 140;
+            int buttonX = card.ClientSize.Width - 128;
             _outputBox.Width = Math.Max(300, buttonX - 42);
             outputButton.Left = buttonX;
             _customProfileSummaryLabel.Width = Math.Max(150, card.ClientSize.Width - 610);
@@ -394,6 +392,35 @@ public sealed class MainForm : Form
         UpdateCustomProfileUi();
     }
 
+    internal void ApplyReadyPreview()
+    {
+        string apk = @"C:\Game files\Minecraft-Story-Mode-v1-37-PowerVR.apk";
+        string main = @"C:\Game files\main.40129.com.telltalegames.minecraft100.obb";
+        string patch = @"C:\Game files\patch.40135.com.telltalegames.minecraft100.obb";
+        _apkBox.Text = apk;
+        _obbBox.Text = main;
+        _patchObbBox.Text = patch;
+        _validatedApkPath = apk;
+        _validatedMainObbPath = main;
+        _validatedPatchObbPath = patch;
+        SetInputState(_apkValidationLabel, "VERIFIED  •  v1.37 / 40137", Primary, "✓");
+        SetInputState(
+            _mainObbValidationLabel,
+            $"VERIFIED  •  {FormatBytes(DataBuilderService.SupportedMainObbBytes)}",
+            Primary,
+            "✓");
+        SetInputState(
+            _patchObbValidationLabel,
+            $"AUTO  •  VERIFIED  •  {FormatBytes(DataBuilderService.SupportedPatchObbBytes)}",
+            Primary,
+            "✓");
+        SelectProfile("custom");
+        UpdateCustomProfileUi();
+        UpdateBaseNote();
+        UpdateOptionalSummary();
+        UpdateReadyState();
+    }
+
     private void SelectProfile(string value)
     {
         for (int index = 0; index < _profileBox.Items.Count; index++)
@@ -422,45 +449,48 @@ public sealed class MainForm : Form
 
     private void BuildActionCard()
     {
-        Panel card = CreateCard("✓", "Build", "Your selected APK and OBB files are never modified.", 146);
+        Panel card = CreateCard(
+            "Build data folder",
+            "Files stay local. Your selected APK and OBB files are never modified.",
+            112);
 
         _statusLabel.AutoSize = false;
-        _statusLabel.Location = new Point(24, 74);
-        _statusLabel.Size = new Size(480, 26);
-        _statusLabel.Font = new Font("Segoe UI Semibold", 10f);
+        _statusLabel.Location = new Point(24, 64);
+        _statusLabel.Size = new Size(480, 22);
+        _statusLabel.Font = new Font("Segoe UI Semibold", 9.4f);
         _statusLabel.ForeColor = TextSoft;
 
-        _progress.Location = new Point(24, 104);
-        _progress.Height = 6;
+        _progress.Location = new Point(24, 89);
+        _progress.Height = 5;
         _progress.Value = 0;
 
         _progressDetail.AutoSize = false;
-        _progressDetail.Location = new Point(24, 115);
-        _progressDetail.Size = new Size(500, 22);
-        _progressDetail.Font = new Font("Segoe UI", 8.5f);
+        _progressDetail.Location = new Point(24, 95);
+        _progressDetail.Size = new Size(500, 15);
+        _progressDetail.Font = new Font("Segoe UI", 8f);
         _progressDetail.ForeColor = TextSoft;
 
-        ConfigurePrimaryButton(_buildButton, "BUILD DATA FOLDER", 0, 78, 210);
+        ConfigurePrimaryButton(_buildButton, "BUILD DATA FOLDER", 0, 62, 194);
         _buildButton.Click += async (_, _) => await BuildDataAsync();
-        ConfigureGhostButton(_cancelButton, "Cancel", 0, 116, 98);
+        ConfigureGhostButton(_cancelButton, "Cancel", 0, 66, 92);
         _cancelButton.Enabled = false;
         _cancelButton.Visible = false;
         _cancelButton.Click += (_, _) => _buildCancellation?.Cancel();
-        ConfigureGhostButton(_openButton, "Open result", 0, 116, 104);
+        ConfigureGhostButton(_openButton, "Open result", 0, 66, 102);
         _openButton.Enabled = false;
         _openButton.Visible = false;
         _openButton.Click += (_, _) => OpenLastResult();
 
         void ResizeFields()
         {
-            int actionX = card.ClientSize.Width - 234;
+            int actionX = card.ClientSize.Width - 218;
             int leftWidth = Math.Max(360, actionX - 42);
             _statusLabel.Width = leftWidth;
             _progress.Width = leftWidth;
             _progressDetail.Width = leftWidth;
             _buildButton.Left = actionX;
             _cancelButton.Left = actionX;
-            _openButton.Left = actionX + 106;
+            _openButton.Left = actionX + 96;
         }
         card.SizeChanged += (_, _) => ResizeFields();
 
@@ -471,7 +501,7 @@ public sealed class MainForm : Form
         ResizeFields();
     }
 
-    private Panel CreateCard(string number, string title, string subtitle, int height)
+    private Panel CreateCard(string title, string subtitle, int height)
     {
         Panel card = new()
         {
@@ -486,36 +516,26 @@ public sealed class MainForm : Form
             e.Graphics.DrawRectangle(pen, 0, 0, card.ClientSize.Width - 1, card.ClientSize.Height - 1);
         };
 
-        Label badge = new()
-        {
-            Text = number,
-            TextAlign = ContentAlignment.MiddleCenter,
-            Font = new Font("Segoe UI Semibold", 12f),
-            ForeColor = Primary,
-            BackColor = PrimaryDark,
-            Location = new Point(24, 21),
-            Size = new Size(36, 36)
-        };
         Label heading = new()
         {
             AutoSize = true,
             Text = title,
-            Font = new Font("Segoe UI Semibold", 14f),
+            Font = new Font("Segoe UI Semibold", 12.8f),
             ForeColor = TextMain,
-            Location = new Point(72, 17)
+            Location = new Point(24, 14)
         };
         Label description = new()
         {
             AutoSize = false,
             Text = subtitle,
-            Font = new Font("Segoe UI", 9f),
+            Font = new Font("Segoe UI", 8.7f),
             ForeColor = TextSoft,
-            Location = new Point(74, 45),
-            Height = 28,
+            Location = new Point(25, 39),
+            Height = 24,
             Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right
         };
-        card.SizeChanged += (_, _) => description.Width = Math.Max(100, card.ClientSize.Width - 98);
-        card.Controls.AddRange([badge, heading, description]);
+        card.SizeChanged += (_, _) => description.Width = Math.Max(100, card.ClientSize.Width - 50);
+        card.Controls.AddRange([heading, description]);
         _widePanels.Add(card);
         _page.Controls.Add(card);
         return card;
@@ -668,6 +688,81 @@ public sealed class MainForm : Form
         }
     }
 
+    private async Task BrowseSetupFolderAsync()
+    {
+        using FolderBrowserDialog dialog = new()
+        {
+            Description = "Choose a folder containing your MCSM APK, OBBs, and optional episode files",
+            UseDescriptionForTitle = true,
+            ShowNewFolderButton = false
+        };
+        if (dialog.ShowDialog(this) != DialogResult.OK)
+        {
+            return;
+        }
+
+        try
+        {
+            UseWaitCursor = true;
+            SetStatus("Scanning the selected folder…", Info);
+            SetupFolderScanResult found = await Task.Run(() => SetupFolderScanner.Scan(dialog.SelectedPath));
+
+            if (found.ApkPath is not null)
+            {
+                await SelectApkAsync(found.ApkPath);
+            }
+            if (found.MainObbPath is not null)
+            {
+                await SelectMainObbAsync(found.MainObbPath, found.PatchObbPath, useStandaloneCheck: true);
+            }
+            else if (found.PatchObbPath is not null)
+            {
+                await SelectPatchObbAsync(found.PatchObbPath, detectedAutomatically: true);
+            }
+
+            var existingEpisodes = _chapterList.Items.Cast<ChapterSource>()
+                .SelectMany(source => source.Episodes)
+                .ToHashSet();
+            foreach (ChapterSource chapter in found.Chapters)
+            {
+                if (chapter.Episodes.Any(existingEpisodes.Contains))
+                {
+                    continue;
+                }
+                _chapterList.Items.Add(chapter);
+                foreach (int episode in chapter.Episodes)
+                {
+                    existingEpisodes.Add(episode);
+                }
+            }
+            UpdateOptionalSummary();
+            UpdateReadyState();
+
+            var missing = new List<string>();
+            if (found.ApkPath is null) missing.Add("supported PowerVR v1.37 APK");
+            if (found.MainObbPath is null) missing.Add("matching main OBB");
+            if (found.PatchObbPath is null) missing.Add("matching patch OBB");
+            if (missing.Count > 0)
+            {
+                MessageBox.Show(
+                    this,
+                    "The scan filled everything it could find. Still needed:\n\n• " + string.Join("\n• ", missing),
+                    "Folder scan incomplete",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Information);
+            }
+        }
+        catch (Exception exception)
+        {
+            MessageBox.Show(this, exception.Message, "Folder scan failed", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            UpdateReadyState();
+        }
+        finally
+        {
+            UseWaitCursor = false;
+        }
+    }
+
     private async Task BrowseMainObbAsync()
     {
         using OpenFileDialog dialog = new()
@@ -720,7 +815,7 @@ public sealed class MainForm : Form
             _validatedApkPath = fullPath;
             SetInputState(
                 _apkValidationLabel,
-                $"PowerVR verified  •  v{layout.VersionName} ({layout.VersionCode})",
+                $"VERIFIED  •  v{layout.VersionName} / {layout.VersionCode}",
                 Primary,
                 "✓");
             _toolTip.SetToolTip(
@@ -736,7 +831,10 @@ public sealed class MainForm : Form
         UpdateReadyState();
     }
 
-    private async Task SelectMainObbAsync(string path)
+    private async Task SelectMainObbAsync(
+        string path,
+        string? preferredPatchPath = null,
+        bool useStandaloneCheck = false)
     {
         string fullPath = Path.GetFullPath(path);
         _validatedMainObbPath = null;
@@ -746,7 +844,9 @@ public sealed class MainForm : Form
 
         try
         {
-            ObbLayout layout = await Task.Run(() => DataBuilderService.InspectMainObb(fullPath));
+            ObbLayout layout = await Task.Run(() => useStandaloneCheck
+                ? DataBuilderService.InspectSupportedMainObbStandalone(fullPath)
+                : DataBuilderService.InspectMainObb(fullPath));
             if (!PathsMatch(fullPath, _obbBox.Text))
             {
                 return;
@@ -754,7 +854,7 @@ public sealed class MainForm : Form
             _validatedMainObbPath = fullPath;
             SetInputState(
                 _mainObbValidationLabel,
-                $"PowerVR verified  •  {FormatBytes(layout.TotalBytes)}",
+                $"VERIFIED  •  {FormatBytes(layout.TotalBytes)}",
                 Primary,
                 "✓");
 
@@ -764,7 +864,11 @@ public sealed class MainForm : Form
                 SetInputState(_patchObbValidationLabel, "Choose a different file", Warning, "!");
             }
 
-            if (layout.PatchPath is not null && !PathsMatch(layout.PatchPath, _patchObbBox.Text))
+            if (preferredPatchPath is not null && !PathsMatch(preferredPatchPath, _patchObbBox.Text))
+            {
+                await SelectPatchObbAsync(preferredPatchPath, detectedAutomatically: true);
+            }
+            else if (layout.PatchPath is not null && !PathsMatch(layout.PatchPath, _patchObbBox.Text))
             {
                 await SelectPatchObbAsync(layout.PatchPath, detectedAutomatically: true);
             }
@@ -802,7 +906,7 @@ public sealed class MainForm : Form
                 return;
             }
             _validatedPatchObbPath = fullPath;
-            string source = detectedAutomatically ? "Auto-detected + verified" : "PowerVR verified";
+            string source = detectedAutomatically ? "AUTO  •  VERIFIED" : "VERIFIED";
             SetInputState(
                 _patchObbValidationLabel,
                 $"{source}  •  {FormatBytes(layout.TotalBytes)}",
@@ -1073,19 +1177,19 @@ public sealed class MainForm : Form
         SetBuildButtonState(ready, busy: false);
         if (ready)
         {
-            SetStatus("Exact PowerVR base set verified. Ready to build.", Primary);
+            SetStatus("PowerVR base set verified. Ready.", Primary);
         }
         else if (!PathsMatch(_validatedApkPath, _apkBox.Text))
         {
-            SetStatus("Start with the required 32-bit PowerVR .apk.", TextSoft);
+            SetStatus("Choose a setup folder, or start with the PowerVR APK.", TextSoft);
         }
         else if (!PathsMatch(_validatedMainObbPath, _obbBox.Text))
         {
-            SetStatus("PowerVR APK verified — now add the main .obb.", TextSoft);
+            SetStatus("APK verified. Add the main OBB.", TextSoft);
         }
         else if (!PathsMatch(_validatedPatchObbPath, _patchObbBox.Text))
         {
-            SetStatus("Main data ready — add the separate patch .obb.", TextSoft);
+            SetStatus("Main OBB verified. Add the patch OBB.", TextSoft);
         }
         else
         {
@@ -1129,9 +1233,9 @@ public sealed class MainForm : Form
                 : "no controller fix";
         string choiceText = hasChoiceData ? "offline choice stats" : "no offline choice stats";
         string obbText = PathsMatch(_validatedPatchObbPath, _patchObbBox.Text)
-            ? "Both OBBs ready"
-            : "Main + patch OBB required";
-        _baseNoteLabel.Text = $"{obbText}  ·  Built in: {controllerText} + {choiceText}";
+            ? "PowerVR v1.37 + 2 OBBs"
+            : "Need main + patch OBB";
+        _baseNoteLabel.Text = $"{obbText}  •  {controllerText}  •  {choiceText}";
         string? supportError = activeFixError ?? _choiceDataError;
         _baseNoteLabel.ForeColor = supportError is not null
             ? Warning

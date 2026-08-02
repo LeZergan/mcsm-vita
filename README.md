@@ -30,12 +30,12 @@ No *Minecraft: Story Mode* code or assets are included or linked — supply your
 The Windows [MCSM Vita Data Builder](data-builder/README.md) turns user-owned Android files into the exact ready-to-copy Vita folder. It does not download or contain game data.
 
 1. Open `MCSM-Vita-Data-Builder.exe`.
-2. Choose the PowerVR v1.37 APK, main OBB, and patch OBB. The exact supported set is verified locally, and a matching patch beside the main OBB is filled automatically.
+2. Press **Scan folder** and choose the folder containing your Android files. The builder finds the exact PowerVR v1.37 APK, both matching OBBs, and recognizable Episodes 2–8 automatically. You can still browse for each file manually.
 3. Keep **Default — recommended**, choose another preset, or press **Make custom** for an Easy/Advanced profile editor.
 4. Optionally add Episode 2–8 folders or chapter ZIPs.
 5. Press **Build Data Folder**, then copy the resulting `mcsm` folder to `ux0:data/` with VitaShell.
 
-The final required path is `ux0:data/mcsm/assets`. The builder reads `AndroidManifest.xml`, verifies the exact known PowerVR fingerprint, and accepts only the supported v1.37 APK (`versionCode 40137`); renaming an older or Mali/Adreno APK does not bypass the check. Both fingerprint-matched PowerVR OBBs are required for the base install. The patch is detected automatically when it sits beside the main OBB or can be selected manually. Extra chapter `.ttarch2` and descriptor `.lua` files are detected, validated, and put in the correct shared assets folder.
+The final required path is `ux0:data/mcsm/assets`. The compact builder keeps version, renderer, OBB, bundled-fix, profile, and readiness information visible without exposing unnecessary setup controls. It reads `AndroidManifest.xml`, verifies the exact known PowerVR fingerprint, and accepts only the supported v1.37 APK (`versionCode 40137`); renaming an older or Mali/Adreno APK does not bypass the check. Both fingerprint-matched PowerVR OBBs are required. Extra chapter `.ttarch2` and descriptor `.lua` files are detected, validated, and put in the correct shared assets folder.
 
 To build the self-contained Windows EXE from source:
 

@@ -22,10 +22,35 @@ if (args.Length == 4 && args[0].Equals("--inspect-base", StringComparison.Ordina
     return 0;
 }
 
+if (args.Length == 2 && args[0].Equals("--scan-folder", StringComparison.OrdinalIgnoreCase))
+{
+    SetupFolderScanResult found = SetupFolderScanner.Scan(args[1]);
+    Console.WriteLine(
+        $"Folder scan: APK={(found.ApkPath is null ? "missing" : Path.GetFileName(found.ApkPath))}; " +
+        $"main={(found.MainObbPath is null ? "missing" : Path.GetFileName(found.MainObbPath))}; " +
+        $"patch={(found.PatchObbPath is null ? "missing" : Path.GetFileName(found.PatchObbPath))}; " +
+        $"episodes={string.Join(",", found.Chapters.SelectMany(source => source.Episodes).Distinct().Order())}.");
+    return found.BaseSetComplete ? 0 : 2;
+}
+
 if (args.Length == 2 && args[0].Equals("--render", StringComparison.OrdinalIgnoreCase))
 {
     RenderForm(args[1], () => new MainForm());
     Console.WriteLine($"Rendered UI preview: {args[1]}");
+    return 0;
+}
+
+if (args.Length == 2 && args[0].Equals("--render-ready", StringComparison.OrdinalIgnoreCase))
+{
+    RenderForm(
+        args[1],
+        () =>
+        {
+            MainForm form = new();
+            form.ApplyReadyPreview();
+            return form;
+        });
+    Console.WriteLine($"Rendered ready-state UI preview: {args[1]}");
     return 0;
 }
 
@@ -245,6 +270,13 @@ try
     DataAddonSource addonZip = DataAddonScanner.Inspect(modZip);
     Assert(source2.Episodes.SequenceEqual([2]), "Episode 2 folder detection failed.");
     Assert(source3.Episodes.SequenceEqual([3]), "Episode 3 ZIP detection failed.");
+    SetupFolderScanResult scannedFolder = SetupFolderScanner.Scan(inputs);
+    Assert(scannedFolder.ApkPath is null, "Folder scan accepted an unverified synthetic APK.");
+    Assert(scannedFolder.MainObbPath is null, "Folder scan accepted an unverified synthetic main OBB.");
+    Assert(scannedFolder.PatchObbPath is null, "Folder scan accepted an unverified synthetic patch OBB.");
+    Assert(
+        scannedFolder.Chapters.SelectMany(source => source.Episodes).Distinct().Order().SequenceEqual([2, 3]),
+        "Folder scan did not discover the optional chapter folder and ZIP.");
     Assert(
         ChapterScanner.DetectEpisodes([
             "MCSM_android_JesseMale105_dlog.ttarch2",
@@ -367,7 +399,7 @@ try
     }
     Assert(File.Exists(Path.Combine(output, "DATA_FOLDER_READY.txt")), "Final ready marker is missing.");
 
-    Console.WriteLine("PASS: PowerVR/version checks, custom-profile output, recommended default, OBB extraction, chapters, controller fixes, offline choice data, add-ons, settings, and backups.");
+    Console.WriteLine("PASS: folder discovery, PowerVR/version checks, custom profiles, recommended default, OBB extraction, chapters, controller fixes, choice data, add-ons, settings, and backups.");
     return 0;
 }
 catch (Exception exception)

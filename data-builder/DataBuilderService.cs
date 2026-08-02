@@ -14,6 +14,9 @@ public sealed class DataBuilderService
     public const string SupportedApkSha256 = "3B8111421CC37E96FF6B222548BD476584AA32A1A68A0B2052BF36CA188EE41B";
     public const string SupportedMainObbSha256 = "C4EFFC61744BA051516C79E5B118E5A11E0CD1B1C37F4957594685A9DB0449FD";
     public const string SupportedPatchObbSha256 = "B041CEBF54D361839EC642D3FC5A80D1757C16185D3E8FBE26ED2D2701398AA5";
+    public const long SupportedApkBytes = 19_835_654;
+    public const long SupportedMainObbBytes = 813_669_332;
+    public const long SupportedPatchObbBytes = 3_868_418;
     public const string SupportedChoiceDataSha256 = "F5F0C7FF7467707C7224BF056C6F7111E8D27279AA0BEE3BA422886B7EBB2616";
     public const string MainObbName = "main.40129.com.telltalegames.minecraft100.obb";
     public const string PatchObbName = "patch.40135.com.telltalegames.minecraft100.obb";
@@ -53,7 +56,7 @@ public sealed class DataBuilderService
     {
         ValidateRequest(request);
         ApkLayout apkLayout = InspectApkCore(request.ApkPath, !_allowSyntheticInputs);
-        ObbLayout mainObb = InspectMainObbCore(request.MainObbPath, !_allowSyntheticInputs);
+        ObbLayout mainObb = InspectMainObbCore(request.MainObbPath, !_allowSyntheticInputs, false);
         ObbLayout patchObb = InspectPatchObbCore(request.PatchObbPath, !_allowSyntheticInputs);
         ButtonFixBundle? buttonFix = ResolveButtonFix(request.ButtonFixPath);
         BundledAsset? choiceData = InspectBundledChoiceData();
@@ -339,11 +342,18 @@ public sealed class DataBuilderService
         }
     }
 
-    public static ObbLayout InspectMainObb(string mainObbPath) => InspectMainObbCore(mainObbPath, true);
+    public static ObbLayout InspectMainObb(string mainObbPath) => InspectMainObbCore(mainObbPath, true, true);
 
-    internal static ObbLayout InspectSyntheticMainObb(string mainObbPath) => InspectMainObbCore(mainObbPath, false);
+    internal static ObbLayout InspectSupportedMainObbStandalone(string mainObbPath) =>
+        InspectMainObbCore(mainObbPath, true, false);
 
-    private static ObbLayout InspectMainObbCore(string mainObbPath, bool enforceCompatibilityFingerprint)
+    internal static ObbLayout InspectSyntheticMainObb(string mainObbPath) =>
+        InspectMainObbCore(mainObbPath, false, true);
+
+    private static ObbLayout InspectMainObbCore(
+        string mainObbPath,
+        bool enforceCompatibilityFingerprint,
+        bool findNeighboringPatch)
     {
         if (!File.Exists(mainObbPath))
         {
@@ -375,7 +385,7 @@ public sealed class DataBuilderService
                 "This is not the supported PowerVR main OBB. Choose the exact main expansion file used by this port.");
         }
 
-        return new ObbLayout(bytes, FindPatchObb(mainObbPath));
+        return new ObbLayout(bytes, findNeighboringPatch ? FindPatchObb(mainObbPath) : null);
     }
 
     public static ObbLayout InspectPatchObb(string patchObbPath) => InspectPatchObbCore(patchObbPath, true);
