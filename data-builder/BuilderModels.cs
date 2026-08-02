@@ -63,6 +63,7 @@ public sealed record BuildResult(
     IReadOnlyList<int> IncludedEpisodes,
     int ChapterFileCount,
     int ButtonFixFileCount,
+    bool ChoiceDataIncluded,
     int DataAddonFileCount,
     int DataAddonOverwriteCount,
     long TotalBytes);

@@ -30,12 +30,12 @@ No *Minecraft: Story Mode* code or assets are included or linked — supply your
 The Windows [MCSM Vita Data Builder](data-builder/README.md) turns user-owned Android files into the exact ready-to-copy Vita folder. It does not download or contain game data.
 
 1. Open `MCSM-Vita-Data-Builder.exe`.
-2. Choose the 32-bit PowerVR APK, main OBB, and patch OBB. A matching patch beside the main OBB is filled automatically.
+2. Choose the PowerVR v1.37 APK, main OBB, and patch OBB. The exact supported set is verified locally, and a matching patch beside the main OBB is filled automatically.
 3. Optionally add Episode 2–8 folders or chapter ZIPs.
 4. Press **Build Data Folder**.
 5. Copy the resulting `mcsm` folder to `ux0:data/` with VitaShell.
 
-The final required path is `ux0:data/mcsm/assets`. Both OBBs are required for the base install; the patch is detected automatically when it sits beside the main OBB, or it can be selected manually. Extra chapter `.ttarch2` and descriptor `.lua` files are detected, validated, and put in the correct shared assets folder.
+The final required path is `ux0:data/mcsm/assets`. The builder reads `AndroidManifest.xml`, verifies the exact known PowerVR fingerprint, and accepts only the supported v1.37 APK (`versionCode 40137`); renaming an older or Mali/Adreno APK does not bypass the check. Both fingerprint-matched PowerVR OBBs are required for the base install. The patch is detected automatically when it sits beside the main OBB or can be selected manually. Extra chapter `.ttarch2` and descriptor `.lua` files are detected, validated, and put in the correct shared assets folder.
 
 To build the self-contained Windows EXE from source:
 
@@ -45,7 +45,7 @@ To build the self-contained Windows EXE from source:
 
 The app also creates `settings/graphics.txt` and `settings/game.txt`. The recommended Performance preset is selected by default; Easy and Advanced Custom sections remain editable. Advanced mode includes a 60 FPS cap, but that is a maximum target rather than a guaranteed lock—crowded scenes with many characters can fall to around 20 FPS.
 
-The **Fix & mods** panel can install a supplied controller-button asset fix and merge extra folders/ZIPs into the generated data directory. General mod installation is experimental and has not been tested on Vita; add-ons are applied last, while the canonical OBBs and native runtime libraries remain protected.
+The **Fix & mods** panel can install a supplied controller-button asset fix and merge extra folders/ZIPs into the generated data directory. Locally distributed builds can also include the supported offline `choice.prop` dataset required by the crowd-choice statistics screen. General mod installation is experimental and has not been tested on Vita; add-ons are applied last, while the canonical OBBs and native runtime libraries remain protected.
 
 ## Known issues
 

@@ -2,6 +2,26 @@ using System.IO.Compression;
 using System.Text;
 using McsmVitaDataBuilder;
 
+if (args.Length == 2 && args[0].Equals("--inspect-apk", StringComparison.OrdinalIgnoreCase))
+{
+    ApkLayout apk = DataBuilderService.InspectApk(args[1]);
+    Console.WriteLine(
+        $"APK accepted: {apk.PackageName} v{apk.VersionName} " +
+        $"(versionCode {apk.VersionCode}), {apk.LibraryCount} ARMv7 libraries, {apk.AssetCount} assets.");
+    return 0;
+}
+
+if (args.Length == 4 && args[0].Equals("--inspect-base", StringComparison.OrdinalIgnoreCase))
+{
+    ApkLayout apk = DataBuilderService.InspectApk(args[1]);
+    ObbLayout main = DataBuilderService.InspectMainObb(args[2]);
+    ObbLayout patch = DataBuilderService.InspectPatchObb(args[3]);
+    Console.WriteLine(
+        $"PowerVR base set accepted: APK v{apk.VersionName} ({apk.VersionCode}), " +
+        $"main {main.TotalBytes} bytes, patch {patch.TotalBytes} bytes.");
+    return 0;
+}
+
 if (args.Length == 2 && args[0].Equals("--render", StringComparison.OrdinalIgnoreCase))
 {
     RenderForm(args[1], () => new MainForm());
@@ -28,6 +48,12 @@ try
     string apkPath = Path.Combine(inputs, "minecraft.apk");
     using (ZipArchive apk = ZipFile.Open(apkPath, ZipArchiveMode.Create))
     {
+        WriteEntry(
+            apk,
+            "AndroidManifest.xml",
+            "<manifest xmlns:android=\"http://schemas.android.com/apk/res/android\" " +
+            "package=\"com.telltalegames.minecraft100\" " +
+            "android:versionCode=\"40137\" android:versionName=\"1.37\" />");
         foreach (string library in DataBuilderService.RequiredLibraries)
         {
             WriteEntry(apk, $"lib/armeabi-v7a/{library}", $"synthetic-{library}");
@@ -37,23 +63,63 @@ try
         WriteEntry(apk, "lib/x86/libmain.so", "wrong-abi-copy");
     }
 
+    ApkLayout inspectedApk = DataBuilderService.InspectSyntheticApk(apkPath);
+    Assert(inspectedApk.VersionCode == 40137, "Supported APK version detection failed.");
+    Assert(inspectedApk.VersionName == "1.37", "Supported APK version name detection failed.");
+    bool unknownRendererRejected = false;
+    try
+    {
+        _ = DataBuilderService.InspectApk(apkPath);
+    }
+    catch (InvalidDataException)
+    {
+        unknownRendererRejected = true;
+    }
+    Assert(unknownRendererRejected, "An unknown v1.37 renderer fingerprint was accepted.");
+
+    string oldApk = Path.Combine(inputs, "minecraft-old.apk");
+    using (ZipArchive apk = ZipFile.Open(oldApk, ZipArchiveMode.Create))
+    {
+        WriteEntry(
+            apk,
+            "AndroidManifest.xml",
+            "<manifest xmlns:android=\"http://schemas.android.com/apk/res/android\" " +
+            "package=\"com.telltalegames.minecraft100\" " +
+            "android:versionCode=\"40136\" android:versionName=\"1.36\" />");
+        foreach (string library in DataBuilderService.RequiredLibraries)
+        {
+            WriteEntry(apk, $"lib/armeabi-v7a/{library}", $"synthetic-{library}");
+        }
+        WriteEntry(apk, "assets/feedInfo.dat", "synthetic-feed");
+    }
+    bool oldApkRejected = false;
+    try
+    {
+        _ = DataBuilderService.InspectSyntheticApk(oldApk);
+    }
+    catch (InvalidDataException)
+    {
+        oldApkRejected = true;
+    }
+    Assert(oldApkRejected, "An older APK version was accepted.");
+
     string mainObb = Path.Combine(inputs, "main.99999.com.telltalegames.minecraft100.obb");
     await File.WriteAllBytesAsync(mainObb, new byte[2 * 1024 * 1024]);
     string patchObb = Path.Combine(inputs, "patch.99999.com.telltalegames.minecraft100.obb");
     await File.WriteAllTextAsync(patchObb, "synthetic patch");
 
-    ObbLayout inspectedMainObb = DataBuilderService.InspectMainObb(mainObb);
+    ObbLayout inspectedMainObb = DataBuilderService.InspectSyntheticMainObb(mainObb);
     Assert(
         inspectedMainObb.PatchPath?.Equals(patchObb, StringComparison.OrdinalIgnoreCase) == true,
         "The neighboring required patch OBB was not detected.");
-    _ = DataBuilderService.InspectPatchObb(patchObb);
+    _ = DataBuilderService.InspectSyntheticPatchObb(patchObb);
 
     string disguisedApk = Path.Combine(inputs, "minecraft.zip");
     File.Copy(apkPath, disguisedApk);
     bool wrongApkExtensionRejected = false;
     try
     {
-        _ = DataBuilderService.InspectApk(disguisedApk);
+        _ = DataBuilderService.InspectSyntheticApk(disguisedApk);
     }
     catch (InvalidDataException)
     {
@@ -182,7 +248,7 @@ try
         buttonFix,
         [addonFolder, addonZip]);
 
-    DataBuilderService builder = new();
+    DataBuilderService builder = new(allowSyntheticInputs: true);
     bool missingPatchRejected = false;
     try
     {
@@ -206,8 +272,10 @@ try
     Assert(duplicateObbsRejected, "The same OBB was accepted for both required OBB slots.");
 
     BuildResult first = await builder.BuildAsync(request);
+    BundledAsset? embeddedChoiceData = DataBuilderService.InspectBundledChoiceData();
     Assert(first.IncludedEpisodes.SequenceEqual([1, 2, 3]), "Included episode list is wrong.");
     Assert(first.ButtonFixFileCount == 4, "User-supplied controller fix was not installed.");
+    Assert(first.ChoiceDataIncluded == (embeddedChoiceData is not null), "Offline choice-data status is wrong.");
     Assert(first.DataAddonFileCount == 4, "Experimental data add-on file count is wrong.");
     Assert(first.DataAddonOverwriteCount == 1, "Data add-on replacement count is wrong.");
     Assert(File.Exists(Path.Combine(output, DataBuilderService.MainObbName)), "Canonical main OBB is missing.");
@@ -218,6 +286,16 @@ try
     Assert(File.Exists(Path.Combine(output, "assets", "MCSM_android_Minecraft103_data.ttarch2")), "Episode 3 marker is missing.");
     Assert(!File.Exists(Path.Combine(output, "assets", "do-not-copy.txt")), "Unrelated chapter file was copied.");
     Assert(File.Exists(Path.Combine(output, "assets", "ui_action_promptFacebuttonDown.d3dmesh")), "Controller fix mesh is missing.");
+    if (embeddedChoiceData is not null)
+    {
+        string rootChoice = Path.Combine(output, "choice.prop");
+        string tempChoice = Path.Combine(output, "Temp", "choice.prop");
+        Assert(File.Exists(rootChoice), "Root offline choice dataset is missing.");
+        Assert(File.Exists(tempChoice), "Temp offline choice dataset is missing.");
+        Assert(
+            File.ReadAllBytes(rootChoice).SequenceEqual(File.ReadAllBytes(tempChoice)),
+            "Offline choice dataset copies do not match.");
+    }
     Assert(File.Exists(Path.Combine(output, "assets", "folder-mod.asset")), "Folder data add-on is missing.");
     Assert(File.Exists(Path.Combine(output, "User", "zip-mod.cfg")), "ZIP data add-on is missing.");
     Assert(await File.ReadAllTextAsync(Path.Combine(output, "assets", "feedInfo.dat")) == "modded feed", "Data add-on was not applied last.");
@@ -247,7 +325,7 @@ try
     }
     Assert(File.Exists(Path.Combine(output, "DATA_FOLDER_READY.txt")), "Final ready marker is missing.");
 
-    Console.WriteLine("PASS: strict APK + required main/patch OBB validation, extraction, chapters, controller fixes, experimental data add-ons, settings, and backups.");
+    Console.WriteLine("PASS: exact PowerVR fingerprints + strict v1.37 manifest, OBB validation, extraction, chapters, controller fixes, offline choice data, experimental add-ons, settings, and backups.");
     return 0;
 }
 catch (Exception exception)

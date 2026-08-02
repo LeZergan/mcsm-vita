@@ -8,6 +8,13 @@ namespace McsmVitaDataBuilder;
 
 public sealed class DataBuilderService
 {
+    public const string SupportedPackageName = "com.telltalegames.minecraft100";
+    public const int SupportedApkVersionCode = 40137;
+    public const string SupportedApkVersionName = "1.37";
+    public const string SupportedApkSha256 = "3B8111421CC37E96FF6B222548BD476584AA32A1A68A0B2052BF36CA188EE41B";
+    public const string SupportedMainObbSha256 = "C4EFFC61744BA051516C79E5B118E5A11E0CD1B1C37F4957594685A9DB0449FD";
+    public const string SupportedPatchObbSha256 = "B041CEBF54D361839EC642D3FC5A80D1757C16185D3E8FBE26ED2D2701398AA5";
+    public const string SupportedChoiceDataSha256 = "F5F0C7FF7467707C7224BF056C6F7111E8D27279AA0BEE3BA422886B7EBB2616";
     public const string MainObbName = "main.40129.com.telltalegames.minecraft100.obb";
     public const string PatchObbName = "patch.40135.com.telltalegames.minecraft100.obb";
 
@@ -28,16 +35,28 @@ public sealed class DataBuilderService
         "ui_action_promptFacebuttonUp.d3dmesh"
     ];
 
+    private readonly bool _allowSyntheticInputs;
+
+    public DataBuilderService()
+    {
+    }
+
+    internal DataBuilderService(bool allowSyntheticInputs)
+    {
+        _allowSyntheticInputs = allowSyntheticInputs;
+    }
+
     public async Task<BuildResult> BuildAsync(
         BuildRequest request,
         IProgress<BuildProgress>? progress = null,
         CancellationToken cancellationToken = default)
     {
         ValidateRequest(request);
-        ApkLayout apkLayout = InspectApk(request.ApkPath);
-        ObbLayout mainObb = InspectMainObb(request.MainObbPath);
-        ObbLayout patchObb = InspectPatchObb(request.PatchObbPath);
+        ApkLayout apkLayout = InspectApkCore(request.ApkPath, !_allowSyntheticInputs);
+        ObbLayout mainObb = InspectMainObbCore(request.MainObbPath, !_allowSyntheticInputs);
+        ObbLayout patchObb = InspectPatchObbCore(request.PatchObbPath, !_allowSyntheticInputs);
         ButtonFixBundle? buttonFix = ResolveButtonFix(request.ButtonFixPath);
+        BundledAsset? choiceData = InspectBundledChoiceData();
 
         string outputDirectory = Path.GetFullPath(request.OutputDirectory.Trim());
         if (!Path.GetFileName(outputDirectory.TrimEnd(Path.DirectorySeparatorChar))
@@ -56,6 +75,7 @@ public sealed class DataBuilderService
         long totalBytes = apkLayout.TotalBytes
             + mainObb.TotalBytes
             + patchObb.TotalBytes
+            + (choiceData?.Size * 2 ?? 0)
             + (buttonFix?.TotalBytes ?? 0)
             + request.ChapterSources.Sum(source => source.TotalBytes)
             + request.DataAddons.Sum(source => source.TotalBytes);
@@ -121,6 +141,15 @@ public sealed class DataBuilderService
                     cancellationToken);
             }
 
+            if (choiceData is not null)
+            {
+                Report("Installing offline choice statistics…");
+                await CopyBundledChoiceDataAsync(
+                    stagingDirectory,
+                    bytes => copiedBytes += bytes,
+                    cancellationToken);
+            }
+
             Report("Copying the main game data…");
             await CopyFileAsync(
                 request.MainObbPath,
@@ -177,10 +206,11 @@ public sealed class DataBuilderService
                 request,
                 includedEpisodes,
                 buttonFix,
+                choiceData,
                 dataAddonFileCount,
                 dataAddonOverwriteCount,
                 cancellationToken);
-            VerifyOutput(stagingDirectory, includedEpisodes, buttonFix);
+            VerifyOutput(stagingDirectory, includedEpisodes, buttonFix, choiceData);
 
             Report("Finalizing the ready-to-copy folder…");
             if (Directory.Exists(outputDirectory))
@@ -213,6 +243,7 @@ public sealed class DataBuilderService
                 includedEpisodes.ToList(),
                 chapterFileCount,
                 buttonFixFileCount,
+                choiceData is not null,
                 dataAddonFileCount,
                 dataAddonOverwriteCount,
                 totalBytes);
@@ -227,7 +258,11 @@ public sealed class DataBuilderService
         }
     }
 
-    public static ApkLayout InspectApk(string apkPath)
+    public static ApkLayout InspectApk(string apkPath) => InspectApkCore(apkPath, true);
+
+    internal static ApkLayout InspectSyntheticApk(string apkPath) => InspectApkCore(apkPath, false);
+
+    private static ApkLayout InspectApkCore(string apkPath, bool enforceCompatibilityFingerprint)
     {
         if (!File.Exists(apkPath))
         {
@@ -241,6 +276,38 @@ public sealed class DataBuilderService
         try
         {
             using ZipArchive apk = ZipFile.OpenRead(apkPath);
+            ZipArchiveEntry manifestEntry = apk.GetEntry("AndroidManifest.xml")
+                ?? throw new InvalidDataException("The APK has no AndroidManifest.xml.");
+            ApkManifestInfo manifest;
+            using (Stream manifestStream = manifestEntry.Open())
+            {
+                manifest = ApkManifestReader.Read(manifestStream);
+            }
+            if (!manifest.PackageName.Equals(SupportedPackageName, StringComparison.Ordinal))
+            {
+                throw new InvalidDataException(
+                    $"This APK belongs to '{manifest.PackageName}', not Minecraft: Story Mode ({SupportedPackageName}).");
+            }
+            if (manifest.VersionCode != SupportedApkVersionCode)
+            {
+                string detectedName = string.IsNullOrWhiteSpace(manifest.VersionName)
+                    ? $"versionCode {manifest.VersionCode}"
+                    : $"v{manifest.VersionName} (versionCode {manifest.VersionCode})";
+                throw new InvalidDataException(
+                    $"Unsupported APK version: {detectedName}. " +
+                    $"This port requires the newest supported PowerVR APK: v{SupportedApkVersionName} " +
+                    $"(versionCode {SupportedApkVersionCode}).");
+            }
+
+            if (enforceCompatibilityFingerprint)
+            {
+                VerifySupportedFingerprint(
+                    apkPath,
+                    SupportedApkSha256,
+                    "This is v1.37, but it is not the supported PowerVR APK. " +
+                    "Choose the PowerVR build used by this port; Mali and Adreno APKs are not accepted.");
+            }
+
             var missing = RequiredLibraries
                 .Where(library => apk.GetEntry($"lib/armeabi-v7a/{library}") is null)
                 .ToList();
@@ -254,7 +321,13 @@ public sealed class DataBuilderService
                 .Select(library => apk.GetEntry($"lib/armeabi-v7a/{library}")!.Length)
                 .Sum();
             var assets = apk.Entries.Where(IsApkAsset).ToList();
-            return new ApkLayout(RequiredLibraries.Length, assets.Count, libraryBytes + assets.Sum(entry => entry.Length));
+            return new ApkLayout(
+                manifest.PackageName,
+                manifest.VersionCode,
+                manifest.VersionName,
+                RequiredLibraries.Length,
+                assets.Count,
+                libraryBytes + assets.Sum(entry => entry.Length));
         }
         catch (InvalidDataException)
         {
@@ -266,7 +339,11 @@ public sealed class DataBuilderService
         }
     }
 
-    public static ObbLayout InspectMainObb(string mainObbPath)
+    public static ObbLayout InspectMainObb(string mainObbPath) => InspectMainObbCore(mainObbPath, true);
+
+    internal static ObbLayout InspectSyntheticMainObb(string mainObbPath) => InspectMainObbCore(mainObbPath, false);
+
+    private static ObbLayout InspectMainObbCore(string mainObbPath, bool enforceCompatibilityFingerprint)
     {
         if (!File.Exists(mainObbPath))
         {
@@ -290,10 +367,22 @@ public sealed class DataBuilderService
             throw new InvalidDataException("The selected main OBB is unexpectedly small and cannot be used.");
         }
 
+        if (enforceCompatibilityFingerprint)
+        {
+            VerifySupportedFingerprint(
+                mainObbPath,
+                SupportedMainObbSha256,
+                "This is not the supported PowerVR main OBB. Choose the exact main expansion file used by this port.");
+        }
+
         return new ObbLayout(bytes, FindPatchObb(mainObbPath));
     }
 
-    public static ObbLayout InspectPatchObb(string patchObbPath)
+    public static ObbLayout InspectPatchObb(string patchObbPath) => InspectPatchObbCore(patchObbPath, true);
+
+    internal static ObbLayout InspectSyntheticPatchObb(string patchObbPath) => InspectPatchObbCore(patchObbPath, false);
+
+    private static ObbLayout InspectPatchObbCore(string patchObbPath, bool enforceCompatibilityFingerprint)
     {
         if (!File.Exists(patchObbPath))
         {
@@ -316,7 +405,31 @@ public sealed class DataBuilderService
             throw new InvalidDataException("The selected patch OBB is empty and cannot be used.");
         }
 
+        if (enforceCompatibilityFingerprint)
+        {
+            VerifySupportedFingerprint(
+                patchObbPath,
+                SupportedPatchObbSha256,
+                "This is not the supported PowerVR patch OBB. Choose the exact patch expansion file used by this port.");
+        }
+
         return new ObbLayout(bytes, null);
+    }
+
+    private static void VerifySupportedFingerprint(string path, string expectedSha256, string errorMessage)
+    {
+        using FileStream stream = new(
+            path,
+            FileMode.Open,
+            FileAccess.Read,
+            FileShare.Read,
+            1024 * 1024,
+            FileOptions.SequentialScan);
+        string hash = Convert.ToHexString(SHA256.HashData(stream));
+        if (!hash.Equals(expectedSha256, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidDataException(errorMessage);
+        }
     }
 
     public static ButtonFixBundle? InspectBundledButtonFix()
@@ -332,6 +445,31 @@ public sealed class DataBuilderService
         using Stream stream = assembly.GetManifestResourceStream(resourceName)
             ?? throw new InvalidDataException("The embedded controller button-fix package could not be opened.");
         return InspectButtonFixArchive(stream, ButtonFixSourceKind.Embedded, null);
+    }
+
+    public static BundledAsset? InspectBundledChoiceData()
+    {
+        Assembly assembly = typeof(DataBuilderService).Assembly;
+        string? resourceName = assembly.GetManifestResourceNames()
+            .SingleOrDefault(name => name.EndsWith("LocalAssets.choice.prop", StringComparison.OrdinalIgnoreCase));
+        if (resourceName is null)
+        {
+            return null;
+        }
+
+        using Stream stream = assembly.GetManifestResourceStream(resourceName)
+            ?? throw new InvalidDataException("The embedded offline choice dataset could not be opened.");
+        if (stream.Length <= 0)
+        {
+            throw new InvalidDataException("The embedded offline choice dataset is empty.");
+        }
+        string hash = Convert.ToHexString(SHA256.HashData(stream));
+        if (!hash.Equals(SupportedChoiceDataSha256, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidDataException(
+                "The embedded choice.prop is not the supported offline crowd-choice dataset.");
+        }
+        return new BundledAsset("choice.prop", stream.Length);
     }
 
     public static ButtonFixBundle? ResolveButtonFix(string? selectedPath)
@@ -582,6 +720,29 @@ public sealed class DataBuilderService
         }
     }
 
+    private static async Task CopyBundledChoiceDataAsync(
+        string stagingDirectory,
+        Action<int> addBytes,
+        CancellationToken cancellationToken)
+    {
+        Assembly assembly = typeof(DataBuilderService).Assembly;
+        string resourceName = assembly.GetManifestResourceNames()
+            .Single(name => name.EndsWith("LocalAssets.choice.prop", StringComparison.OrdinalIgnoreCase));
+        await using Stream stream = assembly.GetManifestResourceStream(resourceName)
+            ?? throw new InvalidDataException("The embedded offline choice dataset could not be opened.");
+        using MemoryStream memory = new();
+        await stream.CopyToAsync(memory, cancellationToken);
+        byte[] data = memory.ToArray();
+
+        foreach (string relative in new[] { "choice.prop", Path.Combine("Temp", "choice.prop") })
+        {
+            string destination = Path.Combine(stagingDirectory, relative);
+            Directory.CreateDirectory(Path.GetDirectoryName(destination)!);
+            await File.WriteAllBytesAsync(destination, data, cancellationToken);
+            addBytes(data.Length);
+        }
+    }
+
     private static async Task<int> CopyChapterZipAsync(
         ChapterSource source,
         string assetsDirectory,
@@ -731,6 +892,7 @@ public sealed class DataBuilderService
         BuildRequest request,
         IEnumerable<int> includedEpisodes,
         ButtonFixBundle? buttonFix,
+        BundledAsset? choiceData,
         int dataAddonFileCount,
         int dataAddonOverwriteCount,
         CancellationToken cancellationToken)
@@ -746,6 +908,7 @@ public sealed class DataBuilderService
             $"Graphics profile: {request.GraphicsProfile}\r\n" +
             $"Language: {request.LanguageCode}\r\n" +
             $"Controller button fix: {(buttonFix is null ? "not supplied" : $"included ({buttonFix.FileCount} assets)")}\r\n" +
+            $"Offline choice statistics: {(choiceData is null ? "not supplied" : "included")}\r\n" +
             $"Experimental data add-ons: {dataAddonFileCount} files ({dataAddonOverwriteCount} replacements)\r\n\r\n" +
             "Advanced graphics and episode controls are in the settings folder.\r\n" +
             "Data add-on / mod installation is experimental and has not been tested on Vita.\r\n" +
@@ -771,7 +934,8 @@ public sealed class DataBuilderService
     private static void VerifyOutput(
         string output,
         IEnumerable<int> episodes,
-        ButtonFixBundle? buttonFix)
+        ButtonFixBundle? buttonFix,
+        BundledAsset? choiceData)
     {
         var required = RequiredLibraries
             .Select(library => Path.Combine(output, library))
@@ -805,6 +969,26 @@ public sealed class DataBuilderService
                 {
                     throw new IOException(
                         $"Controller button-fix verification failed: '{asset.Name}' is missing or incomplete.");
+                }
+            }
+        }
+
+        if (choiceData is not null)
+        {
+            string rootChoice = Path.Combine(output, "choice.prop");
+            string tempChoice = Path.Combine(output, "Temp", "choice.prop");
+            foreach (string path in new[] { rootChoice, tempChoice })
+            {
+                if (!File.Exists(path) || new FileInfo(path).Length <= 0)
+                {
+                    throw new IOException("Offline choice-statistics verification failed: choice.prop is missing.");
+                }
+
+                using FileStream stream = File.OpenRead(path);
+                string hash = Convert.ToHexString(SHA256.HashData(stream));
+                if (!hash.Equals(SupportedChoiceDataSha256, StringComparison.OrdinalIgnoreCase))
+                {
+                    throw new IOException("Offline choice-statistics verification failed: choice.prop is invalid.");
                 }
             }
         }
@@ -914,6 +1098,12 @@ public sealed class DataBuilderService
     }
 }
 
-public sealed record ApkLayout(int LibraryCount, int AssetCount, long TotalBytes);
+public sealed record ApkLayout(
+    string PackageName,
+    int VersionCode,
+    string VersionName,
+    int LibraryCount,
+    int AssetCount,
+    long TotalBytes);
 
 public sealed record ObbLayout(long TotalBytes, string? PatchPath);
