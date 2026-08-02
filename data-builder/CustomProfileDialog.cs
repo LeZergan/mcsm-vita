@@ -37,6 +37,7 @@ public sealed class CustomProfileDialog : Form
     private readonly ComboBox _clock = new();
     private readonly ComboBox _upscale = new();
     private readonly ComboBox _vsync = new();
+    private readonly ComboBox _animationRate = new();
     private readonly ComboBox _nearest = new();
     private readonly ComboBox _fbfetch = new();
 
@@ -53,7 +54,7 @@ public sealed class CustomProfileDialog : Form
         FormBorderStyle = FormBorderStyle.FixedDialog;
         MaximizeBox = false;
         MinimizeBox = false;
-        ClientSize = new Size(800, 670);
+        ClientSize = new Size(800, 732);
         BackColor = Page;
         ForeColor = TextMain;
         Font = new Font("Segoe UI", 9.5f);
@@ -104,7 +105,7 @@ public sealed class CustomProfileDialog : Form
         BuildAdvancedPanel();
 
         _summary.AutoSize = false;
-        _summary.Location = new Point(30, 574);
+        _summary.Location = new Point(30, 636);
         _summary.Size = new Size(740, 26);
         _summary.Font = new Font("Segoe UI Semibold", 9.5f);
         _summary.ForeColor = Primary;
@@ -112,16 +113,16 @@ public sealed class CustomProfileDialog : Form
         Label warning = new()
         {
             AutoSize = false,
-            Text = "60 FPS is only a cap. Busy scenes with many characters can still fall to around 20 FPS.",
-            Location = new Point(30, 600),
+            Text = "60 FPS is a maximum. A busy frame can miss it, but the game no longer locks itself to 20 FPS.",
+            Location = new Point(30, 662),
             Size = new Size(740, 24),
             ForeColor = Warning,
             Font = new Font("Segoe UI", 8.8f)
         };
 
-        Button reset = CreateGhostButton("Reset", 30, 630, 90);
-        Button cancel = CreateGhostButton("Cancel", 508, 630, 96);
-        Button save = CreatePrimaryButton("USE CUSTOM PROFILE", 612, 626, 160);
+        Button reset = CreateGhostButton("Reset", 30, 692, 90);
+        Button cancel = CreateGhostButton("Cancel", 508, 692, 96);
+        Button save = CreatePrimaryButton("USE CUSTOM PROFILE", 612, 688, 160);
         save.Size = new Size(160, 34);
         save.Font = new Font("Segoe UI Semibold", 8.2f);
         reset.Click += (_, _) => LoadSettings(new CustomProfileSettings());
@@ -231,7 +232,7 @@ public sealed class CustomProfileDialog : Form
         ]);
         AddAdvancedCombo(_fps, "FPS cap", 382, 18, [
             new("30 FPS — recommended", "30"), new("60 FPS — maximum target", "60"),
-            new("20 FPS", "20"), new("15 FPS", "15")
+            new("Uncapped — VSync only", "0"), new("20 FPS", "20"), new("15 FPS", "15")
         ]);
         AddAdvancedCombo(_advancedGpu, "PowerVR GPU name", 20, 80, [
             new("PowerVR SGX 540 — fastest", "sgx540"), new("PowerVR SGX 541", "sgx541"),
@@ -267,10 +268,16 @@ public sealed class CustomProfileDialog : Form
         AddAdvancedCombo(_vsync, "VSync", 382, 266, OnOff());
         AddAdvancedCombo(_nearest, "Thin-seam fix", 20, 328, OnOff(defaultOn: false));
         AddAdvancedCombo(_fbfetch, "White glass/light fix", 382, 328, OnOff(defaultOn: false));
+        AddAdvancedCombo(_animationRate, "Animation updates", 20, 390, [
+            new("Full rate — recommended", "1"),
+            new("Half rate — faster, visibly stepped", "2"),
+            new("Third rate — fastest, visibly stepped", "3")
+        ]);
 
         _toolTip.SetToolTip(_advancedGpu, "Changes the GPU identity reported to the engine; it does not overclock the Vita GPU.");
         _toolTip.SetToolTip(_nearest, "Nearest texture filtering can remove thin white seams but changes image filtering.");
         _toolTip.SetToolTip(_fbfetch, "Use only if glass or light effects render as solid white.");
+        _toolTip.SetToolTip(_animationRate, "Explicitly updates character animation every 1st, 2nd, or 3rd frame. It never changes automatically.");
     }
 
     private void AddEasyField(
@@ -340,6 +347,7 @@ public sealed class CustomProfileDialog : Form
         SelectValue(_clock, settings.Clock);
         SelectValue(_upscale, settings.Upscale);
         SelectValue(_vsync, settings.Vsync);
+        SelectValue(_animationRate, settings.AnimationRate.ToString());
         SelectValue(_nearest, settings.NearestFilter);
         SelectValue(_fbfetch, settings.FbfetchZero);
         _loadingSettings = false;
@@ -365,6 +373,7 @@ public sealed class CustomProfileDialog : Form
         Clock = ValueOf(_clock),
         Upscale = ValueOf(_upscale),
         Vsync = ValueOf(_vsync),
+        AnimationRate = int.Parse(ValueOf(_animationRate)),
         NearestFilter = ValueOf(_nearest),
         FbfetchZero = ValueOf(_fbfetch)
     };
@@ -409,7 +418,7 @@ public sealed class CustomProfileDialog : Form
 
     private static void ConfigureContentPanel(Panel panel)
     {
-        panel.Bounds = new Rectangle(28, 160, 744, 402);
+        panel.Bounds = new Rectangle(28, 160, 744, 464);
         panel.BackColor = Card;
         panel.Paint += (_, e) =>
         {

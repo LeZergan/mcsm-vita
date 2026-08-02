@@ -53,7 +53,8 @@ static void apply_profile(McsmCfg *c, int prof) {
      * vblank at or after it. For 24fps the targets land on 2.5, 5.0, 7.5, 10.0
      * vblanks, so vsync catches vblanks 3, 5, 8, 10 -- a repeating 3:2:3:2 cadence
      * averaging exactly 24.000fps with no drift. That is precisely how 24fps film is
-     * shown on 60Hz displays, and it is why quality can and does lock 24.
+     * shown on 60Hz displays. No built-in preset currently uses 24, but a manual
+     * override remains paced correctly.
      *
      * The sim pace (patch.c mcsm_frame_pace_us) was NOT updated at the same time and
      * kept quantising to whole vblanks, so fps_cap=24 paced the sim at 30834us
@@ -106,58 +107,12 @@ static void apply_profile(McsmCfg *c, int prof) {
 
     switch (prof) {
     case PROF_QUALITY:
-        /* Best picture the hardware can hold WITHOUT the framerate ever moving.
-         * Native res, real GPU identity so the engine configures itself at full
-         * quality, and a rate that is genuinely LOCKED.
-         *
-         * ★★ 20, NOT 24 -- AND 20 IS THE ONE THAT IS ACTUALLY LOCKED (2026-07-31).
-         * This profile asked for 24 for a long time, on the reasoning that 24 is the
-         * cinematic cadence the game was authored for. The reasoning was fine and the
-         * number was not achievable: the panel is 60Hz, and with vsync a frame can
-         * only last a WHOLE number of vblanks. 60/24 = 2.5, which does not exist, so
-         * "24" was never a locked 24 -- it was a 3:2 pulldown alternating 33ms and
-         * 50ms frames that merely AVERAGED 24. Every per-second counter reported a
-         * truthful 24 while the motion carried the 50ms half, which is exactly the
-         * "counter says 24, feels like 15" the tester reported.
-         *
-         * The only even rates available are 60/N: 60, 30, 20, 15. 24 is the gap
-         * between 30 and 20. Of those two neighbours:
-         *   30 = 33.3ms budget -- this workload (sim ~30-45ms) MISSES it, so it would
-         *        drop frames and be uneven again, just wearing a faster label.
-         *   20 = 50.0ms budget -- fits with real margin, and every frame is exactly
-         *        3 vblanks. Same worst case as the 3:2 pattern's slow half, but now
-         *        it is EVERY frame instead of every other one, and consistency is
-         *        most of what perceived smoothness actually is.
-         * So 20 is both the closest even rate and the only one this profile can hold.
-         * It is still slow and deliberate, which is what "cinematic" was after.
-         *
-         * DO NOT "fix" this back to 24 because 24 sounds more filmic. 24 on a 60Hz
-         * panel is a pulldown, not a frame rate. Check the PACING log line: a locked
-         * 20 puts essentially every frame in the 3-vblank bucket; the old 24 spread
-         * across buckets 2 and 3. That spread IS the judder. */
+        /* Sharpest preset. It targets 30 FPS but deliberately spends more CPU on
+         * image quality, so demanding frames may miss an individual vblank. The
+         * presenter must never turn those misses into a persistent 20 FPS lock. */
         c->render_w = 800; c->render_h = 452; c->fps_cap = 30; c->vsync = 1;
-        /* draw_distance is NOT unlimited here, even though this is the pretty
-         * profile. Device data: the GPU idles around 40% while frames take 55ms,
-         * i.e. the CPU is the entire limit -- so pixels are nearly free, and culling
-         * distant objects is what actually buys stability. Unlimited distance made
-         * the CPU walk every far object for almost no visible gain, and sim work
-         * measured p50 49ms / p90 71ms against the 50ms budget -- half the frames
-         * missed 20fps before drawing anything.
-         *
-         * ★ SHADOWS ARE OFF, AND THAT IS WHAT MAKES THIS PROFILE HONEST (2026-07-31).
-         * They were on, and the profile could not hold the 24 it promises: 24fps is a
-         * 41.7ms budget and measured sim was p50 49ms -- the median frame missed,
-         * before a single draw. Shadows re-submit the ENTIRE scene, so on a
-         * CPU-bound frame they are the most expensive thing in the profile and the
-         * only cut big enough to close a 7ms median gap.
-         *
-         * Native resolution and full detail are KEPT precisely because the limit is
-         * the CPU: dropping pixels would cost sharpness and buy almost nothing, and
-         * this is the profile someone picks for sharpness. So the trade is
-         * "everything the CPU can afford at 24, nothing it cannot" -- native res,
-         * outlines, full-detail geometry, no shadows. Distance also comes 6000->5000
-         * (matching `default`) to take the remaining margin from object walking
-         * rather than from anything visible up close. */
+        /* Shadows remain off because they resubmit the scene. Full detail, outlines,
+         * and the higher render resolution are the visible quality tradeoff. */
         c->outlines = 1;   c->shadows = 0;    c->draw_distance = 4000; c->skinning_full = 1;
         c->anim_rate = 1;   c->detail = 1000; c->render_quality = -1; c->gpu_tier = 1;
         c->shader_opt = 2; c->clock_adaptive = 0; c->clock_mhz = 444; break;
@@ -185,133 +140,25 @@ static void apply_profile(McsmCfg *c, int prof) {
          * stepping), and the higher 720x408 render scale for legible text. That is
          * the actual difference now -- not the engine tier. */
         c->render_w = 720; c->render_h = 408; c->fps_cap = 30; c->vsync = 1;
-        c->outlines = 1;   c->shadows = 0;    c->draw_distance = 5000; c->skinning_full = 1;
-        c->anim_rate = 1;   c->detail = 1000;  c->render_quality = -1; c->gpu_tier = 1;
+        c->outlines = 1;   c->shadows = 0;    c->draw_distance = 4000; c->skinning_full = 1;
+        c->anim_rate = 1;   c->detail = 900;   c->render_quality = -1; c->gpu_tier = 0;
         c->shader_opt = 2; c->clock_adaptive = 0; c->clock_mhz = 444; break;
 
     case PROF_PERFORMANCE:
-        /* Frames over everything -- but "frames" means DISPLAYED frames, which on a
-         * 60Hz vsynced panel is a ladder, not a dial: only 60/30/20/15 exist.
-         *
-         * ★★ CAP IS 30, NOT 60 (2026-08-01). It was 60 on the argument that capping
-         * lower never makes a frame arrive sooner, only later -- which is true about
-         * THROUGHPUT and wrong about what a player sees.
-         *
-         * On a 60Hz panel with vsync a frame lasts a whole number of vblanks. 60 means
-         * ONE vblank, 16.7ms, and this workload (sim p50 26ms / p90 42ms) never gets
-         * there -- so every single frame misses its target and lands on whichever
-         * vblank it happens to reach. The result is a rate that constantly changes
-         * duration, reported from device as "it was uncapped fps it seems" and felt as
-         * microstutter. 30 is two vblanks, 33.3ms, which the median frame actually
-         * makes: frames that fit are EVEN, and frames that miss degrade to a steady 20
-         * via the pacer's hysteresis rather than oscillating.
-         *
-         * It also aligns the two pacers. mcsm_frame_pace_us() paces the SIM from this
-         * same cap, so at 60 the engine was being driven at 14.2ms while the display
-         * delivered 20-30fps -- the engine's own frame delta varying every frame, which
-         * is motion judder no amount of present-side smoothing can fix. At 30 the sim
-         * and the display are asking for the same thing.
-         *
-         * (Related: the anim_rate throttle's thresholds were hardcoded for a 30 cap
-         * and so NEVER fired at 60, which made anim_rate = 2 inert here. Now that
-         * they follow fps_cap, this profile's biggest sim lever actually engages.)
-         *
-         * The cuts are CPU-side because measurement says the CPU is the limit
-         * (~157 draws/frame, slow frames tracking VERTEX count, not draw count):
-         *   gpu_tier 0   weakest GPU identity; the engine then picks its own
-         *                low-spec path. Worth 22.2 -> 26.2 fps on its own.
-         *   outlines/shadows off
-         *   detail 700   biases the engine to coarser BAKED LODs -- one of only two
-         *                runtime levers that cut vertex count itself.
-         *   dist 3000    culls distant geometry before submission.
-         *   anim_rate 2  half-rate animation blending. Motion and lip-sync visibly
-         *                step, which is why quality/default keep it at 1. Note the
-         *                throttle only engages while frames are actually dropping,
-         *                and its thresholds now follow fps_cap (they were hardcoded
-         *                for 30 and never fired at all at a 60 cap).
-         * Resolution STAYS 576x326: pixels were never the bottleneck, so dropping
-         * further trades sharpness for almost nothing.
-         *
-         * ★ skinning stays FULL. It was set to 0 here on 2026-07-30 as a
-         * "character-scaling fix" on the theory that
-         * GameEngine::mbFixRecursiveAnimationContribution was the per-character
-         * cost. Disassembly says otherwise: the software-skinning decision in
-         * RenderObject_Mesh::_RenderMeshInstance (@0xab7088) branches only on
-         * (skeletonInstance != NULL), mesh flags bit 23, and mesh[+0x1c8] -- the
-         * flag appears nowhere in it. So it cannot reduce per-character skinning or
-         * the per-mesh vertex-buffer respecify, which is why "even on lowest
-         * everything struggles" was the result. Meanwhile reduced skinning makes
-         * attached parts (a costume, a chest lid) trail the body: a real visual
-         * DEFECT, not a quality tier. Shipping a known defect for a lever that
-         * provably does not act on the cost is a strict loss, so it is 1 again.
-         * The actual per-character cost is graphics.txt `map_buffers` -- see
-         * so_patch() and PERF_FINDINGS_2026-07-30.md. */
-        /* ★ RETUNED 2026-07-31. A 79-minute device session on these settings averaged
-         * 23.9 fps -- roughly what `battery` aims for, from the profile named
-         * "fastest". Every cheap lever was already taken (gpu_tier 0, outlines off,
-         * shadows off, anim_rate 2), so the remaining headroom is the one thing slow
-         * frames actually track: VERTEX COUNT. detail 700 -> 600 and dist 3000 ->
-         * 2500 both attack it -- detail biases the engine to coarser baked LODs,
-         * distance culls whole objects before submission. Geometry gets visibly
-         * chunkier and far scenery pops in sooner; that is the entire point of the
-         * profile, and it is the only place left to take time from.
-         * Resolution STILL stays 576x326 -- pixels were never the bottleneck (the GPU
-         * idles ~40% while frames take 55ms), so dropping it further would cost
-         * sharpness and buy nothing. */
-        /* ★★ anim_rate IS 1, NOT 2 (2026-08-01). Half-rate animation blending was the
-         * last "make it faster by making it worse" lever still shipping, and it is the
-         * most visible one: it steps FACIAL animation and lip-sync, on a dialogue-driven
-         * adventure game where faces are what the camera is pointed at. Reported from
-         * device as "facial animations are kinda fucked on basic performance profile".
-         *
-         * A profile may cost sharpness, draw distance, geometry detail or frame rate.
-         * It may NOT make the game look WRONG -- that is the same line already drawn
-         * for `skinning = reduced` (attachments trailing the body) two entries up.
-         * Speed comes out of pixels and vertices, never out of correctness.
-         *
-         * The frames are elsewhere anyway: animation is only ~15% of a frame, so this
-         * was a small win bought at a large visual cost. */
+        /* Fastest preset. A 30 FPS cap matches the two-vblank cadence this workload
+         * can realistically reach. CPU-side cuts use the weakest GPU identity,
+         * shorter distance, coarser detail, and no outline/shadow submissions.
+         * Full animation and skinning stay enabled because reducing either caused
+         * visible facial or attachment defects without fixing the frame bottleneck. */
         c->render_w = 640; c->render_h = 362; c->fps_cap = 30; c->vsync = 1;
         c->outlines = 0;   c->shadows = 0;    c->draw_distance = 2500; c->skinning_full = 1;
         c->anim_rate = 1;   c->detail = 600;   c->render_quality = -1; c->gpu_tier = 0;
         c->shader_opt = 2; c->clock_adaptive = 0; c->clock_mhz = 444; break;
 
     case PROF_BATTERY:
-        /* Longest play time. Power on this console tracks CPU clock and pixels, so:
-         * downclock when idle, weakest GPU identity, coarser geometry,
-         *
-         * ☠ 456x258 IS NOT AN EXACT HALF OF 960x544 (2026-08-01). This was 480x272
-         * precisely because that IS half, so it upscaled by clean pixel doubling with
-         * no resampling -- and sanitize_framebuffer_override() was fixed specifically
-         * to stop snapping it to 480x270 and destroying that. The ~10% step down was
-         * requested across every profile and gives the doubling up: the upscale now
-         * resamples and reads a touch softer. A deliberate trade, not an oversight --
-         * put this one line back to 480x272 to recover the crisp doubling. Note that
-         * `upscale = nearest` only pays off at the exact 2x ratio, so it no longer
-         * helps here either,
-         * half-rate animation, and 20fps -- a lower locked rate is less work per
-         * second AND a clean 3-vblank lock.
-         *
-         * ★ skinning is FULL here too, for exactly the reason PROF_PERFORMANCE gives
-         * above: the flag does not reach the software-skinning decision at all
-         * (RenderObject_Mesh::_RenderMeshInstance branches on skeletonInstance,
-         * mesh flags bit 23 and mesh[+0x1c8] -- never on it), so it saves nothing,
-         * while reduced skinning makes attached parts visibly trail the body. This
-         * profile trades frames and pixels for battery; it does not get to trade
-         * correctness for nothing. It was the last profile still shipping that
-         * defect. */
-        /* ★ RETUNED 2026-07-31 (detail 700 -> 600, dist 3000 -> 2500, matching
-         * `performance`). 20fps is a 50ms budget and these settings already fit it --
-         * measured sim on the heavier performance profile is p50 26ms / p90 42ms --
-         * so the extra cuts are NOT about hitting the cap. They are the battery win
-         * itself: the adaptive governor below only steps the ARM clock down when a
-         * frame finishes early, so every millisecond of headroom converts directly
-         * into a lower clock for the rest of that frame. Buying headroom this profile
-         * does not need for frames is exactly how it buys runtime. */
-        /* anim_rate 1 here too, for the reason spelled out in PROF_PERFORMANCE: stepped
-         * faces and lip-sync are a defect, not a battery setting. Battery buys its
-         * runtime from pixels, geometry and clock -- all of which look correct, just
-         * simpler. */
+        /* Longest-play-time preset: lower render cost, weakest GPU identity, coarser
+         * geometry, and adaptive ARM clock. It still requests 30 FPS and keeps full
+         * animation/skinning correctness; power savings come from simpler work. */
         c->render_w = 576; c->render_h = 326; c->fps_cap = 30; c->vsync = 1;
         c->outlines = 0;   c->shadows = 0;    c->draw_distance = 3000; c->skinning_full = 1;
         c->anim_rate = 1;   c->detail = 700;   c->render_quality = -1; c->gpu_tier = 0;
@@ -344,7 +191,7 @@ static void apply_profile(McsmCfg *c, int prof) {
          * the shipped graphics.txt told players exactly that. But the caller does
          *     apply_profile(&g_cfg, p == PROF_CUSTOM ? PROF_BALANCED : p);
          * so PROF_CUSTOM never arrives here -- custom really starts from BALANCED
-         * (720x408, dist 5000). Every other enumerator has its own case, so nothing
+         * (720x408, dist 4000). Every other enumerator has its own case, so nothing
          * can reach this arm at all.
          *
          * Kept only as a defensive fallback for an out-of-range value, and made
@@ -358,8 +205,8 @@ static void apply_profile(McsmCfg *c, int prof) {
          * touch PROF_BALANCED, touch this too -- or better, delete this arm and let
          * the compiler's -Wswitch tell you when an enumerator is unhandled. */
         c->render_w = 720; c->render_h = 408; c->fps_cap = 30; c->vsync = 1;
-        c->outlines = 1;   c->shadows = 0;    c->draw_distance = 5000; c->skinning_full = 1;
-        c->anim_rate = 1;   c->detail = 1000;  c->render_quality = -1; c->gpu_tier = 1;
+        c->outlines = 1;   c->shadows = 0;    c->draw_distance = 4000; c->skinning_full = 1;
+        c->anim_rate = 1;   c->detail = 900;   c->render_quality = -1; c->gpu_tier = 0;
         c->shader_opt = 2; c->clock_adaptive = 0; c->clock_mhz = 444; break;
     }
 }
@@ -403,6 +250,27 @@ static int split_kv(const char *line, char *k, int ksz, char *v, int vsz) {
     return sscanf(norm, fmt, k, v) == 2;
 }
 
+/* Import the flat tuning files used by the proven v1.7 data layout when the
+ * consolidated graphics.txt does not exist. New data folders stay governed by
+ * graphics.txt; this fallback only prevents an existing working folder from
+ * silently losing its resolution/FPS/effect choices after updating the VPK. */
+static int legacy_read_token(const char *name, char *dst, size_t cap) {
+    FILE *f = mcsm_open_setting(name, "r");
+    if (!f) return 0;
+    char value[64] = "";
+    const int ok = fscanf(f, " %63s", value) == 1;
+    fclose(f);
+    if (ok) cfg_set(dst, cap, value);
+    return ok;
+}
+
+static int legacy_marker_present(const char *name) {
+    FILE *f = mcsm_open_setting(name, "r");
+    if (!f) return 0;
+    fclose(f);
+    return 1;
+}
+
 static void load_cfg(void) {
     char prof[16] = "balanced";
     char res[16] = "", fps[16] = "", vsync[16] = "", outl[16] = "", shad[16] = "";
@@ -416,8 +284,10 @@ static void load_cfg(void) {
     char cmode[16] = "easy", cpicture[16] = "", cmotion[16] = "", ceffects[16] = "", cworld[16] = "", cpower[16] = "";
     char ares[16] = "", afps[16] = "", avsync[16] = "", aoutl[16] = "", ashad[16] = "";
     char anfilt[16] = "", afbz[16] = "", aupsc[16] = "", adist[16] = "", aclk[16] = "", adet[16] = "", agpu[32] = "";
+    char aarate[16] = "";
 
     FILE *f = mcsm_open_setting("graphics.txt", "r");
+    const int have_graphics = (f != NULL);
     if (f) {
         char line[160], k[24], v[64];
         while (fgets(line, sizeof(line), f)) {
@@ -453,6 +323,7 @@ static void load_cfg(void) {
             else if (!strcmp(k, "advanced_upscale"))       cfg_set(aupsc, sizeof(aupsc), v);
             else if (!strcmp(k, "advanced_draw_distance")) cfg_set(adist, sizeof(adist), v);
             else if (!strcmp(k, "advanced_clock"))         cfg_set(aclk, sizeof(aclk), v);
+            else if (!strcmp(k, "advanced_anim_rate"))     cfg_set(aarate, sizeof(aarate), v);
             else if (!strcmp(k, "advanced_detail"))        cfg_set(adet, sizeof(adet), v);
             else if (!strcmp(k, "advanced_gpu"))           cfg_set(agpu, sizeof(agpu), v);
             else if (!strcmp(k, "resolution"))    cfg_set(res, sizeof(res), v);
@@ -482,6 +353,36 @@ static void load_cfg(void) {
             else if (!strcmp(k, "fbfetch_zero"))  cfg_set(fbz, sizeof(fbz), v);
         }
         fclose(f);
+    }
+
+    if (!have_graphics) {
+        int imported = 0;
+        imported |= legacy_read_token("fb_override.txt", res, sizeof(res));
+        imported |= legacy_read_token("fps_cap.txt", fps, sizeof(fps));
+        imported |= legacy_read_token("anim_rate.txt", arate, sizeof(arate));
+        imported |= legacy_read_token("anim_full.txt", skin, sizeof(skin));
+        imported |= legacy_read_token("render_quality.txt", rq, sizeof(rq));
+        imported |= legacy_read_token("far_clip.txt", dist, sizeof(dist));
+
+        char detail_scale[16] = "";
+        if (legacy_read_token("detail_scale.txt", detail_scale, sizeof(detail_scale))) {
+            const float scale = (float)atof(detail_scale);
+            if (scale >= 0.1f && scale <= 1.0f) {
+                snprintf(det, sizeof(det), "%d", (int)(scale * 1000.0f + 0.5f));
+            }
+            imported = 1;
+        }
+
+        if (legacy_marker_present("shadows.txt"))       { cfg_set(shad, sizeof(shad), "on");  imported = 1; }
+        if (legacy_marker_present("no_shadows.txt"))    { cfg_set(shad, sizeof(shad), "off"); imported = 1; }
+        if (legacy_marker_present("no_outlines.txt"))   { cfg_set(outl, sizeof(outl), "off"); imported = 1; }
+        if (legacy_marker_present("novsync.txt"))       { cfg_set(vsync, sizeof(vsync), "off"); imported = 1; }
+        if (legacy_marker_present("nearest_filter.txt")){ cfg_set(nfilt, sizeof(nfilt), "on"); imported = 1; }
+        if (legacy_marker_present("fbfetch_zero.txt"))  { cfg_set(fbz, sizeof(fbz), "on"); imported = 1; }
+
+        if (imported) {
+            l_info("CONFIG(graphics): graphics.txt absent; imported compatible v1.7 flat tuning files");
+        }
     }
 
     int p = PROF_BALANCED;
@@ -541,6 +442,7 @@ static void load_cfg(void) {
             if (aupsc[0])  cfg_set(upsc,  sizeof(upsc),  aupsc);
             if (adist[0])  cfg_set(dist,  sizeof(dist),  adist);
             if (aclk[0])   cfg_set(clk,   sizeof(clk),   aclk);
+            if (aarate[0]) cfg_set(arate, sizeof(arate), aarate);
             if (adet[0])   cfg_set(det,   sizeof(det),   adet);
             if (agpu[0])   cfg_set(gpu_name, sizeof(gpu_name), agpu);
         }

@@ -53,13 +53,13 @@ To build the self-contained Windows EXE from source:
 .\data-builder\build.ps1
 ```
 
-The app also creates `settings/graphics.txt` and `settings/game.txt`. **Balanced** is the recommended starting profile. The profile guide shows every preset's resolution, FPS cap, reported PowerVR GPU, detail, distance, and main tradeoff. The built-in Custom Profile maker exposes six simple Easy choices or exact Advanced resolution, FPS, PowerVR GPU name, effects, detail, distance, clock, filtering, and compatibility fixes. The generated text remains editable afterward. Advanced mode includes a 60 FPS cap, but that is a maximum target rather than a guaranteed lock—crowded scenes with many characters can fall to around 20 FPS.
+The app also creates `settings/graphics.txt` and `settings/game.txt`. **Balanced** is the recommended starting profile. The profile guide shows every preset's resolution, FPS cap, reported PowerVR GPU, detail, distance, and main tradeoff. The built-in Custom Profile maker exposes six simple Easy choices or exact Advanced resolution, uncapped/60/30/20/15 FPS, PowerVR GPU name, effects, animation rate, detail, distance, clock, filtering, and compatibility fixes. The generated text remains editable afterward. A demanding frame can still miss its target, but the presenter no longer converts brief misses into a persistent 20 FPS lock. Existing v1.7 flat tuning files remain supported whenever no consolidated `graphics.txt` is present.
 
 The **Fix & mods** panel can install a supplied controller-button asset fix and merge extra folders/ZIPs into the generated data directory. Locally distributed builds can also include the supported offline `choice.prop` dataset required by the crowd-choice statistics screen. General mod installation is experimental and has not been tested on Vita; add-ons are applied last, while the canonical OBBs and native runtime libraries remain protected.
 
 ## Known limitations
 
-- Crowded scenes can become CPU-heavy and fall to around 20 FPS.
+- Crowded scenes can still produce individual ~20 FPS frame intervals when CPU-heavy, but the configured 30/60 FPS target is retried immediately instead of being auto-downgraded.
 - The first boot can remain black for roughly 30 seconds while caches are created.
 - Save-slot titles cannot currently be renamed.
 - Experimental data add-ons/mods have not been validated on Vita hardware.

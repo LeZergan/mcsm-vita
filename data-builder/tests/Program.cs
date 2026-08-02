@@ -375,6 +375,7 @@ try
             Mode = "advanced",
             Resolution = "640x362",
             FpsCap = 60,
+            AnimationRate = 2,
             AdvancedGpu = "sgx541",
             Outlines = "off",
             Shadows = "off",
@@ -457,6 +458,7 @@ try
     Assert(graphics.Contains("custom_mode = advanced"), "Custom profile mode was not written.");
     Assert(graphics.Contains("advanced_resolution      = 640x362"), "Custom resolution was not written.");
     Assert(graphics.Contains("advanced_fps_cap         = 60"), "Custom 60 FPS cap was not written.");
+    Assert(graphics.Contains("advanced_anim_rate       = 2"), "Custom animation update rate was not written.");
     Assert(graphics.Contains("advanced_gpu             = sgx541"), "Custom PowerVR GPU name was not written.");
     Assert(graphics.Contains("advanced_detail          = 650"), "Custom detail was not written.");
     Assert(graphics.Contains("advanced_draw_distance   = 3000"), "Custom draw distance was not written.");

@@ -15,7 +15,7 @@ public sealed class ProfileGuideDialog : Form
         new(
             "BALANCED",
             "RECOMMENDED",
-            "720×408  ·  30 FPS cap  ·  SGX 541  ·  full detail  ·  5000 distance  ·  outlines on",
+            "720×408  ·  30 FPS cap  ·  SGX 540  ·  900 detail  ·  4000 distance  ·  outlines on",
             "The best all-round starting point: clear text, broad scenery and normal animation."),
         new(
             "PERFORMANCE",
@@ -35,8 +35,8 @@ public sealed class ProfileGuideDialog : Form
         new(
             "CUSTOM",
             "YOUR SETTINGS",
-            "Easy choices or exact resolution, 60/30/20/15 cap, PowerVR GPU, effects, detail and clock",
-            "A cap is a target, not a guarantee: crowded character scenes can still fall near 20 FPS.")
+            "Easy choices or exact FPS, resolution, GPU, effects, animation, world and power",
+            "Caps recover immediately after late frames; they no longer latch to 20 FPS.")
     ];
 
     public ProfileGuideDialog()

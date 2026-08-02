@@ -42,7 +42,7 @@ custom_power   = performance    # battery | performance
 #   Use this block when custom_mode = advanced.
 
 advanced_resolution      = 720x408   # 960x544 | 800x452 | 720x408 | 640x362 | 576x326 | 480x272
-advanced_fps_cap         = 30        # 60 | 30 | 20 | 15
+advanced_fps_cap         = 30        # 0=uncapped | 60 | 30 | 20 | 15
 advanced_gpu             = sgx540    # sgx540 | sgx541 | sgx542 | sgx543 | sgx543mp
 advanced_outlines        = on        # on | off
 advanced_shadows         = off       # on | off
@@ -51,6 +51,7 @@ advanced_draw_distance   = 3500      # 2500 to 6000; 0 = unlimited
 advanced_clock           = 444       # 444 | adaptive
 advanced_upscale         = linear    # linear | nearest
 advanced_vsync           = on        # on | off
+advanced_anim_rate       = 1         # 1=full | 2=half | 3=third; never changes automatically
 advanced_nearest_filter  = off       # on fixes thin white block seams
 advanced_fbfetch_zero    = off       # on fixes solid-white glass/lights
 
@@ -64,9 +65,9 @@ advanced_fbfetch_zero    = off       # on fixes solid-white glass/lights
 # MOTION:  smooth=30 fps | steady=20 fps | low=15 fps
 #
 # ADVANCED 60 FPS
-#   Set advanced_fps_cap = 60 for the highest possible frame-rate target.
-#   This is a cap, not a guaranteed lock. Crowded scenes with many characters
-#   can still fall to around 20 fps because the game becomes CPU-heavy.
+#   Set advanced_fps_cap = 60 for the highest capped target, or 0 for uncapped.
+#   This is a cap, not a guaranteed lock. A busy frame can still miss the target,
+#   but brief misses no longer lock the game to 20 fps.
 #
 # GPU:     fastest/sgx540 = PowerVR SGX 540
 #          fast/sgx541    = PowerVR SGX 541
@@ -80,6 +81,7 @@ advanced_fbfetch_zero    = off       # on fixes solid-white glass/lights
 #          detailed=1000/5000 | unlimited=1000/unlimited
 #
 # POWER:   performance=444 MHz | battery=adaptive clock
+# ANIMATION: 1=full rate | 2=half rate | 3=third rate (explicit Advanced choice)
 #
 # ============================================================================
 #   RESET

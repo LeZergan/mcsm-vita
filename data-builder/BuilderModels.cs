@@ -74,11 +74,12 @@ public sealed record CustomProfileSettings
     public string Clock { get; init; } = "444";
     public string Upscale { get; init; } = "linear";
     public string Vsync { get; init; } = "on";
+    public int AnimationRate { get; init; } = 1;
     public string NearestFilter { get; init; } = "off";
     public string FbfetchZero { get; init; } = "off";
 
     public string Summary => Mode == "advanced"
-        ? $"Advanced · {Resolution} · {FpsCap} FPS · {AdvancedGpu.ToUpperInvariant()}"
+        ? $"Advanced · {Resolution} · {(FpsCap == 0 ? "uncapped" : $"{FpsCap} FPS")} · {AdvancedGpu.ToUpperInvariant()}"
         : $"Easy · {Cap(Picture)} · {MotionFps(Motion)} FPS · {GpuLabel(Gpu)}";
 
     private static string Cap(string value) =>

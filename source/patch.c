@@ -1428,11 +1428,11 @@ static void resolve_animation_runtime_flags(void) {
  * absent or "1" -> full (default, current behaviour). */
 static int mcsm_anim_full(void) { return mcsm_cfg()->skinning_full; }
 
-/* ANIMATION UPDATE-RATE THROTTLE (2026-07-20, priority-3 sim lever). The heaviest
+/* ANIMATION UPDATE-RATE CONTROL (2026-07-20, priority-3 sim lever). The heaviest
  * scenes spend ~50ms in the sim, dominated by animation blend across many
  * PlaybackControllers. Advancing them every Nth frame with N*accumulated-dt halves
  * (N=2) the blend cost at CORRECT wall-clock speed (no slow-mo). Opt-in + tunable:
- * ux0:data/mcsm/settings/anim_rate.txt = 1 (full, default) / 2 (half) / 3 (third).
+ * settings/graphics.txt `anim_rate` = 1 (full, default) / 2 (half) / 3 (third).
  * Visual trade: close-up motion + lip-sync step at ~15Hz (N=2), so it's for heavy
  * gameplay/crowd scenes, not dialogue. Default 1 = zero change. */
 static int mcsm_anim_rate(void) {
@@ -2392,63 +2392,17 @@ static int playback_dt_is_usable(float value) {
 
 static void hook_playback_controller_update(uint32_t frame_time_bits,
                                             uint32_t actual_frame_time_bits) {
-    /* Animation-rate throttle (opt-in anim_rate.txt): on non-Nth frames, accumulate
+    /* Explicit animation-rate control: on non-Nth frames, accumulate
      * this frame's dt and SKIP the whole update (controllers don't advance); on the
      * Nth frame, run the update with the accumulated dt so wall-clock speed stays
-     * correct. Not applied during boot (governor owns that phase). Halves/thirds the
-     * per-frame anim-blend sim cost in heavy scenes. */
+     * correct. It is never applied during boot. There is deliberately no hidden
+     * engage/release governor: `anim_rate = 2|3` means exactly what the user chose,
+     * while the default `1` leaves every animation update intact. */
     {
         const int rate = mcsm_anim_rate();
-        /* FPS-GATED anim throttle: skip controller updates ONLY while the frame is
-         * genuinely dropping (present cadence from gl_swap), so normal ~30fps scenes
-         * keep FULL-rate animation. This is exactly what the earlier unconditional
-         * throttle got wrong — it slowed the chest-open in LIGHT scenes. Device data:
-         * light=~31ms present, heavy=~47-59ms. Quick engage (5 slow frames) / slow
-         * release (90 healthy frames) with a wide 33-38ms dead-band, so a throttle
-         * that lands a scene mid-band HOLDS steady instead of oscillating. */
-        static int   throttle_active = 0;
         static uint32_t phase = 0;
         static float acc_ft = 0.0f, acc_aft = 0.0f;
-        if (rate > 1 && !g_boot_scene_active) {
-            extern volatile uint32_t g_mcsm_present_dt_us;
-            const uint32_t pdt = g_mcsm_present_dt_us;
-            static uint32_t slow = 0, fast = 0;
-            /* ★ THRESHOLDS MUST FOLLOW THE CONFIGURED CAP (fixed 2026-07-30).
-             * These were the literals 38000 and 33000, i.e. hand-tuned for a 30fps
-             * cap only, which made the throttle misbehave on every other rate:
-             *   fps_cap=24 (period 41666): a PERFECTLY paced frame is 41666us, which
-             *     is > 38000, so it counted as "dropping" -- the throttle would latch
-             *     ON permanently and halve animation on a profile that was hitting
-             *     its target exactly.
-             *   fps_cap=60 (period 16666): a frame at 33ms is a catastrophic miss
-             *     (half rate), yet 33000 is neither > 38000 nor < 33000, so it landed
-             *     in the dead-band and the throttle NEVER engaged -- anim_rate=2 on
-             *     the performance profile was silently inert.
-             * Derive both from the real period instead. The ratios reproduce the old
-             * 30fps behaviour (37500/33333 vs the old 38000/33000) so that rate is
-             * unchanged, while 24 and 60 now mean what they say. */
-            const uint32_t period = mcsm_frame_period_us();
-            const uint32_t drop_us = period ? (period + period / 8u)  : 38000u; /* 1.125x */
-            /* "Healthy" must be slightly ABOVE the period, not equal to it. A
-             * perfectly paced frame measures the period (or a hair over), which is
-             * neither > drop_us nor < period -- so with ok_us == period it landed in
-             * the dead-band forever and a throttle that had once engaged could never
-             * release. +3% makes an on-target frame count as healthy. */
-            const uint32_t ok_us   = period ? (period + period / 32u) : 34000u;
-            if      (pdt > drop_us) { slow++; fast = 0; }   /* clearly dropping      */
-            else if (pdt < ok_us)   { fast++; slow = 0; }   /* holding target        */
-            else                    { slow = 0; fast = 0; } /* dead-band: hold state */
-            if (!throttle_active && slow >= 5u) {
-                throttle_active = 1; phase = 0; acc_ft = 0.0f; acc_aft = 0.0f;
-                l_info("ANIM: throttle ON 1/%d (present=%uus dropping)", rate, pdt);
-            } else if (throttle_active && fast >= 90u) {
-                throttle_active = 0;
-                l_info("ANIM: throttle OFF (present=%uus recovered)", pdt);
-            }
-        } else if (throttle_active) {
-            throttle_active = 0;
-        }
-        if (throttle_active) {
+        if (rate > 1 && g_boot_scene_active) {
             acc_ft  += float_from_bits(frame_time_bits);
             acc_aft += float_from_bits(actual_frame_time_bits);
             if ((++phase % (uint32_t)rate) != 0u) {
@@ -2457,6 +2411,10 @@ static void hook_playback_controller_update(uint32_t frame_time_bits,
             frame_time_bits        = float_bits(acc_ft);
             actual_frame_time_bits = float_bits(acc_aft);
             acc_ft = 0.0f; acc_aft = 0.0f;
+        } else {
+            phase = 0;
+            acc_ft = 0.0f;
+            acc_aft = 0.0f;
         }
     }
 
@@ -6743,7 +6701,7 @@ static void patch_login_diag_hooks(void) {
  *       (fewer runtime shader compiles AND less per-frame CPU/GPU). The hook ALWAYS
  *       logs the natural values the game sets (so a diagnostic run reveals the enum
  *       in loader.log) and only OVERRIDES when settings/render_quality.txt = <int>.
- *   (2) toon OUTLINE pass — RenderObject_Mesh::SetRenderToonOutline(bool). Forcing
+ *   (2) OUTLINE pass — RenderObject_Mesh::SetRenderToonOutline(bool). Forcing
  *       it off skips the per-mesh outline submit. Opt-in: settings/graphics.txt (outlines).
  * Both alter visuals, so both are OFF by default — zero effect on the shader-key-fix
  * validation; enable to A/B toward reliable 30fps. */
@@ -7096,7 +7054,7 @@ static void patch_render_perf_hooks(void) {
                                             &g_hook_set_toon_outline,
                                             &g_set_toon_outline_tramp);
         }
-        l_info("PERF: toon outlines DISABLED (graphics.txt outlines=off) — outline submit skipped.");
+        l_info("PERF: outlines DISABLED (graphics.txt outlines=off) — outline submit skipped.");
     }
     if (detail_scale() > 0.0f) {
         (void)mcsm_install_tramp_hook("_ZN5Scene17SetBrushFarDetailEf",

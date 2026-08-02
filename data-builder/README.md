@@ -21,7 +21,7 @@ The main screen intentionally stays compact: exact version/renderer results, bot
 
 ### Custom profile maker
 
-The output screen includes **Make custom** beside the profile selector. Saving the dialog automatically selects Custom and writes the chosen Easy or Advanced values into `settings/graphics.txt`. Easy mode covers picture, motion, PowerVR GPU identity, effects, world detail, and CPU power. Advanced mode includes the 60 FPS cap, exact resolution, detail, draw distance, clock, VSync, upscale filter, outlines, shadows, thin-seam filtering, and the white glass/light fix. These remain normal text settings that users can change later.
+The output screen includes **Make custom** beside the profile selector. Saving the dialog automatically selects Custom and writes the chosen Easy or Advanced values into `settings/graphics.txt`. Easy mode covers picture, motion, PowerVR GPU identity, effects, world detail, and CPU power. Advanced mode includes uncapped/60/30/20/15 FPS, exact resolution, detail, draw distance, clock, VSync, explicit full/half/third-rate animation updates, upscale filtering, outlines, shadows, thin-seam filtering, and the white glass/light fix. These remain normal text settings that users can change later.
 
 ### Controller button fix
 

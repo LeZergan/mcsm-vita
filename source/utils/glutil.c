@@ -1415,8 +1415,8 @@ void gl_init() {
         rs_init(render_w, render_h);
     }
 
-    /* Present-side frame lock period from fps_cap.txt (read once, here, where
-     * file I/O is safe — NOT in gl_swap). */
+    /* Present-side frame cap from graphics.txt (read once, here, where file I/O
+     * is safe — NOT in gl_swap). */
     {
         int fps = mcsm_cfg()->fps_cap;
         if (fps > 0 && fps <= 120) {
@@ -1561,7 +1561,7 @@ void gl_swap() {
      * between 60 and 30fps = persistent judder, even on a static camera (the sim
      * pace alone can't fix this — it doesn't gate the present). Enforce a steady
      * minimum present interval so the display rate is consistent (no beating).
-     * Period = 1/fps_cap.txt (e.g. 30 -> 33.3ms). fps_cap 0/absent = off. */
+     * Period = 1/graphics.txt fps_cap (e.g. 30 -> 33.3ms). A cap of 0 is off. */
     if (g_present_period_us > 0 && g_present_vb_whole > 0) {
         /* ★★★ EXACT PACING BY VBLANK COUNT. This is the whole fix.
          *
@@ -1581,28 +1581,26 @@ void gl_swap() {
          * Missed frames resync instead of accumulating debt, so a slow patch can never
          * produce a catch-up burst afterwards. */
         static unsigned s_next_vc = 0;
-        static int s_extra_vb = 0, s_miss = 0, s_hit = 0;
 
         const unsigned vc = (unsigned)sceDisplayGetVcount();
-        const int vb = g_present_vb_whole + s_extra_vb;
+        const int vb = g_present_vb_whole;
         if (!s_next_vc) s_next_vc = vc + (unsigned)vb;
 
         const int remaining = (int)(s_next_vc - vc);   /* signed: survives wraparound */
 
-        /* HYSTERESIS. If frames keep arriving after their slot, widen the cadence by a
-         * whole vblank and HOLD -- a steady 20 reads far better than a 30 that keeps
-         * dropping to 20. Drop fast (4 misses) so judder ends quickly; recover slowly
-         * (90 clean frames) so a brief lull cannot restart the oscillation. */
-        if (remaining <= 0) { s_miss++; s_hit = 0; } else { s_hit++; s_miss = 0; }
-        if (s_miss >= 4 && s_extra_vb < 2) {
-            s_extra_vb++; s_miss = 0;
-            l_info("PACING: frames arriving late — widening to %d vblanks (%d fps) and holding",
-                   g_present_vb_whole + s_extra_vb, 60 / (g_present_vb_whole + s_extra_vb));
-        } else if (s_hit >= 90 && s_extra_vb > 0) {
-            s_extra_vb--; s_hit = 0;
-            l_info("PACING: sustained headroom — narrowing to %d vblanks (%d fps)",
-                   g_present_vb_whole + s_extra_vb, 60 / (g_present_vb_whole + s_extra_vb));
-        }
+        /* NEVER AUTO-DOWNSHIFT THE USER'S CAP.
+         *
+         * The old hysteresis widened `vb` after only four late frames and held the
+         * wider cadence for 90 frames. A 60 FPS request therefore became 30 after
+         * four ordinary >16.7 ms frames, then became 20 after four >33.3 ms frames.
+         * The same mechanism pulled a 30 FPS profile to 20 during a short busy patch
+         * and kept it there after the scene recovered. That is why every profile
+         * appeared hard-locked to 20 regardless of the selected cap.
+         *
+         * A cap is a maximum presentation cadence, not a dynamic quality governor.
+         * A genuinely slow frame can still miss its slot and present on a later
+         * vblank, but the following frame immediately targets the configured cadence
+         * again. This preserves natural 30/60 recovery without catch-up bursts. */
 
         if (remaining > 1) {
             sceDisplayWaitVblankStartMulti((unsigned int)(remaining - 1));
@@ -1610,7 +1608,7 @@ void gl_swap() {
         /* Schedule the next slot. Late frames present at vc+1 (the swap's own wait), so
          * the next slot is measured from there rather than from a target we already
          * missed -- that is what stops debt accumulating. */
-        s_next_vc = (remaining > 0 ? s_next_vc : vc + 1u) + (unsigned)(g_present_vb_whole + s_extra_vb);
+        s_next_vc = (remaining > 0 ? s_next_vc : vc + 1u) + (unsigned)g_present_vb_whole;
     } else if (g_present_period_us > 0) {
         /* FRACTIONAL cap (24, 40, ...): no single vblank count expresses it, so keep the
          * exact microsecond timeline with its remainder carry. Reachable only by hand

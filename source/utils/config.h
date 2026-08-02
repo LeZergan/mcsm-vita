@@ -17,7 +17,7 @@ typedef struct {
     int  fps_cap;             /* target fps; 0 = uncapped                        */
     int  vsync;               /* 1 = on (smooth), 0 = off (higher fps, tearing)  */
     /* graphics */
-    int  outlines;            /* 1 = toon outlines on, 0 = off (fewer draws)     */
+    int  outlines;            /* 1 = outlines on, 0 = off (fewer draws)          */
     int  shadows;             /* 1 = cast shadows on, 0 = off (fewer draws)      */
     int  draw_distance;       /* far-clip cap in world units; 0 = engine default */
     int  skinning_full;       /* 1 = full char animation, 0 = reduced (less CPU) */

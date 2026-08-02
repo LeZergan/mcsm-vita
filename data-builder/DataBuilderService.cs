@@ -733,14 +733,18 @@ public sealed class DataBuilderService
         RequireOption(custom.Power, ["battery", "performance"], "custom power");
 
         RequireOption(custom.Resolution, ["960x544", "800x452", "720x408", "640x362", "576x326", "480x272"], "advanced resolution");
-        if (custom.FpsCap is not (60 or 30 or 20 or 15))
+        if (custom.FpsCap is not (0 or 60 or 30 or 20 or 15))
         {
-            throw new InvalidDataException("Custom FPS cap must be 60, 30, 20, or 15.");
+            throw new InvalidDataException("Custom FPS cap must be uncapped (0), 60, 30, 20, or 15.");
         }
         RequireOption(custom.AdvancedGpu, ["sgx540", "sgx541", "sgx542", "sgx543", "sgx543mp"], "advanced GPU");
         RequireOnOff(custom.Outlines, "outlines");
         RequireOnOff(custom.Shadows, "shadows");
         RequireOnOff(custom.Vsync, "VSync");
+        if (custom.AnimationRate is < 1 or > 3)
+        {
+            throw new InvalidDataException("Animation update rate must be 1, 2, or 3.");
+        }
         RequireOnOff(custom.NearestFilter, "seam fix");
         RequireOnOff(custom.FbfetchZero, "glass/light fix");
         RequireOption(custom.Clock, ["444", "adaptive"], "clock");
@@ -1170,6 +1174,7 @@ public sealed class DataBuilderService
             ["advanced_clock"] = custom.Clock,
             ["advanced_upscale"] = custom.Upscale,
             ["advanced_vsync"] = custom.Vsync,
+            ["advanced_anim_rate"] = custom.AnimationRate.ToString(),
             ["advanced_nearest_filter"] = custom.NearestFilter,
             ["advanced_fbfetch_zero"] = custom.FbfetchZero
         };
