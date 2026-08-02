@@ -23,7 +23,7 @@ Development progress, oldest to newest:
 4. [Gameplay & chapter presentation](https://youtu.be/QsmPfikGh0A)
 5. [Texture fixes](https://youtu.be/BrGuSMM_j5U)
 6. [Stutter fix & optimisation — shader caching](https://youtu.be/IK8h5NXLh2k)
-7. [Performance improvements and fixes](https://youtu.be/4aSJUfWHK3w)
+7. [Performance improvements & fixes](https://youtu.be/4aSJUfWHK3w)
 
 ## Legal
 
