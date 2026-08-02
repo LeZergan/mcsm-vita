@@ -420,8 +420,12 @@ try
     Assert(first.ChoiceDataIncluded == (embeddedChoiceData is not null), "Offline choice-data status is wrong.");
     Assert(first.DataAddonFileCount == 4, "Experimental data add-on file count is wrong.");
     Assert(first.DataAddonOverwriteCount == 1, "Data add-on replacement count is wrong.");
-    Assert(File.Exists(Path.Combine(output, DataBuilderService.MainObbName)), "Canonical main OBB is missing.");
-    Assert(File.Exists(Path.Combine(output, DataBuilderService.PatchObbName)), "Auto-detected patch OBB is missing.");
+    Assert(!File.Exists(Path.Combine(output, DataBuilderService.MainObbName)), "Temporary main OBB was retained.");
+    Assert(!File.Exists(Path.Combine(output, DataBuilderService.PatchObbName)), "Temporary patch OBB was retained.");
+    Assert(File.Exists(Path.Combine(output, "cpuinfo")), "Working-layout cpuinfo seed is missing.");
+    Assert(File.Exists(Path.Combine(output, "meminfo")), "Working-layout meminfo seed is missing.");
+    Assert(File.Exists(Path.Combine(output, "prefs.prop")), "Working-layout prefs seed is missing.");
+    Assert(File.Exists(Path.Combine(output, "Temp", "prefs.prop")), "Working-layout Temp prefs seed is missing.");
     Assert(File.Exists(Path.Combine(output, "assets", "feedInfo.dat")), "APK asset is missing.");
     Assert(File.Exists(Path.Combine(output, "assets", "nested", "config.bin")), "Nested APK asset is missing.");
     Assert(File.Exists(Path.Combine(output, "assets", "MCSM_android_Minecraft102_data.ttarch2")), "Episode 2 marker is missing.");

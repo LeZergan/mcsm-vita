@@ -105,6 +105,8 @@ public sealed class DataBuilderService
         EnsureFreeSpace(outputDirectory, totalBytes);
 
         string stagingDirectory = Path.Combine(parent, $".mcsm-building-{Guid.NewGuid():N}");
+        string stagedMainObbPath = Path.Combine(stagingDirectory, MainObbName);
+        string stagedPatchObbPath = Path.Combine(stagingDirectory, PatchObbName);
         string? backupDirectory = null;
         var copiedNames = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         long copiedBytes = 0;
@@ -155,24 +157,24 @@ public sealed class DataBuilderService
             Report("Copying the main game data…");
             await CopyFileAsync(
                 request.MainObbPath,
-                Path.Combine(stagingDirectory, MainObbName),
+                stagedMainObbPath,
                 bytes => copiedBytes += bytes,
                 cancellationToken);
-            Report("Main OBB ready");
+            Report("Main OBB ready for extraction");
 
             await CopyFileAsync(
                 request.PatchObbPath,
-                Path.Combine(stagingDirectory, PatchObbName),
+                stagedPatchObbPath,
                 bytes => copiedBytes += bytes,
                 cancellationToken);
-            Report("Patch OBB ready");
+            Report("Patch OBB ready for extraction");
 
             int baseArchiveEntryCount = 0;
             if (!_allowSyntheticInputs)
             {
                 string assetsDirectory = Path.Combine(stagingDirectory, "assets");
                 TelltaleExtractionResult mainExtraction = await TelltaleObbExtractor.ExtractAsync(
-                    Path.Combine(stagingDirectory, MainObbName),
+                    stagedMainObbPath,
                     assetsDirectory,
                     "main",
                     Report,
@@ -187,7 +189,7 @@ public sealed class DataBuilderService
                 Report($"Main OBB extracted — {mainExtraction.FileCount} assets");
 
                 TelltaleExtractionResult patchExtraction = await TelltaleObbExtractor.ExtractAsync(
-                    Path.Combine(stagingDirectory, PatchObbName),
+                    stagedPatchObbPath,
                     assetsDirectory,
                     "patch",
                     Report,
@@ -202,6 +204,13 @@ public sealed class DataBuilderService
                 VerifyExtractedBaseAssets(assetsDirectory);
                 Report($"Patch OBB extracted — {patchExtraction.FileCount} assets");
             }
+
+            // The working Vita layout contains the extracted archives in assets/,
+            // not the Android OBB containers. The staged copies exist only so the
+            // extractor can safely create its temporary hard-link aliases.
+            File.Delete(stagedMainObbPath);
+            File.Delete(stagedPatchObbPath);
+            Report("Temporary OBB containers removed — extracted assets kept");
 
             // User-supplied fixes intentionally come after the base archives so they
             // can replace the original controller prompts instead of being overwritten.
@@ -262,6 +271,7 @@ public sealed class DataBuilderService
                 chapterFileCount += copied;
             }
 
+            await WriteRuntimeSeedFilesAsync(stagingDirectory, cancellationToken);
             await WriteSettingsAsync(stagingDirectory, request, cancellationToken);
             (int dataAddonFileCount, int dataAddonOverwriteCount) = await CopyDataAddonsAsync(
                 request.DataAddons,
@@ -285,6 +295,10 @@ public sealed class DataBuilderService
                 buttonFix,
                 choiceData,
                 requireBaseAssets: !_allowSyntheticInputs);
+
+            long outputBytes = Directory
+                .EnumerateFiles(stagingDirectory, "*", SearchOption.AllDirectories)
+                .Sum(path => new FileInfo(path).Length);
 
             Report("Finalizing the ready-to-copy folder…");
             if (Directory.Exists(outputDirectory))
@@ -320,7 +334,7 @@ public sealed class DataBuilderService
                 choiceData is not null,
                 dataAddonFileCount,
                 dataAddonOverwriteCount,
-                totalBytes);
+                outputBytes);
         }
         catch
         {
@@ -1176,6 +1190,59 @@ public sealed class DataBuilderService
         await File.WriteAllTextAsync(Path.Combine(settings, "game.txt"), game, new UTF8Encoding(false), cancellationToken);
     }
 
+    private static async Task WriteRuntimeSeedFilesAsync(
+        string stagingDirectory,
+        CancellationToken cancellationToken)
+    {
+        // Match the small Android compatibility files shipped in the proven
+        // tester-kit layout. The loader can repair these at runtime, but placing
+        // them up front keeps a freshly built folder identical in structure.
+        var textFiles = new Dictionary<string, string>
+        {
+            ["cpu_possible"] = "0-3\n",
+            ["cpu_present"] = "0-3\n",
+            ["cpuinfo"] =
+                "Processor\t: ARMv7 Processor rev 4 (v7l)\n" +
+                "processor\t: 0\n" +
+                "BogoMIPS\t: 1000.00\n" +
+                "Features\t: swp half thumb fastmult vfp edsp neon vfpv3 tls\n" +
+                "CPU implementer\t: 0x41\n" +
+                "CPU architecture: 7\n" +
+                "CPU variant\t: 0x0\n" +
+                "CPU part\t: 0xc09\n" +
+                "CPU revision\t: 4\n" +
+                "Hardware\t: PlayStation Vita\n",
+            ["meminfo"] =
+                "MemTotal:         512000 kB\n" +
+                "MemFree:          256000 kB\n" +
+                "MemAvailable:     256000 kB\n"
+        };
+
+        foreach ((string relative, string contents) in textFiles)
+        {
+            await File.WriteAllTextAsync(
+                Path.Combine(stagingDirectory, relative),
+                contents,
+                new UTF8Encoding(false),
+                cancellationToken);
+        }
+
+        foreach (string relative in new[]
+        {
+            "prefs.prop",
+            "user.prop",
+            "game_prefs.prop",
+            Path.Combine("Temp", "prefs.prop"),
+            Path.Combine("Temp", "user.prop"),
+            Path.Combine("Temp", "game_prefs.prop")
+        })
+        {
+            string destination = Path.Combine(stagingDirectory, relative);
+            Directory.CreateDirectory(Path.GetDirectoryName(destination)!);
+            await File.WriteAllBytesAsync(destination, Array.Empty<byte>(), cancellationToken);
+        }
+    }
+
     private static async Task WriteReadyMarkerAsync(
         string stagingDirectory,
         BuildRequest request,
@@ -1194,7 +1261,7 @@ public sealed class DataBuilderService
             "Copy this entire mcsm folder to ux0:data\\ on the PS Vita.\r\n" +
             "The final Vita path must be: ux0:data\\mcsm\\assets\r\n\r\n" +
             $"Detected episodes: {episodeText}\r\n" +
-            $"Base OBBs: main + patch included and extracted ({baseArchiveEntryCount} archive entries)\r\n" +
+            $"Base assets: main + patch extracted ({baseArchiveEntryCount} archive entries); OBB containers removed\r\n" +
             $"Graphics profile: {FormatGraphicsProfile(request)}\r\n" +
             $"Language: {request.LanguageCode}\r\n" +
             $"Controller button fix: {(buttonFix is null ? "not supplied" : $"included ({buttonFix.FileCount} assets)")}\r\n" +
@@ -1294,7 +1361,6 @@ public sealed class DataBuilderService
     {
         var required = RequiredLibraries
             .Select(library => Path.Combine(output, library))
-            .Append(Path.Combine(output, MainObbName))
             .Append(Path.Combine(output, "settings", "graphics.txt"))
             .Append(Path.Combine(output, "settings", "game.txt"));
 
@@ -1302,6 +1368,15 @@ public sealed class DataBuilderService
         if (missing is not null)
         {
             throw new IOException($"Build verification failed: '{missing}' is missing or empty.");
+        }
+
+        string? retainedObb = new[] { MainObbName, PatchObbName }
+            .Select(name => Path.Combine(output, name))
+            .FirstOrDefault(File.Exists);
+        if (retainedObb is not null)
+        {
+            throw new IOException(
+                $"Build verification failed: temporary OBB container '{Path.GetFileName(retainedObb)}' was retained.");
         }
 
         if (requireBaseAssets)

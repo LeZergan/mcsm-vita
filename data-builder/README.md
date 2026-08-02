@@ -15,7 +15,7 @@ The chapter importer copies generic and PowerVR/SGX assets, ignores Mali/Adreno 
 5. Choose the output location and press **Build Data Folder**.
 6. Copy the resulting `mcsm` folder to `ux0:data/` with VitaShell.
 
-The app copies both OBBs and extracts their NCTT contents into `mcsm/assets`, then adds the APK assets and optional episodes. A correct Episode 1 base contains 144 active OBB archives/descriptors (about 817 MB) before APK assets or controller fixes are added. The build is rejected instead of finalized if that boot-critical set is incomplete. It also detects episode numbers from their real archive names, creates the runtime folders, writes easy-to-edit graphics/game settings, and moves an existing output to a timestamped backup instead of deleting it.
+The app uses both OBBs as temporary extraction inputs and keeps their NCTT contents in `mcsm/assets`, then adds the APK assets and optional episodes. The temporary OBB copies are deleted before the final `mcsm` folder is verified. A correct Episode 1 base contains 144 active archives/descriptors (about 817 MB) before APK assets or controller fixes are added. The build is rejected instead of finalized if that boot-critical set is incomplete. It also detects episode numbers from their real archive names, creates the same runtime seed structure as the working tester kit, writes easy-to-edit graphics/game settings, and moves an existing output to a timestamped backup instead of deleting it.
 
 The main screen intentionally stays compact: exact version/renderer results, both OBB states, automatic support packs, episodes/mods, profile details, and final readiness remain visible without separate wizard pages.
 

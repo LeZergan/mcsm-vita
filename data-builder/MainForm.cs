@@ -56,7 +56,7 @@ public sealed class MainForm : Form
 
     public MainForm()
     {
-        Text = "MCSM Vita Data Builder  •  v1.7";
+        Text = "MCSM Vita Data Builder  •  v1.8";
         StartPosition = FormStartPosition.CenterScreen;
         MinimumSize = new Size(860, 720);
         Size = new Size(1020, 850);
@@ -150,7 +150,7 @@ public sealed class MainForm : Form
         Label localOnly = new()
         {
             AutoSize = true,
-            Text = "v1.7  •  LOCAL / OFFLINE",
+            Text = "v1.8  •  LOCAL / OFFLINE",
             Font = new Font("Segoe UI Semibold", 8f),
             ForeColor = Info,
             Location = new Point(626, 10),
