@@ -1,0 +1,120 @@
+name: Game bug report
+description: Report crashes, freezes, input, saves, settings, language, audio, graphics, or performance problems.
+title: "[Bug] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for testing MCSM Vita 1.10.
+
+        This is a prerelease. New scenes can stutter while missing progcache entries compile, but freezes, dead stops, broken behavior, and severe or repeatable problems should still be reported.
+
+        Do not upload APKs, OBBs, game assets, or private save data.
+
+  - type: dropdown
+    id: episode
+    attributes:
+      label: Episode or area
+      options:
+        - Boot / startup
+        - Main menu / episode menu
+        - Episode 1
+        - Episode 2
+        - Episode 3
+        - Episode 4
+        - Episode 5
+        - Episode 6
+        - Episode 7
+        - Episode 8
+        - Save / settings menu
+        - Other
+    validations:
+      required: true
+
+  - type: input
+    id: scene
+    attributes:
+      label: Scene or checkpoint
+      description: Where did the problem happen?
+      placeholder: "Example: Episode 2, temple QTE after opening the door"
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What happened?
+      description: Describe the problem and what you expected instead.
+      placeholder: "The game froze after... I expected..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: List the shortest steps that trigger it.
+      placeholder: |
+        1. Load save slot 1
+        2. Enter the scene
+        3. Choose the left response
+        4. Game freezes
+    validations:
+      required: true
+
+  - type: dropdown
+    id: frequency
+    attributes:
+      label: How often does it happen?
+      options:
+        - Every time
+        - Often
+        - Once so far
+        - Not sure
+    validations:
+      required: true
+
+  - type: dropdown
+    id: profile
+    attributes:
+      label: Graphics profile
+      options:
+        - Balanced
+        - Performance
+        - Quality
+        - Battery
+        - Custom
+        - Not sure
+    validations:
+      required: true
+
+  - type: input
+    id: resolution
+    attributes:
+      label: Resolution or custom settings
+      placeholder: "Example: 720x408, 30 FPS"
+
+  - type: textarea
+    id: plugins
+    attributes:
+      label: Vita plugins
+      description: Mention CapUnlocker, overclock tools, NoTrpDrm, and anything else that may matter.
+      placeholder: "Example: CapUnlocker 1.4 + PSVshellPlus; 500/222/222/166"
+
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Screenshot or video
+      description: Drag in a screenshot or short video when it helps explain the problem.
+
+  - type: checkboxes
+    id: confirmations
+    attributes:
+      label: Checklist
+      options:
+        - label: I am using the current MCSM 1.10 prerelease.
+          required: true
+        - label: I understand that first-time shader compilation stutter is expected until the progcache is populated.
+          required: true
+        - label: I did not attach APKs, OBBs, game assets, or private save data.
+          required: true

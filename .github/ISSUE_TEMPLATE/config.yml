@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: MCSM Vita Discord
+    url: https://discord.gg/EYYTxeXCq
+    about: Ask questions, share test results, or get setup help from the community.
+  - name: Progcache uploads
+    url: https://github.com/LeZergan/mcsm-vita#help-complete-the-progcache
+    about: Choose the matching Episode 1–8 upload issue from the README.
