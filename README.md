@@ -27,6 +27,23 @@ Development progress, oldest to newest:
 6. [Stutter fix & optimisation — shader caching](https://youtu.be/IK8h5NXLh2k)
 7. [Performance improvements & fixes](https://youtu.be/4aSJUfWHK3w)
 
+## Help complete the progcache
+
+We need community progcache uploads for **Episodes 1–8** to prepare a more complete cache for the next release:
+
+- [ ] Episode 1
+- [ ] Episode 2
+- [ ] Episode 3
+- [ ] Episode 4
+- [ ] Episode 5
+- [ ] Episode 6
+- [ ] Episode 7
+- [ ] Episode 8
+
+Play an episode through as much content as possible, close the game, then copy and ZIP **only** `ux0:data/mcsm_progcache`. Upload the ZIP to the [Episodes 1–8 progcache collection issue](https://github.com/LeZergan/mcsm-vita/issues/2) or the [MCSM Vita Discord](https://discord.gg/EYYTxeXCq), and mention which episode and graphics profile you played. Multiple uploads for the same episode are useful because different choices may compile different programs.
+
+Do not include `ux0:data/mcsm`, game assets, saves, APKs, OBBs, logs, or other files—just the `mcsm_progcache` folder.
+
 ## Legal
 
 No Android game executable, native library, OBB, episode, or gameplay archive is included or linked — supply your own `.apk`, main `.obb`, and patch `.obb`. The VPK contains only the loader-side Vita presentation and trophy resources used by this homebrew build. Unofficial fan project, not affiliated with Mojang, Microsoft, Telltale/LCG, Skybound, or Netflix. Trademarks belong to their owners.
