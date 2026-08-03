@@ -4,12 +4,14 @@ Runs the Android build of *Minecraft: Story Mode* on the PS Vita. The package co
 
 > **Public testing release.** Expect rough edges and keep backups of your saves.
 
+Questions, test results, and bug reports are welcome in the [MCSM Vita Discord](https://discord.gg/EYYTxeXCq).
+
 ## Download
 
 The [latest GitHub release](../../releases/latest) contains both files needed for setup:
 
 - **`MCSM-1.10.vpk`** — complete loader with LiveArea artwork and trophy support; install with VitaShell.
-- **`MCSM-Vita-Data-Builder-v1.8.exe`** — creates the required `ux0:data/mcsm` folder from your legally owned Android files.
+- **`MCSM-Vita-Data-Builder-v1.9.exe`** — creates the required `ux0:data/mcsm` folder or a small episode-only copy pack from your legally owned Android files.
 
 The release does not contain the Android game APK, OBBs, episodes, native libraries, or gameplay archives.
 
@@ -60,10 +62,12 @@ Do not manually delete random `ur0:user/.../trophy` files: that can leave the da
 The Windows [MCSM Vita Data Builder](data-builder/README.md) turns user-owned Android files into the exact ready-to-copy Vita folder. It does not download or contain game data.
 
 1. Open `MCSM-Vita-Data-Builder.exe`.
-2. Press **Scan folder** and choose the folder containing your Android files. The builder finds the exact PowerVR v1.37 APK, both matching base OBBs, and recognizable Episodes 2–8 automatically. You can still browse for each file manually. Version 1.8 uses both OBBs only as PC-side extraction inputs, keeps their boot-critical NCTT contents in `mcsm/assets`, and removes the temporary OBB copies before finalizing the Vita folder.
+2. Keep **Full setup**, then press **Scan folder** and choose the folder containing your Android files. The builder finds the exact PowerVR v1.37 APK, both matching base OBBs, and recognizable Episodes 2–8 automatically. You can still browse for each file manually. Version 1.9 uses both OBBs only as PC-side extraction inputs, keeps their boot-critical NCTT contents in `mcsm/assets`, and removes the temporary OBB copies before finalizing the Vita folder.
 3. Keep **Balanced — recommended**, choose another preset, press **View profiles** for a quick comparison, or press **Make custom** for an Easy/Advanced profile editor.
 4. Optionally add Episode 2–8 folders, chapter OBBs, ZIPs, or full nested chapter bundles.
 5. Press **Build Data Folder**, then copy the resulting `mcsm` folder to `ux0:data/` with VitaShell.
+
+Adding episodes later does not require another full build. Select **Add episodes only**, add the chapter folders/OBBs/ZIPs, and press **Build Chapter Pack**. The result is a small `mcsm` folder containing only the selected chapter assets and clear copy instructions. Copy it into `ux0:data/` and choose Merge/Replace; the pack contains no APK libraries, rebuilt base data, settings, saves, or preferences.
 
 The final required path is `ux0:data/mcsm/assets`. The compact builder keeps version, renderer, input, bundled-fix, profile, and readiness information visible without exposing unnecessary setup controls. It reads `AndroidManifest.xml`, verifies the exact known PowerVR fingerprint, and accepts only the supported v1.37 APK (`versionCode 40137`); renaming an older or Mali/Adreno APK does not bypass the check. Both fingerprint-matched PowerVR OBBs are required only to produce the extracted base assets on the PC; no `.obb` is copied to the finished Vita folder. Extra chapter `.ttarch2` and descriptor `.lua` files are detected, validated, and put in the correct shared assets folder.
 
@@ -83,6 +87,7 @@ The **Fix & mods** panel can install a supplied controller-button asset fix and 
 - Personal story decisions and the “seen choice screen” state are stored with the local save bundles under `ux0:data/mcsm/Temp`. The `<User>`/bare-name redirects cover create, load, save, property, bundle, event-log, and both one-slash/two-slash choice paths.
 - Crowd percentages are offline data, not a network login. The builder installs the supported `choice.prop` at both required locations and verifies its SHA-256. The loader will no longer create an empty fake dataset: if valid crowd data is missing, statistics remain unavailable instead of opening a blank results screen.
 - Preferences such as font size are synchronized between the engine's native root resource and Lua's `<Temp>` resource after every `SavePrefs`, so both paths reload the same settings.
+- Save-slot titles can be renamed with the Vita on-screen keyboard.
 
 Back up the entire `ux0:data/mcsm/Temp` directory before replacing data or testing save changes.
 
@@ -90,7 +95,6 @@ Back up the entire `ux0:data/mcsm/Temp` directory before replacing data or testi
 
 - Crowded scenes can still produce individual ~20 FPS frame intervals when CPU-heavy, but the configured 30/60 FPS target is retried immediately instead of being auto-downgraded.
 - The first boot can remain black for roughly 30 seconds while caches are created.
-- Save-slot titles cannot currently be renamed.
 - Experimental data add-ons/mods have not been validated on Vita hardware.
 - Choice persistence, crowd results, language switching, and the newest timing/stall fixes need broader real-hardware coverage across all eight episodes.
 

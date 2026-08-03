@@ -53,6 +53,10 @@ public sealed record BuildRequest(
     string? ButtonFixPath,
     IReadOnlyList<DataAddonSource> DataAddons);
 
+public sealed record ChapterBuildRequest(
+    string OutputDirectory,
+    IReadOnlyList<ChapterSource> ChapterSources);
+
 public sealed record CustomProfileSettings
 {
     public string Mode { get; init; } = "easy";

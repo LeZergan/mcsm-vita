@@ -11,10 +11,10 @@
     <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
     <DebugType>embedded</DebugType>
     <DebugSymbols>false</DebugSymbols>
-    <Version>1.8.0</Version>
+    <Version>1.9.0</Version>
     <ApplicationIcon Condition="Exists('LocalAssets\app-icon.ico')">LocalAssets\app-icon.ico</ApplicationIcon>
     <Authors>MCSM Vita contributors</Authors>
-    <Description>Builds a ready-to-copy MCSM PS Vita data folder from user-owned Android files.</Description>
+    <Description>Builds complete MCSM PS Vita data folders and chapter-only copy packs from user-owned Android files.</Description>
   </PropertyGroup>
 
   <ItemGroup>

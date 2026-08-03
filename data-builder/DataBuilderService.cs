@@ -346,6 +346,126 @@ public sealed class DataBuilderService
         }
     }
 
+    public async Task<BuildResult> BuildChaptersAsync(
+        ChapterBuildRequest request,
+        IProgress<BuildProgress>? progress = null,
+        CancellationToken cancellationToken = default)
+    {
+        ValidateChapterRequest(request);
+        string outputDirectory = Path.GetFullPath(request.OutputDirectory.Trim());
+        if (Directory.Exists(outputDirectory)
+            && RequiredLibraries.Any(library => File.Exists(Path.Combine(outputDirectory, library))))
+        {
+            throw new InvalidDataException(
+                "That output is a full MCSM data folder. Choose a separate location for the small chapter copy pack.");
+        }
+        long totalBytes = request.ChapterSources.Sum(source => source.TotalBytes);
+        EnsureFreeSpace(outputDirectory, totalBytes);
+
+        string? parent = Directory.GetParent(outputDirectory)?.FullName;
+        if (string.IsNullOrWhiteSpace(parent))
+        {
+            throw new InvalidDataException("Choose a normal output folder, not the root of a drive.");
+        }
+        Directory.CreateDirectory(parent);
+        string stagingDirectory = Path.Combine(parent, $".mcsm-chapters-building-{Guid.NewGuid():N}");
+        string stagingAssets = Path.Combine(stagingDirectory, "assets");
+        string? backupDirectory = null;
+        var copiedNames = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        var includedEpisodes = new SortedSet<int>();
+        long copiedBytes = 0;
+        int chapterFileCount = 0;
+
+        void Report(string status)
+        {
+            int percent = totalBytes <= 0
+                ? 0
+                : (int)Math.Clamp(copiedBytes * 100L / totalBytes, 0, 99);
+            progress?.Report(new BuildProgress(percent, status, copiedBytes, totalBytes));
+        }
+
+        try
+        {
+            Directory.CreateDirectory(stagingAssets);
+            foreach (ChapterSource source in request.ChapterSources)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                foreach (int episode in source.Episodes)
+                {
+                    includedEpisodes.Add(episode);
+                }
+
+                chapterFileCount += source.Kind switch
+                {
+                    ChapterSourceKind.Folder => await CopyChapterFolderAsync(
+                        source,
+                        stagingAssets,
+                        copiedNames,
+                        bytes => copiedBytes += bytes,
+                        Report,
+                        cancellationToken),
+                    ChapterSourceKind.ZipArchive or ChapterSourceKind.ObbArchive => await CopyChapterZipAsync(
+                        source,
+                        stagingAssets,
+                        copiedNames,
+                        bytes => copiedBytes += bytes,
+                        Report,
+                        cancellationToken),
+                    _ => throw new ArgumentOutOfRangeException()
+                };
+            }
+
+            VerifyChapterMarkers(stagingDirectory, includedEpisodes);
+            await WriteChapterPackInstructionsAsync(stagingDirectory, includedEpisodes, cancellationToken);
+            long installedBytes = Directory
+                .EnumerateFiles(stagingDirectory, "*", SearchOption.AllDirectories)
+                .Sum(path => new FileInfo(path).Length);
+
+            Report("Finalizing the chapter copy pack…");
+            if (Directory.Exists(outputDirectory))
+            {
+                backupDirectory = NextChapterBackupPath(parent);
+                Directory.Move(outputDirectory, backupDirectory);
+            }
+
+            try
+            {
+                Directory.Move(stagingDirectory, outputDirectory);
+            }
+            catch
+            {
+                if (backupDirectory is not null
+                    && Directory.Exists(backupDirectory)
+                    && !Directory.Exists(outputDirectory))
+                {
+                    Directory.Move(backupDirectory, outputDirectory);
+                    backupDirectory = null;
+                }
+                throw;
+            }
+
+            progress?.Report(new BuildProgress(100, "Chapter copy pack ready", totalBytes, totalBytes));
+            return new BuildResult(
+                outputDirectory,
+                backupDirectory,
+                includedEpisodes.ToList(),
+                chapterFileCount,
+                0,
+                false,
+                0,
+                0,
+                installedBytes);
+        }
+        catch
+        {
+            if (Directory.Exists(stagingDirectory))
+            {
+                Directory.Delete(stagingDirectory, recursive: true);
+            }
+            throw;
+        }
+    }
+
     public static ApkLayout InspectApk(string apkPath) => InspectApkCore(apkPath, true);
 
     internal static ApkLayout InspectSyntheticApk(string apkPath) => InspectApkCore(apkPath, false);
@@ -719,6 +839,23 @@ public sealed class DataBuilderService
         if (!new[] { "en", "fr", "de", "es", "pt", "ru", "zh" }.Contains(request.LanguageCode))
         {
             throw new InvalidDataException("Choose a valid language.");
+        }
+    }
+
+    private static void ValidateChapterRequest(ChapterBuildRequest request)
+    {
+        if (string.IsNullOrWhiteSpace(request.OutputDirectory))
+        {
+            throw new InvalidDataException("Choose where to create the chapter copy pack.");
+        }
+        if (!Path.GetFileName(request.OutputDirectory.TrimEnd(Path.DirectorySeparatorChar))
+            .Equals("mcsm", StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidDataException("The chapter copy pack must be a folder named 'mcsm'.");
+        }
+        if (request.ChapterSources.Count == 0)
+        {
+            throw new InvalidDataException("Add at least one PowerVR episode folder, OBB, or ZIP.");
         }
     }
 
@@ -1282,6 +1419,27 @@ public sealed class DataBuilderService
             cancellationToken);
     }
 
+    private static async Task WriteChapterPackInstructionsAsync(
+        string stagingDirectory,
+        IEnumerable<int> includedEpisodes,
+        CancellationToken cancellationToken)
+    {
+        string episodeText = string.Join(", ", includedEpisodes.Order());
+        string instructions =
+            "MCSM VITA CHAPTER COPY PACK\r\n" +
+            "===========================\r\n\r\n" +
+            $"Prepared episodes: {episodeText}\r\n\r\n" +
+            "Copy this mcsm folder into ux0:data\\ on your Vita and choose Merge/Replace when asked.\r\n" +
+            "This pack contains only the selected PowerVR chapter files inside mcsm\\assets.\r\n" +
+            "It does not contain APK libraries, rebuilt base data, settings, saves, or preferences.\r\n" +
+            "You must already have a complete working ux0:data\\mcsm folder from Full setup.\r\n";
+        await File.WriteAllTextAsync(
+            Path.Combine(stagingDirectory, "COPY_EPISODES.txt"),
+            instructions,
+            new UTF8Encoding(false),
+            cancellationToken);
+    }
+
     private static string ReplaceSettingValue(string text, string key, string value) =>
         Regex.Replace(
             text,
@@ -1398,15 +1556,7 @@ public sealed class DataBuilderService
             }
         }
 
-        foreach (int episode in episodes.Where(episode => episode >= 2))
-        {
-            string marker = Path.Combine(output, "assets", $"MCSM_android_Minecraft10{episode}_data.ttarch2");
-            if (!File.Exists(marker))
-            {
-                throw new InvalidDataException(
-                    $"Episode {episode} was detected, but its required marker archive is missing: {Path.GetFileName(marker)}");
-            }
-        }
+        VerifyChapterMarkers(output, episodes);
 
 
         if (buttonFix is not null)
@@ -1443,9 +1593,34 @@ public sealed class DataBuilderService
         }
     }
 
+    private static void VerifyChapterMarkers(string output, IEnumerable<int> episodes)
+    {
+        foreach (int episode in episodes.Where(episode => episode >= 2))
+        {
+            string marker = Path.Combine(output, "assets", $"MCSM_android_Minecraft10{episode}_data.ttarch2");
+            if (!File.Exists(marker) || new FileInfo(marker).Length == 0)
+            {
+                throw new InvalidDataException(
+                    $"Episode {episode} was detected, but its required marker archive is missing: {Path.GetFileName(marker)}");
+            }
+        }
+    }
+
     private static string NextBackupPath(string parent)
     {
         string basePath = Path.Combine(parent, $"mcsm-backup-{DateTime.Now:yyyyMMdd-HHmmss}");
+        string candidate = basePath;
+        int suffix = 2;
+        while (Directory.Exists(candidate))
+        {
+            candidate = $"{basePath}-{suffix++}";
+        }
+        return candidate;
+    }
+
+    private static string NextChapterBackupPath(string parent)
+    {
+        string basePath = Path.Combine(parent, $"mcsm-chapter-backup-{DateTime.Now:yyyyMMdd-HHmmss}");
         string candidate = basePath;
         int suffix = 2;
         while (Directory.Exists(candidate))

@@ -21,6 +21,7 @@ public sealed class MainForm : Form
     private readonly TextBox _obbBox = new();
     private readonly TextBox _patchObbBox = new();
     private readonly TextBox _outputBox = new();
+    private readonly ComboBox _buildModeBox = new();
     private readonly Label _apkValidationLabel = new();
     private readonly Label _mainObbValidationLabel = new();
     private readonly Label _patchObbValidationLabel = new();
@@ -39,6 +40,7 @@ public sealed class MainForm : Form
     private readonly Button _openButton = new();
     private readonly List<Panel> _widePanels = [];
     private readonly List<Control> _inputs = [];
+    private readonly List<Control> _fullBuildInputs = [];
     private readonly DataBuilderService _builder = new();
     private readonly ToolTip _toolTip = new();
     private ButtonFixBundle? _buttonFixBundle;
@@ -54,9 +56,11 @@ public sealed class MainForm : Form
     private CancellationTokenSource? _buildCancellation;
     private BuildResult? _lastResult;
 
+    private bool IsChapterOnly => (_buildModeBox.SelectedItem as Choice)?.Value == "chapters";
+
     public MainForm()
     {
-        Text = "MCSM Vita Data Builder  •  v1.8";
+        Text = "MCSM Vita Data Builder  •  v1.9";
         StartPosition = FormStartPosition.CenterScreen;
         MinimumSize = new Size(860, 720);
         Size = new Size(1020, 850);
@@ -95,6 +99,7 @@ public sealed class MainForm : Form
 
         string desktop = Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory);
         _outputBox.Text = Path.Combine(desktop, "MCSM Vita Data", "mcsm");
+        _buildModeBox.SelectedIndex = 0;
         _profileBox.SelectedIndex = 0;
         _languageBox.SelectedIndex = 0;
         UpdateBaseNote();
@@ -125,7 +130,7 @@ public sealed class MainForm : Form
     {
         Panel header = new()
         {
-            Height = 64,
+            Height = 72,
             Margin = new Padding(0, 0, 0, 8),
             BackColor = Page
         };
@@ -150,14 +155,29 @@ public sealed class MainForm : Form
         Label localOnly = new()
         {
             AutoSize = true,
-            Text = "v1.8  •  LOCAL / OFFLINE",
+            Text = "v1.9  •  LOCAL / OFFLINE",
             Font = new Font("Segoe UI Semibold", 8f),
             ForeColor = Info,
-            Location = new Point(626, 10),
+            Location = new Point(626, 5),
             Anchor = AnchorStyles.Top | AnchorStyles.Right
         };
-        header.SizeChanged += (_, _) => localOnly.Left = Math.Max(420, header.ClientSize.Width - localOnly.Width - 2);
-        header.Controls.AddRange([title, subtitle, localOnly]);
+        ConfigureCombo(_buildModeBox, 0, 29, 220);
+        _buildModeBox.Items.AddRange([
+            new Choice("Full setup", "full"),
+            new Choice("Add episodes only", "chapters")
+        ]);
+        _buildModeBox.AccessibleName = "Build mode";
+        _toolTip.SetToolTip(
+            _buildModeBox,
+            "Full setup builds everything. Add episodes only creates a small mcsm copy pack without reprocessing the APK or base OBBs.");
+        _buildModeBox.SelectedIndexChanged += (_, _) => UpdateBuildModeUi();
+        _inputs.Add(_buildModeBox);
+        header.SizeChanged += (_, _) =>
+        {
+            localOnly.Left = Math.Max(420, header.ClientSize.Width - localOnly.Width - 2);
+            _buildModeBox.Left = Math.Max(560, header.ClientSize.Width - _buildModeBox.Width - 2);
+        };
+        header.Controls.AddRange([title, subtitle, localOnly, _buildModeBox]);
         _page.Controls.Add(header);
     }
 
@@ -247,6 +267,10 @@ public sealed class MainForm : Form
             _apkBox, _obbBox, _patchObbBox,
             scanFolderButton, apkButton, obbButton, patchObbButton
         ]);
+        _fullBuildInputs.AddRange([
+            _apkBox, _obbBox, _patchObbBox,
+            scanFolderButton, apkButton, obbButton, patchObbButton
+        ]);
         card.Controls.AddRange([
             scanFolderButton,
             apkLabel, _apkValidationLabel, _apkBox, apkButton,
@@ -311,6 +335,7 @@ public sealed class MainForm : Form
         card.SizeChanged += (_, _) => ResizeFields();
 
         _inputs.AddRange([_chapterList, addFolder, addZip, remove, extras]);
+        _fullBuildInputs.Add(extras);
         card.Controls.AddRange([_chapterList, addFolder, addZip, remove, extras, _extrasSummaryLabel]);
         ResizeFields();
     }
@@ -319,7 +344,7 @@ public sealed class MainForm : Form
     {
         Panel card = CreateCard(
             "Output and settings",
-            "Choose the destination, graphics profile, and text language.",
+            "Choose the destination. Full setup also applies the graphics profile and text language.",
             178);
 
         Label outputLabel = CreateFieldLabel("OUTPUT · ALWAYS NAMED MCSM", 24, 68);
@@ -380,6 +405,7 @@ public sealed class MainForm : Form
         _outputBox.TextChanged += (_, _) => UpdateReadyState();
         _profileBox.SelectedIndexChanged += (_, _) => UpdateCustomProfileUi();
         _inputs.AddRange([_outputBox, outputButton, _profileBox, _customizeProfileButton, _languageBox, profileGuide]);
+        _fullBuildInputs.AddRange([_profileBox, _customizeProfileButton, _languageBox, profileGuide]);
         card.Controls.AddRange([
             profileGuide,
             outputLabel, _outputBox, outputButton,
@@ -431,6 +457,19 @@ public sealed class MainForm : Form
         UpdateReadyState();
     }
 
+    internal void ApplyChapterPackPreview()
+    {
+        _buildModeBox.SelectedIndex = 1;
+        _chapterList.Items.Add(new ChapterSource(
+            @"C:\Game files\Episode 2 PowerVR",
+            ChapterSourceKind.Folder,
+            [2],
+            7,
+            768L * 1024 * 1024));
+        UpdateOptionalSummary();
+        UpdateReadyState();
+    }
+
     private void SelectProfile(string value)
     {
         for (int index = 0; index < _profileBox.Items.Count; index++)
@@ -462,6 +501,33 @@ public sealed class MainForm : Form
                 _ => "Choose a profile"
             };
         _customProfileSummaryLabel.ForeColor = customSelected ? Primary : TextSoft;
+    }
+
+    private void UpdateBuildModeUi()
+    {
+        bool chaptersOnly = IsChapterOnly;
+        foreach (Control control in _fullBuildInputs)
+        {
+            control.Enabled = !chaptersOnly && _buildCancellation is null;
+        }
+
+        string desktop = Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory);
+        string fullDefault = Path.Combine(desktop, "MCSM Vita Data", "mcsm");
+        string chapterDefault = Path.Combine(desktop, "MCSM Vita Chapter Pack", "mcsm");
+        if (chaptersOnly && PathsMatch(_outputBox.Text, fullDefault))
+        {
+            _outputBox.Text = chapterDefault;
+        }
+        else if (!chaptersOnly && PathsMatch(_outputBox.Text, chapterDefault))
+        {
+            _outputBox.Text = fullDefault;
+        }
+
+        _outputBox.PlaceholderText = chaptersOnly
+            ? "Choose where the small mcsm chapter copy pack should be created"
+            : "Choose where the finished mcsm folder should be created";
+        UpdateOptionalSummary();
+        UpdateReadyState();
     }
 
     private void BuildActionCard()
@@ -981,7 +1047,9 @@ public sealed class MainForm : Form
     {
         using FolderBrowserDialog dialog = new()
         {
-            Description = "Choose where the ready mcsm folder should be created",
+            Description = IsChapterOnly
+                ? "Choose where the small mcsm chapter copy pack should be created"
+                : "Choose where the complete mcsm data folder should be created",
             UseDescriptionForTitle = true,
             ShowNewFolderButton = true
         };
@@ -1041,8 +1109,14 @@ public sealed class MainForm : Form
     private void UpdateOptionalSummary()
     {
         string episodes = _chapterList.Items.Count == 0
-            ? "Episode 1 only"
+            ? (IsChapterOnly ? "Add Episodes 2–8" : "Episode 1 only")
             : $"{_chapterList.Items.Count} episode source(s)";
+        if (IsChapterOnly)
+        {
+            _extrasSummaryLabel.Text = $"{episodes}  ·  PowerVR checked  ·  copy pack only";
+            _extrasSummaryLabel.ForeColor = _chapterList.Items.Count > 0 ? Primary : TextSoft;
+            return;
+        }
         string buttonFix = _selectedButtonFixPath is not null
             ? "custom button fix"
             : _buttonFixBundle is not null
@@ -1068,7 +1142,8 @@ public sealed class MainForm : Form
         }
 
         string output = _outputBox.Text.Trim();
-        if (_dataAddons.Count > 0)
+        bool chaptersOnly = IsChapterOnly;
+        if (!chaptersOnly && _dataAddons.Count > 0)
         {
             DialogResult modAnswer = MessageBox.Show(
                 this,
@@ -1086,10 +1161,13 @@ public sealed class MainForm : Form
 
         if (Directory.Exists(output) && Directory.EnumerateFileSystemEntries(output).Any())
         {
+            string existingMessage = chaptersOnly
+                ? "A chapter copy pack already exists there. It will be preserved as a timestamped backup before the new pack is created.\n\nContinue?"
+                : "A data folder already exists there. It will be preserved as a timestamped backup before the new folder is installed.\n\nContinue?";
             DialogResult answer = MessageBox.Show(
                 this,
-                "A data folder already exists there. It will be preserved as a timestamped backup before the new folder is installed.\n\nContinue?",
-                "Existing mcsm folder",
+                existingMessage,
+                chaptersOnly ? "Existing chapter pack" : "Existing mcsm folder",
                 MessageBoxButtons.YesNo,
                 MessageBoxIcon.Question,
                 MessageBoxDefaultButton.Button2);
@@ -1107,20 +1185,6 @@ public sealed class MainForm : Form
             SetBusy(true);
 
             var chapters = _chapterList.Items.Cast<ChapterSource>().ToList();
-            var profile = (Choice?)_profileBox.SelectedItem ?? throw new InvalidDataException("Choose a profile.");
-            var language = (Choice?)_languageBox.SelectedItem ?? throw new InvalidDataException("Choose a language.");
-            var request = new BuildRequest(
-                _apkBox.Text.Trim(),
-                _obbBox.Text.Trim(),
-                _patchObbBox.Text.Trim(),
-                output,
-                chapters,
-                profile.Value,
-                _customProfile,
-                language.Value,
-                _selectedButtonFixPath,
-                _dataAddons.ToList());
-
             var progress = new Progress<BuildProgress>(update =>
             {
                 _progress.Value = update.Percent;
@@ -1129,14 +1193,42 @@ public sealed class MainForm : Form
                 _progressDetail.Text = $"{FormatBytes(update.BytesCopied)} of {FormatBytes(update.TotalBytes)}";
             });
 
-            _lastResult = await _builder.BuildAsync(request, progress, _buildCancellation.Token);
+            if (chaptersOnly)
+            {
+                _lastResult = await _builder.BuildChaptersAsync(
+                    new ChapterBuildRequest(output, chapters),
+                    progress,
+                    _buildCancellation.Token);
+            }
+            else
+            {
+                var profile = (Choice?)_profileBox.SelectedItem ?? throw new InvalidDataException("Choose a profile.");
+                var language = (Choice?)_languageBox.SelectedItem ?? throw new InvalidDataException("Choose a language.");
+                var request = new BuildRequest(
+                    _apkBox.Text.Trim(),
+                    _obbBox.Text.Trim(),
+                    _patchObbBox.Text.Trim(),
+                    output,
+                    chapters,
+                    profile.Value,
+                    _customProfile,
+                    language.Value,
+                    _selectedButtonFixPath,
+                    _dataAddons.ToList());
+                _lastResult = await _builder.BuildAsync(request, progress, _buildCancellation.Token);
+            }
             _progress.Value = 100;
-            SetStatus("Ready — copy the whole mcsm folder to ux0:data\\", Primary);
-            _progressDetail.Text =
-                $"Episodes {string.Join(", ", _lastResult.IncludedEpisodes)} · " +
-                $"controller fix {_lastResult.ButtonFixFileCount} · " +
-                $"choice stats {(_lastResult.ChoiceDataIncluded ? "ready" : "not included")} · " +
-                $"mods {_lastResult.DataAddonFileCount} files · {FormatBytes(_lastResult.TotalBytes)}";
+            SetStatus(
+                chaptersOnly
+                    ? "Chapter pack ready — merge this small mcsm folder into ux0:data\\"
+                    : "Ready — copy the whole mcsm folder to ux0:data\\",
+                Primary);
+            _progressDetail.Text = chaptersOnly
+                ? $"Episodes {string.Join(", ", _lastResult.IncludedEpisodes)} · {_lastResult.ChapterFileCount} files · {FormatBytes(_lastResult.TotalBytes)}"
+                : $"Episodes {string.Join(", ", _lastResult.IncludedEpisodes)} · " +
+                  $"controller fix {_lastResult.ButtonFixFileCount} · " +
+                  $"choice stats {(_lastResult.ChoiceDataIncluded ? "ready" : "not included")} · " +
+                  $"mods {_lastResult.DataAddonFileCount} files · {FormatBytes(_lastResult.TotalBytes)}";
             _openButton.Enabled = true;
 
             string backup = _lastResult.BackupDirectory is null
@@ -1144,8 +1236,10 @@ public sealed class MainForm : Form
                 : $"\n\nYour previous folder was preserved at:\n{_lastResult.BackupDirectory}";
             MessageBox.Show(
                 this,
-                $"Your Vita data folder is ready.\n\nCopy this folder:\n{_lastResult.OutputDirectory}\n\nTo:\nux0:data\\{backup}",
-                "Build complete",
+                chaptersOnly
+                    ? $"Your chapter copy pack is ready.\n\nCopy this folder:\n{_lastResult.OutputDirectory}\n\nInto:\nux0:data\\\n\nChoose Merge/Replace when VitaShell asks. Only the selected episode files are inside.{backup}"
+                    : $"Your Vita data folder is ready.\n\nCopy this folder:\n{_lastResult.OutputDirectory}\n\nTo:\nux0:data\\{backup}",
+                chaptersOnly ? "Chapter pack complete" : "Build complete",
                 MessageBoxButtons.OK,
                 MessageBoxIcon.Information);
         }
@@ -1174,7 +1268,7 @@ public sealed class MainForm : Form
     {
         foreach (Control input in _inputs)
         {
-            input.Enabled = !busy;
+            input.Enabled = !busy && (!IsChapterOnly || !_fullBuildInputs.Contains(input));
         }
         SetBuildButtonState(!busy && InputsLookReady(), busy);
         _cancelButton.Enabled = busy;
@@ -1192,7 +1286,22 @@ public sealed class MainForm : Form
         }
         bool ready = InputsLookReady();
         SetBuildButtonState(ready, busy: false);
-        if (ready)
+        if (IsChapterOnly)
+        {
+            if (ready)
+            {
+                SetStatus("PowerVR episodes ready. Build the small copy pack.", Primary);
+            }
+            else if (_chapterList.Items.Count == 0)
+            {
+                SetStatus("Add at least one PowerVR episode folder, OBB, or ZIP.", TextSoft);
+            }
+            else
+            {
+                SetStatus("Choose where the mcsm chapter copy pack should go.", TextSoft);
+            }
+        }
+        else if (ready)
         {
             SetStatus("PowerVR base set verified. Ready.", Primary);
         }
@@ -1214,11 +1323,12 @@ public sealed class MainForm : Form
         }
     }
 
-    private bool InputsLookReady() =>
-        PathsMatch(_validatedApkPath, _apkBox.Text)
-        && PathsMatch(_validatedMainObbPath, _obbBox.Text)
-        && PathsMatch(_validatedPatchObbPath, _patchObbBox.Text)
-        && !string.IsNullOrWhiteSpace(_outputBox.Text);
+    private bool InputsLookReady() => IsChapterOnly
+        ? _chapterList.Items.Count > 0 && !string.IsNullOrWhiteSpace(_outputBox.Text)
+        : PathsMatch(_validatedApkPath, _apkBox.Text)
+          && PathsMatch(_validatedMainObbPath, _obbBox.Text)
+          && PathsMatch(_validatedPatchObbPath, _patchObbBox.Text)
+          && !string.IsNullOrWhiteSpace(_outputBox.Text);
 
     private void SetBuildButtonState(bool ready, bool busy)
     {
@@ -1228,14 +1338,14 @@ public sealed class MainForm : Form
         _buildButton.Text = busy
             ? "BUILDING…"
             : ready
-                ? "BUILD DATA FOLDER"
-                : "ADD REQUIRED FILES";
+                ? (IsChapterOnly ? "BUILD CHAPTER PACK" : "BUILD DATA FOLDER")
+                : (IsChapterOnly ? "ADD EPISODES" : "ADD REQUIRED FILES");
         _buildButton.BackColor = ready ? Primary : Color.FromArgb(30, 41, 59);
         _buildButton.ForeColor = ready ? Color.FromArgb(5, 46, 22) : TextSoft;
         _buildButton.Cursor = ready ? Cursors.Hand : Cursors.Default;
         _buildButton.AccessibleDescription = ready
-            ? "Build the validated Vita data folder"
-            : "Add the required APK, main OBB, and patch OBB first";
+            ? (IsChapterOnly ? "Build a copy pack containing only selected episode files" : "Build the validated Vita data folder")
+            : (IsChapterOnly ? "Add a PowerVR episode source first" : "Add the required APK, main OBB, and patch OBB first");
     }
 
     private void UpdateBaseNote()

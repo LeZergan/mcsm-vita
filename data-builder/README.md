@@ -1,10 +1,10 @@
 # MCSM Vita Data Builder
 
-A simple Windows app that creates the exact `ux0:data/mcsm` folder required by the loader. It contains no game files: every APK, OBB, library, and episode archive comes from files the user selects locally.
+A simple offline Windows app that creates the exact `ux0:data/mcsm` folder required by the loader. It can also prepare a small chapter-only copy pack, so adding an episode never requires rebuilding the base data. It contains no game files: every APK, OBB, library, and episode archive comes from files the user selects locally.
 
 ## Using the app
 
-1. Press **Scan folder** and choose the folder containing your game files. The app searches subfolders for the supported PowerVR APK, both base OBBs, Episode 2–8 folders, chapter OBBs, ZIPs, and full nested chapter bundles.
+1. Keep **Full setup**, press **Scan folder**, and choose the folder containing your game files. The app searches subfolders for the supported PowerVR APK, both base OBBs, Episode 2–8 folders, chapter OBBs, ZIPs, and full nested chapter bundles.
 2. Review the compact verification labels. Missing files can still be selected individually with **Browse**. The APK manifest and exact supported PowerVR fingerprint are checked; Mali, Adreno, altered, and older APKs are rejected. Both OBBs must match too.
 3. Keep **Balanced — recommended**, choose another preset, or press **Make custom**. **View profiles** shows the useful differences at a glance; the custom maker offers an Easy mode with six clear choices and an Advanced mode with every supported exact value.
 4. Optionally add Episode 2–8 sources. The app accepts either:
@@ -15,9 +15,18 @@ The chapter importer copies generic and PowerVR/SGX assets, ignores Mali/Adreno 
 5. Choose the output location and press **Build Data Folder**.
 6. Copy the resulting `mcsm` folder to `ux0:data/` with VitaShell.
 
+### Add episodes without rebuilding
+
+1. Select **Add episodes only** at the top of the app.
+2. Add one or more PowerVR Episode 2–8 folders, chapter OBBs, ZIPs, or nested full bundles. The APK and base OBB fields are disabled because this mode does not use them.
+3. Choose an empty output location and press **Build Chapter Pack**.
+4. Copy the resulting small `mcsm` folder into `ux0:data/` on the Vita and choose Merge/Replace when VitaShell asks.
+
+The copy pack contains only validated chapter files under `mcsm/assets` plus `COPY_EPISODES.txt`. It contains no APK libraries, rebuilt base data, graphics settings, language settings, saves, or preferences. To prevent accidents, chapter-only mode refuses to replace an output folder that looks like a complete MCSM data folder.
+
 The app uses both OBBs as temporary extraction inputs and keeps their NCTT contents in `mcsm/assets`, then adds the APK assets and optional episodes. The temporary OBB copies are deleted before the final `mcsm` folder is verified. A correct Episode 1 base contains 144 active archives/descriptors (about 817 MB) before APK assets or controller fixes are added. The build is rejected instead of finalized if that boot-critical set is incomplete. It also detects episode numbers from their real archive names, creates the same runtime seed structure as the working tester kit, writes easy-to-edit graphics/game settings, and moves an existing output to a timestamped backup instead of deleting it.
 
-The main screen intentionally stays compact: exact version/renderer results, both OBB states, automatic support packs, episodes/mods, profile details, and final readiness remain visible without separate wizard pages.
+The main screen stays compact and uses one clear mode switch: **Full setup** for the first installation and **Add episodes only** for later chapter copy packs. Exact version/renderer results, both OBB states, episode sources, profile details, and final readiness remain visible without wizard pages.
 
 ### Custom profile maker
 

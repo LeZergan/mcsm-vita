@@ -83,6 +83,20 @@ if (args.Length == 2 && args[0].Equals("--render-ready", StringComparison.Ordina
     return 0;
 }
 
+if (args.Length == 2 && args[0].Equals("--render-chapters", StringComparison.OrdinalIgnoreCase))
+{
+    RenderForm(
+        args[1],
+        () =>
+        {
+            MainForm form = new();
+            form.ApplyChapterPackPreview();
+            return form;
+        });
+    Console.WriteLine($"Rendered chapter-pack UI preview: {args[1]}");
+    return 0;
+}
+
 if (args.Length == 2 && args[0].Equals("--render-extras", StringComparison.OrdinalIgnoreCase))
 {
     RenderForm(
@@ -288,6 +302,15 @@ try
         WriteEntry(obb, "files/Net/_resdesc_50_Minecraft106_android-mali.lua", "wrong renderer");
     }
 
+    string episode6 = Path.Combine(root, "episode6-powervr", "Net");
+    Directory.CreateDirectory(episode6);
+    await File.WriteAllTextAsync(
+        Path.Combine(episode6, "MCSM_android_Minecraft106_data.ttarch2"),
+        "episode 6 marker");
+    await File.WriteAllTextAsync(
+        Path.Combine(episode6, "_resdesc_50_Minecraft106_android-pvr.lua"),
+        "episode 6 descriptor");
+
     string buttonFix = Path.Combine(inputs, "button-fix");
     Directory.CreateDirectory(buttonFix);
     foreach (string mesh in new[]
@@ -332,12 +355,14 @@ try
     ChapterSource source3 = ChapterScanner.Inspect(episode3Zip);
     ChapterSource source4 = ChapterScanner.Inspect(episode4Obb);
     ChapterSource source5 = ChapterScanner.Inspect(fullChapterZip);
+    ChapterSource source6 = ChapterScanner.Inspect(Path.Combine(root, "episode6-powervr"));
     DataAddonSource addonFolder = DataAddonScanner.Inspect(Path.Combine(inputs, "folder-mod"));
     DataAddonSource addonZip = DataAddonScanner.Inspect(modZip);
     Assert(source2.Episodes.SequenceEqual([2]), "Episode 2 folder detection failed.");
     Assert(source3.Episodes.SequenceEqual([3]), "Episode 3 ZIP detection failed.");
     Assert(source4.Kind == ChapterSourceKind.ObbArchive && source4.Episodes.SequenceEqual([4]), "Episode 4 OBB detection failed.");
     Assert(source5.Episodes.SequenceEqual([5]), "Nested full chapter ZIP detection failed.");
+    Assert(source6.Episodes.SequenceEqual([6]), "Episode 6 PowerVR folder detection failed.");
     bool maliChapterRejected = false;
     try
     {
@@ -468,6 +493,27 @@ try
     Assert(game.Contains("language = ru"), "Selected language was not written.");
     Assert(game.Contains("chapters = auto"), "Episode auto-detection is not enabled.");
 
+    string chapterPack = Path.Combine(root, "chapter-pack", "mcsm");
+    BuildResult chapterResult = await builder.BuildChaptersAsync(
+        new ChapterBuildRequest(chapterPack, [source6]));
+    Assert(chapterResult.IncludedEpisodes.SequenceEqual([6]), "Chapter-only episode list is wrong.");
+    Assert(File.Exists(Path.Combine(chapterPack, "assets", "MCSM_android_Minecraft106_data.ttarch2")), "Chapter-only marker is missing.");
+    Assert(File.Exists(Path.Combine(chapterPack, "assets", "_resdesc_50_Minecraft106_android-pvr.lua")), "Chapter-only descriptor is missing.");
+    Assert(File.Exists(Path.Combine(chapterPack, "COPY_EPISODES.txt")), "Chapter copy instructions are missing.");
+    Assert(!File.Exists(Path.Combine(chapterPack, "libmain.so")), "Chapter-only pack incorrectly contains base libraries.");
+    Assert(!Directory.Exists(Path.Combine(chapterPack, "settings")), "Chapter-only pack incorrectly contains settings.");
+
+    bool fullFolderProtected = false;
+    try
+    {
+        _ = await builder.BuildChaptersAsync(new ChapterBuildRequest(output, [source6]));
+    }
+    catch (InvalidDataException)
+    {
+        fullFolderProtected = true;
+    }
+    Assert(fullFolderProtected, "Chapter-only mode was allowed to replace a full data folder.");
+
     ButtonFixBundle? embeddedFix = DataBuilderService.InspectBundledButtonFix();
     BuildRequest embeddedRequest = request with
     {
@@ -486,7 +532,7 @@ try
     }
     Assert(File.Exists(Path.Combine(output, "DATA_FOLDER_READY.txt")), "Final ready marker is missing.");
 
-    Console.WriteLine("PASS: folder discovery, PowerVR/version checks, profile defaults, chapter folders/OBBs/nested ZIPs, renderer filtering, controller fixes, choice data, add-ons, settings, and backups.");
+    Console.WriteLine("PASS: folder discovery, PowerVR/version checks, profiles, full builds, safe chapter-only copy packs, renderer filtering, controller fixes, choice data, add-ons, settings, and backups.");
     return 0;
 }
 catch (Exception exception)
