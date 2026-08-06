@@ -195,7 +195,33 @@ static volatile uint32_t g_script_us = 0, g_script_n = 0;
 #ifndef MCSM_FAST_FINAL_RUNTIME
 #define MCSM_FAST_FINAL_RUNTIME 1
 #endif
-#if MCSM_FAST_FINAL_RUNTIME
+
+/* ★ 2026-08-06 — THE DIAGNOSTIC BUILD COULD NOT DIAGNOSE THE SIM.
+ *
+ * MCSM_FAST_FINAL_RUNTIME is never set by CMakeLists or build_vpk.ps1, so it is 1
+ * in BOTH configurations -- including the logging VPK that exists purely to be
+ * sent back for analysis. In a 25-minute device log that meant: every phase
+ * accumulator read 0.000ms, `SIMSPLIT` printed only "phase timers COMPILED OUT",
+ * the chore-tick counter never incremented, and `ANIM: chore ticks` was logged
+ * ZERO times. So the one build we ask players to run could not answer "where does
+ * the frame go" or "are chores even advancing" -- which is exactly what the
+ * outstanding animation and framerate reports need.
+ *
+ * Split the two concerns. MCSM_FAST_FINAL_RUNTIME keeps governing the PER-DRAW GL
+ * diagnostics, which really are too expensive to ship and would distort any
+ * measurement they appear in. MCSM_SIM_PROBES governs the per-FRAME sim phase
+ * timers and the chore tick, and follows the logging switch: on in the logging
+ * build, off in the release build. That is ~10 syscalls a frame in a build that is
+ * already slower on purpose and already labelled as such. */
+#ifndef MCSM_SIM_PROBES
+#  ifdef DEBUG_SOLOADER
+#    define MCSM_SIM_PROBES 1
+#  else
+#    define MCSM_SIM_PROBES 0
+#  endif
+#endif
+
+#if !MCSM_SIM_PROBES
 #define MCSM_PHASE_T0()             (0ULL)
 #define MCSM_PHASE_ADD(acc, n, t0)  ((void)(t0))
 #else
@@ -1533,7 +1559,7 @@ static void force_animation_runtime_flags(const char *phase) {
  * count or something else. ChoreInst::UpdateChoreInstances is called ONCE per
  * frame -- not per chore -- so hooking it is cheap and, unlike the render-path
  * hooks that crashed, it is not called concurrently from multiple threads. */
-#if !MCSM_FAST_FINAL_RUNTIME
+#if MCSM_SIM_PROBES
 static so_hook g_hook_chore_update_all;
 #endif
 static volatile unsigned g_chore_ticks = 0;
@@ -1740,7 +1766,7 @@ static void hook_unlock_achievement(void *self, const void *str) {
     SO_CONTINUE_VOID(g_hook_unlock_achievement, self, str);
 }
 
-#if !MCSM_FAST_FINAL_RUNTIME
+#if MCSM_SIM_PROBES
 static so_hook g_hook_scene_update, g_hook_script_update;
 static void hook_scene_update(void) {
     const uint64_t t0 = MCSM_PHASE_T0();
@@ -1754,9 +1780,9 @@ static void hook_script_update(uint32_t dt_bits) {
     SO_CONTINUE_VOID(g_hook_script_update, dt_bits);
     MCSM_PHASE_ADD(g_script_us, g_script_n, t0);
 }
-#endif /* !MCSM_FAST_FINAL_RUNTIME */
+#endif /* MCSM_SIM_PROBES */
 
-#if !MCSM_FAST_FINAL_RUNTIME
+#if MCSM_SIM_PROBES
 static void hook_chore_update_all(void) {
     g_chore_ticks++;
     const uint64_t t0 = MCSM_PHASE_T0();
@@ -1896,7 +1922,7 @@ void mcsm_skin_report(void) {
     const uint32_t s_pf  = (su  - l_su ) / dframes;
     const uint32_t sc_pf = (cu2 - l_cu2) / dframes;
     l_ru=ru; l_rn=rn; l_su=su; l_sn=sn; l_cu2=cu2; l_cn2=cn2;
-#if MCSM_FAST_FINAL_RUNTIME
+#if !MCSM_SIM_PROBES
     /* ☠ SAY SO. With MCSM_PHASE_ADD compiled to a no-op, every accumulator above
      * stays 0 and the normal line below would render as
      *     SIMSPLIT: render=0.000ms(x0.00) chore=0.000ms(x0.00) ... PER FRAME
@@ -1908,9 +1934,9 @@ void mcsm_skin_report(void) {
      * must announce it, not emit zeros. */
     (void)r_pf; (void)chore_pf; (void)pbc_pf; (void)s_pf; (void)sc_pf;
     (void)drn;  (void)dcn;      (void)dpn;    (void)dsn;  (void)dcn2;
-    l_info("SIMSPLIT: phase timers COMPILED OUT (MCSM_FAST_FINAL_RUNTIME=1) — these "
-           "cost 2 syscalls per instrumented call and shipped by mistake. Rebuild with "
-           "-DMCSM_FAST_FINAL_RUNTIME=0 to measure render/chore/playback/scenes/script.");
+    l_info("SIMSPLIT: phase timers COMPILED OUT (release build) — this is expected "
+           "here. The LOGGING build enables them, so send a log from that if you need "
+           "render/chore/playback/scenes/script attributed.");
 #else
     l_info("SIMSPLIT: render=%u.%03ums(x%u.%02u) chore=%u.%03ums(x%u.%02u) "
            "playback=%u.%03ums(x%u.%02u) scenes=%u.%03ums(x%u.%02u) script=%u.%03ums(x%u.%02u)"
@@ -2098,7 +2124,7 @@ static void patch_chore_full_update_path(void) {
         l_warn("ANIM: ChoreAgentInst::SetController symbol not found.");
     }
 
-#if !MCSM_FAST_FINAL_RUNTIME
+#if MCSM_SIM_PROBES
     (void)hook_symbol_checked(&so_mod_gameengine, "_ZN9ChoreInst20UpdateChoreInstancesEv",
                               "ChoreInst::UpdateChoreInstances (probe)",
                               (uintptr_t)&hook_chore_update_all, &g_hook_chore_update_all);
@@ -2133,9 +2159,9 @@ static void patch_chore_full_update_path(void) {
                               "_ZN16Platform_Android17UnlockAchievementERK6String",
                               "Platform_Android::UnlockAchievement (achievement probe)",
                               (uintptr_t)&hook_unlock_achievement, &g_hook_unlock_achievement);
-#if !MCSM_FAST_FINAL_RUNTIME
+#if MCSM_SIM_PROBES
     /* ☠ These two exist ONLY to feed MCSM_PHASE_ADD, which compiles to nothing in the
-     * shipping build -- so installing them there bought a pair of empty SO_CONTINUE
+     * RELEASE build -- so installing them there bought a pair of empty SO_CONTINUE
      * hooks on two once-per-frame engine functions. SO_CONTINUE_VOID is 2 kubridge
      * memcpys + 2 cache flushes per call, so that was 8 kernel calls a frame for a
      * measurement the log itself reports as "phase timers COMPILED OUT" -- and it put
