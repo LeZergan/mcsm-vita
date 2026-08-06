@@ -127,10 +127,21 @@ static void apply_profile(McsmCfg *c, int prof) {
     c->gc_core3       = 1;      /* no_core3.txt absent = core 3 used */
     c->anim_nonskel   = -1;     /* -1 = follow skinning_full, as before */
     c->audio_rate     = 0;      /* 0 = engine default                */
-    c->anim_dt_repair = 1;      /* ★ ON, as shipped in v1.10. Turning it off was
-                                 * reported as clearly worse on device; that is the
-                                 * baseline to match, not my theory about which of
-                                 * the engine's two clocks deserves repairing. */
+    c->anim_dt_repair = 0;      /* ☠ OFF. DEVICE-REPORTED TO BREAK GAMEPLAY ANIMATION.
+                                 *
+                                 * This rewrites Metrics::mFrameTime (and
+                                 * mActualFrameTime) every frame to repair the
+                                 * engine's 0.1s clamp. The clamp is real and
+                                 * disassembled, and the repair still made gameplay
+                                 * animation visibly worse on hardware -- reported
+                                 * twice, unambiguously the second time.
+                                 *
+                                 * The engine owns its animation clocks. With this at
+                                 * 0 the loader hooks Metrics::NewFrame not at all and
+                                 * writes none of them. Do not turn it back on as a
+                                 * default: the theory behind it has now lost to the
+                                 * device twice, and it was ON in v1.10, so "it is
+                                 * what shipped" is not an argument for it either. */
     c->prefs_path_patch = 0;    /* disproved on device, see config.h */
     c->resloc_repair    = 0;    /* unverified; did not fix saving   */
     c->sim_probes     = 0;      /* chore/scene/script probes off     */
