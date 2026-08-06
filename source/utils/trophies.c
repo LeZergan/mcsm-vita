@@ -25,6 +25,7 @@
 #include <psp2/common_dialog.h>
 #include <stdio.h>
 #include <errno.h>
+#include <stdatomic.h>
 #include <string.h>
 #include <stdlib.h>
 
@@ -101,7 +102,7 @@ static int g_ctx = 0;
  * g_setup_pending is read every present, so it is written last on completion.
  * Guarded: a no-trophy build never opens a dialog, so these would be unused. */
 #if MCSM_HAVE_TROPHY_PACK
-static int  g_setup_pending = 0;
+static atomic_int g_setup_pending = ATOMIC_VAR_INIT(0);
 static char g_setup_marker[128];
 static void remember_marker_path(const char *m) {
     size_t n = 0;
@@ -113,10 +114,29 @@ static void remember_marker_path(const char *m) {
 static int g_available = 0;
 static McsmTrophyUnlockState g_unlocked;
 
-/* Worker plumbing. g_req is "a trophy is waiting", g_done is "the worker is idle"
- * (starts signalled) so a caller never overwrites a pending ID. */
-static SceUID g_req_sema = -1, g_done_sema = -1;
-static volatile int g_pending_id = -1;
+/* Worker plumbing. There are only 128 legal trophy IDs, so a 128-entry ring can hold
+ * every distinct outstanding request. g_queued_bits covers both queued and in-flight
+ * IDs: repeated story callbacks are collapsed without claiming the trophy is already
+ * earned. The bit moves to g_unlocked only after sceNpTrophyUnlockTrophy succeeds.
+ *
+ * The engine calls this from its script thread. It must never wait behind Sony's
+ * blocking trophy API -- or even behind the worker's queue mutex. The normal path
+ * uses a try-lock and the rare contended path records the ID in g_deferred_bits. The
+ * worker folds those bits into the same bounded ring under its own lock. Thus mutex
+ * contention cannot stall the game and cannot drop the achievement. */
+#define TROPHY_QUEUE_CAP 128u
+/* Upper bound on how long the worker defers unlocks for the first-boot setup
+ * dialog. Long enough that a user reading the dialog is never cut short, short
+ * enough that a dialog which never completes cannot silently disable trophies. */
+#define TROPHY_SETUP_WAIT_MAX_MS (60u * 1000u)
+static SceUID g_req_sema = -1;
+static SceUID g_queue_mutex = -1;
+static uint8_t g_queue[TROPHY_QUEUE_CAP];
+static unsigned g_queue_head = 0;
+static unsigned g_queue_tail = 0;
+static unsigned g_queue_count = 0;
+static atomic_uint_least32_t g_queued_bits[4];
+static atomic_uint_least32_t g_deferred_bits[4];
 
 /* name -> id map, loaded once from ux0:data/mcsm/settings/trophies.txt */
 #define TROPHY_MAP_MAX 128
@@ -129,24 +149,110 @@ static int g_map_loaded = 0;
 /* ---- worker ------------------------------------------------------------------- */
 
 #if MCSM_HAVE_TROPHY_PACK
+static void trophy_queue_refill_locked(void) {
+    for (unsigned word = 0; word < 4u; word++) {
+        uint32_t bits = (uint32_t)atomic_exchange_explicit(
+            &g_deferred_bits[word], 0u, memory_order_acquire);
+        while (bits != 0u) {
+            const unsigned bit = (unsigned)__builtin_ctz(bits);
+            bits &= bits - 1u;
+
+            /* This cannot fill: queued + deferred + the one in flight contains at
+             * most one entry for each of the 128 valid IDs. Keep the guard anyway so
+             * a future range change fails recoverably instead of corrupting memory. */
+            if (g_queue_count >= TROPHY_QUEUE_CAP) {
+                atomic_fetch_or_explicit(&g_deferred_bits[word],
+                                         bits | (1u << bit),
+                                         memory_order_release);
+                l_warn("TROPHY: internal queue full while refilling (id=%u)",
+                       word * 32u + bit);
+                return;
+            }
+            g_queue[g_queue_tail] = (uint8_t)(word * 32u + bit);
+            g_queue_tail = (g_queue_tail + 1u) % TROPHY_QUEUE_CAP;
+            g_queue_count++;
+        }
+    }
+}
+
 static int trophy_worker(SceSize args, void *argp) {
     (void)args; (void)argp;
     for (;;) {
         if (sceKernelWaitSema(g_req_sema, 1, NULL) < 0) break;
-        const int id = g_pending_id;
+
+        /* A newly-installed set is not usable until its common dialog completes,
+         * so hold early story callbacks until it does.
+         *
+         * ★ BOUNDED. This wait used to be unconditional (`while (pending) sleep`).
+         * g_setup_pending is only ever cleared by mcsm_trophies_setup_poll(), which
+         * runs from gl_swap and only clears once the dialog reports a non-RUNNING
+         * status. If the dialog never reaches that state -- it opened but was never
+         * completed, or presents stopped -- the flag stays set and this loop parks
+         * the worker for the rest of the session, so NOTHING ever unlocks. That is
+         * the "achievements do not pop at all" report. Give the dialog a generous
+         * window, then proceed: an unlock attempted too early merely fails, gets
+         * its queued bit cleared, and is retried by the next story callback. */
+        {
+            unsigned waited_ms = 0;
+            while (atomic_load_explicit(&g_setup_pending, memory_order_acquire)) {
+                if (waited_ms >= TROPHY_SETUP_WAIT_MAX_MS) {
+                    l_warn("TROPHY: setup dialog still pending after %ums; "
+                           "proceeding with queued unlocks", waited_ms);
+                    break;
+                }
+                sceKernelDelayThread(50u * 1000u);
+                waited_ms += 50u;
+            }
+        }
+
+        int id = -1;
+        const int lock_rc = sceKernelLockMutex(g_queue_mutex, 1, NULL);
+        if (lock_rc < 0) {
+            /* The semaphore token still represents a live request. Put the token
+             * back after a short worker-only delay rather than stranding that ID. */
+            l_warn("TROPHY: queue lock failed rc=0x%08X; retrying request",
+                   (unsigned)lock_rc);
+            sceKernelDelayThread(10u * 1000u);
+            sceKernelSignalSema(g_req_sema, 1);
+            continue;
+        }
+        trophy_queue_refill_locked();
+        if (g_queue_count != 0u) {
+            id = (int)g_queue[g_queue_head];
+            g_queue_head = (g_queue_head + 1u) % TROPHY_QUEUE_CAP;
+            g_queue_count--;
+        }
+        sceKernelUnlockMutex(g_queue_mutex, 1);
+        if (id < 0) {
+            /* A wake with no item is harmless (for example, recovery after a rare
+             * signal overflow); never manufacture a trophy ID from it. */
+            l_warn("TROPHY: request wake had no queue item");
+            continue;
+        }
+
         int handle = 0;
         int platinum = -1;
         if (sceNpTrophyCreateHandle(&handle) >= 0) {
             const int rc = sceNpTrophyUnlockTrophy(g_ctx, handle, id, &platinum);
             if (rc < 0) l_warn("TROPHY: unlock id=%d FAILED rc=0x%08X", id, (unsigned)rc);
-            else        l_info("TROPHY: unlocked id=%d%s", id,
-                               platinum >= 0 ? " (platinum condition met)" : "");
+            else {
+                __atomic_fetch_or(&g_unlocked.bits[id >> 5],
+                                  1u << (id & 31), __ATOMIC_RELEASE);
+                if (platinum >= 0 && platinum < 128)
+                    __atomic_fetch_or(&g_unlocked.bits[platinum >> 5],
+                                      1u << (platinum & 31), __ATOMIC_RELEASE);
+                l_info("TROPHY: unlocked id=%d%s", id,
+                       platinum >= 0 ? " (platinum condition met)" : "");
+            }
             sceNpTrophyDestroyHandle(handle);
         } else {
             l_warn("TROPHY: could not create handle for id=%d", id);
         }
-        /* Signal AFTER the blocking work so the next request cannot race this one. */
-        sceKernelSignalSema(g_done_sema, 1);
+
+        /* Success is now recorded in g_unlocked. On failure, clearing only the
+         * queued marker intentionally permits the next engine callback to retry. */
+        atomic_fetch_and_explicit(&g_queued_bits[id >> 5],
+                                  ~(1u << (id & 31)), memory_order_release);
     }
     return 0;
 }
@@ -209,7 +315,7 @@ int mcsm_trophies_setup_active(void) {
 #if !MCSM_HAVE_TROPHY_PACK
     return 0;
 #else
-    return g_setup_pending;
+    return atomic_load_explicit(&g_setup_pending, memory_order_acquire);
 #endif
 }
 
@@ -217,12 +323,11 @@ int mcsm_trophies_setup_poll(void) {
 #if !MCSM_HAVE_TROPHY_PACK
     return 0;
 #else
-    if (!g_setup_pending) return 0;
+    if (!atomic_load_explicit(&g_setup_pending, memory_order_acquire)) return 0;
     const SceCommonDialogStatus st = sceNpTrophySetupDialogGetStatus();
     if (st == SCE_COMMON_DIALOG_STATUS_RUNNING) return 1;
 
     sceNpTrophySetupDialogTerm();
-    g_setup_pending = 0;
 
     FILE *mf = g_setup_marker[0] ? fopen(g_setup_marker, "wb") : NULL;
     if (mf) {
@@ -236,14 +341,21 @@ int mcsm_trophies_setup_poll(void) {
                "will appear again next boot", g_setup_marker, errno);
     }
 
-    /* Registration is what fills the unlock bitmap in. */
-    { int h = 0; uint32_t cnt = 0;
-      sceClibMemset(&g_unlocked, 0, sizeof(g_unlocked));
+    /* Registration is what fills the unlock bitmap in. Query into a private object,
+     * then publish whole words atomically: story callbacks can safely inspect the old
+     * snapshot while the common-dialog thread is refreshing it. */
+    { int h = 0; uint32_t cnt = 0; McsmTrophyUnlockState refreshed;
+      sceClibMemset(&refreshed, 0, sizeof(refreshed));
       if (sceNpTrophyCreateHandle(&h) >= 0) {
-          sceNpTrophyGetTrophyUnlockState(g_ctx, h, &g_unlocked, &cnt);
+          sceNpTrophyGetTrophyUnlockState(g_ctx, h, &refreshed, &cnt);
           sceNpTrophyDestroyHandle(h);
       }
+      for (unsigned i = 0; i < 4u; i++)
+          __atomic_store_n(&g_unlocked.bits[i], refreshed.bits[i], __ATOMIC_RELEASE);
       l_info("TROPHY: registered — %u trophies now known to the system", cnt); }
+
+    /* Release the worker only after the bitmap refresh above is complete. */
+    atomic_store_explicit(&g_setup_pending, 0, memory_order_release);
     return 0;
 #endif
 }
@@ -409,7 +521,7 @@ int mcsm_trophies_init(void) {
         const int drc = sceNpTrophySetupDialogInit(&setup);
         if (drc >= 0) {
             remember_marker_path(marker);
-            g_setup_pending = 1;
+            atomic_store_explicit(&g_setup_pending, 1, memory_order_release);
             l_info("TROPHY: first boot — setup dialog opened, running alongside the load");
         } else {
             l_warn("TROPHY: setup dialog would not open (rc=0x%08X) — trophies will be "
@@ -421,10 +533,19 @@ int mcsm_trophies_init(void) {
            g_comm_id, trophy_count,
            registered ? "already registered" : "registered this launch");
 
-    g_done_sema = sceKernelCreateSema("mcsm_trp_done", 0, 1, 1, NULL);
-    g_req_sema  = sceKernelCreateSema("mcsm_trp_req",  0, 0, 1, NULL);
-    if (g_done_sema < 0 || g_req_sema < 0) {
-        l_warn("TROPHY: semaphore creation failed — trophies disabled");
+    g_queue_head = g_queue_tail = g_queue_count = 0u;
+    for (unsigned i = 0; i < 4u; i++) {
+        atomic_store_explicit(&g_queued_bits[i], 0u, memory_order_relaxed);
+        atomic_store_explicit(&g_deferred_bits[i], 0u, memory_order_relaxed);
+    }
+    g_queue_mutex = sceKernelCreateMutex("mcsm_trp_queue", 0, 0, NULL);
+    g_req_sema = sceKernelCreateSema("mcsm_trp_req", 0, 0,
+                                     (int)TROPHY_QUEUE_CAP, NULL);
+    if (g_queue_mutex < 0 || g_req_sema < 0) {
+        l_warn("TROPHY: queue synchronisation creation failed — trophies disabled");
+        if (g_req_sema >= 0) sceKernelDeleteSema(g_req_sema);
+        if (g_queue_mutex >= 0) sceKernelDeleteMutex(g_queue_mutex);
+        g_req_sema = g_queue_mutex = -1;
         return -1;
     }
     /* Low priority: this thread does one blocking call at a time and must never compete
@@ -436,9 +557,21 @@ int mcsm_trophies_init(void) {
     SceUID thd = sceKernelCreateThread("mcsm_trophy", &trophy_worker, 0x10000100, 0x10000, 0, 0, NULL);
     if (thd < 0) {
         l_warn("TROPHY: worker thread creation failed — trophies disabled");
+        sceKernelDeleteSema(g_req_sema);
+        sceKernelDeleteMutex(g_queue_mutex);
+        g_req_sema = g_queue_mutex = -1;
         return -1;
     }
-    sceKernelStartThread(thd, 0, NULL);
+    const int start_rc = sceKernelStartThread(thd, 0, NULL);
+    if (start_rc < 0) {
+        l_warn("TROPHY: worker thread start failed rc=0x%08X — trophies disabled",
+               (unsigned)start_rc);
+        sceKernelDeleteThread(thd);
+        sceKernelDeleteSema(g_req_sema);
+        sceKernelDeleteMutex(g_queue_mutex);
+        g_req_sema = g_queue_mutex = -1;
+        return start_rc;
+    }
 
     trophy_map_load();
     g_available = 1;
@@ -462,7 +595,8 @@ int mcsm_trophies_init(void) {
 
 int mcsm_trophies_already_unlocked(uint32_t id) {
     if (id >= 128u) return 0;
-    return (g_unlocked.bits[id >> 5] & (1u << (id & 31u))) != 0u;
+    return (__atomic_load_n(&g_unlocked.bits[id >> 5], __ATOMIC_ACQUIRE) &
+            (1u << (id & 31u))) != 0u;
 }
 
 void mcsm_trophies_unlock(uint32_t id) {
@@ -472,23 +606,43 @@ void mcsm_trophies_unlock(uint32_t id) {
      * queueing a redundant blocking unlock every time it plays. The bitmap is seeded
      * at init from the SYSTEM's store, so trophies earned in past sessions count. */
     if (mcsm_trophies_already_unlocked(id)) return;
-    g_unlocked.bits[id >> 5] |= (1u << (id & 31u));
 
-    /* Wait for the worker to be idle, then hand it the ID.
-     * ☠ BOUNDED WAIT. This runs on the ENGINE'S SCRIPT THREAD, so an untimed wait
-     * here would hang the whole game if the worker ever wedged inside a blocking
-     * sceNpTrophyUnlockTrophy. Two seconds is far longer than a trophy write needs and
-     * far shorter than a player would tolerate a freeze; on timeout we drop THIS
-     * unlock rather than the game. The bit was already set above, so a dropped unlock
-     * is not retried -- deliberately, because retrying is what would turn a wedged
-     * worker into a permanent per-achievement stall. */
-    SceUInt timeout_us = 2u * 1000u * 1000u;
-    if (sceKernelWaitSema(g_done_sema, 1, &timeout_us) < 0) {
-        l_warn("TROPHY: worker busy, dropped unlock id=%u (game not stalled)", (unsigned)id);
+    const unsigned word = id >> 5;
+    const uint32_t mask = 1u << (id & 31u);
+    if ((atomic_fetch_or_explicit(&g_queued_bits[word], mask,
+                                  memory_order_acq_rel) & mask) != 0u)
+        return;
+
+    /* The worker may have completed between the first bitmap check and our queue-bit
+     * reservation. Do not enqueue a redundant system call in that narrow window. */
+    if (mcsm_trophies_already_unlocked(id)) {
+        atomic_fetch_and_explicit(&g_queued_bits[word], ~mask, memory_order_release);
         return;
     }
-    g_pending_id = (int)id;
-    sceKernelSignalSema(g_req_sema, 1);
+
+    int in_ring = 0;
+    if (sceKernelTryLockMutex(g_queue_mutex, 1) >= 0) {
+        if (g_queue_count < TROPHY_QUEUE_CAP) {
+            g_queue[g_queue_tail] = (uint8_t)id;
+            g_queue_tail = (g_queue_tail + 1u) % TROPHY_QUEUE_CAP;
+            g_queue_count++;
+            in_ring = 1;
+        }
+        sceKernelUnlockMutex(g_queue_mutex, 1);
+    }
+
+    /* Queue contention never reaches the script thread. The worker transfers this
+     * atomic fallback into the ring before dequeuing its next request. */
+    if (!in_ring)
+        atomic_fetch_or_explicit(&g_deferred_bits[word], mask, memory_order_release);
+
+    const int signal_rc = sceKernelSignalSema(g_req_sema, 1);
+    if (signal_rc < 0) {
+        /* With one bit per valid ID and a 128-slot semaphore this cannot overflow.
+         * Retain the request so another successful wake can recover it. */
+        l_warn("TROPHY: could not wake worker for id=%u rc=0x%08X; request retained",
+               (unsigned)id, (unsigned)signal_rc);
+    }
 }
 
 /* ★ DERIVE THE TROPHY ID FROM THE NAME — no configuration required.

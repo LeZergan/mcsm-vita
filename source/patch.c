@@ -480,73 +480,6 @@ static uint32_t mcsm_frame_period_us(void) {
     return (uint32_t)(1000000 / fps);
 }
 
-static uint32_t mcsm_frame_pace_us(void) {
-    static int initialized = 0;
-    /* Default 30 fps. */
-    static uint32_t pace_us = 30833;
-    static int requested_fps = 30;
-    if (!initialized) {
-        initialized = 1;
-        int fps = mcsm_cfg()->fps_cap;
-        requested_fps = fps;
-        if (fps <= 0 || fps > 120) {
-            pace_us = 0; /* uncapped */
-        } else {
-            /* ★ EXACT PERIOD, NOT WHOLE VBLANKS (fixed 2026-07-30).
-             *
-             * This used to quantise to the nearest whole vblank:
-             *     k = round(1e6/fps / 16667);  pace = k*16667 - 2500
-             * which was correct back when the present lock did the same thing. The
-             * present lock moved to an exact fractional timeline on 2026-07-29 (it
-             * carries a rem/den remainder, so 24fps rides a real 3:2:3:2 pulldown),
-             * and this was never updated -- so the two gates on the same frame were
-             * running at DIFFERENT periods, and the comment here still claimed they
-             * "share one phase".
-             *
-             * For fps_cap = 24 the old rule computed k = round(41666/16667) = 2 and
-             * paced the sim at 30834us -- 32.4fps -- while the present lock held
-             * 41666.67us. The sim therefore ran ~28% faster than anything could be
-             * displayed, burning CPU and battery on work that was thrown away, and
-             * the clock governor (which takes its budget from this function) sized
-             * its up/down thresholds against 30834 instead of the real 41666.
-             *
-             * Using the exact period fixes 24 and is a NO-OP for the rates that were
-             * already right, which is what makes it safe:
-             *     30fps: old 2*16667-2500 = 30834   new 33333-2500 = 30833
-             *     60fps: old 1*16667-2500 = 14167   new 16666-2500 = 14166
-             *     24fps: old            30834       new 41666-2500 = 39166  <-- fixed
-             * The 2500us undershoot is kept: it kicks the sim loose slightly before
-             * the present deadline so the present lock, not this, is the gate that
-             * actually decides when a frame goes out. */
-            const uint32_t period = (uint32_t)(1000000 / fps);
-            pace_us = (period > 2500u) ? (period - 2500u) : period;
-        }
-        l_info("Frame pace: %u us (%s requested=%d, exact period %u us)",
-               pace_us,
-               pace_us ? "capped" : "uncapped",
-               requested_fps,
-               mcsm_frame_period_us());
-    }
-    return pace_us;
-}
-
-static void mcsm_pace_frame(void) {
-    const uint32_t target = mcsm_frame_pace_us();
-    if (!target) {
-        return;
-    }
-    static uint64_t last_us = 0;
-    uint64_t now = sceKernelGetSystemTimeWide();
-    if (last_us != 0) {
-        const uint64_t elapsed = now - last_us;
-        if (elapsed < target) {
-            sceKernelDelayThread((SceUInt)(target - elapsed));
-            now = sceKernelGetSystemTimeWide();
-        }
-    }
-    last_us = now;
-}
-
 /* ADAPTIVE ARM-CLOCK GOVERNOR (2026-07-20, battery) ------------------------
  * The game is CPU/draw-submit bound, but only in HEAVY scenes; menus, dialogue
  * and most gameplay finish the engine sim loop far under the frame budget.
@@ -1034,6 +967,24 @@ static void force_native_render_dimensions(const char *phase) {
 }
 
 
+/* ★ 2026-08-06 — THIS FORCING IS THE RECOVERY PATH, NOT JUST A BOOT NUDGE.
+ *
+ * Application::msbApplicationActive and msbWaitForMessages are both BSS (they
+ * start at 0/0) and on Vita there is no Android Activity to ever set them back
+ * to "active". They are, however, written to the INACTIVE state by SDL's
+ * app-lifecycle events. So anything that queues an SDL pause -- a power
+ * notification, a common dialog, the PS button -- parks the engine in
+ * "inactive / waiting for window messages" permanently.
+ *
+ * 1.10 restricted this to the pre-gameplay boot window (`if (g_boot_scene_active)
+ * return;`) on the theory that the engine owns its own state once gameplay is
+ * live. It does not: nothing on this platform ever re-activates it. That is the
+ * "game freezes with audio still playing, have to quit and relaunch" report --
+ * FMOD keeps streaming on its own thread while the engine loop sits inactive.
+ *
+ * Re-asserting every frame is cheap (two byte stores) and is what every build
+ * before 1.10 did. Keep it unconditional: a transient inactive state then
+ * self-heals on the next frame instead of wedging the session. */
 static void force_application_active(const char *phase) {
 #ifdef DEBUG_SOLOADER
     static uint32_t log_count = 0;
@@ -1219,14 +1170,33 @@ static void metrics_diag_tick(uint32_t loop_count, const char *phase) {
 
 static int playback_dt_is_usable(float value);
 
-/* SLOW-ANIMATION FIX: the animation dt was clamped to a max of 1/30s
- * (33ms). The governor uses REAL elapsed time as the dt, so any frame slower than
- * 30fps (every heavy cutscene/gameplay scene) got its animation advance capped at
- * 33ms while real time advanced much more -> animations crawled in slow motion
- * (log proof: elapsed=310ms -> out=33ms = 0.1x speed). Widen the window so the
- * animation advances at the TRUE frame delta through heavy frames; only genuine
- * half-second-plus stalls get clamped (so a scene-load freeze can't fling the pose).
- * MIN lowered so >60fps frames don't over-advance (fast motion). */
+/* ANIMATION DELTA GOVERNOR ------------------------------------------------
+ *
+ * Metrics::NewFrame (disassembled 2026-08-06 at 0x00c71d58) computes
+ *     frameTime = elapsed - Metrics::mMinFrameTime
+ * and then hard-clamps it:
+ *     if (frameTime > 5.0f)  frameTime = <const>
+ *     if (frameTime > 0.1f)  frameTime = 0.1f      <-- 0x3dcccccd at 0xc7212c
+ *
+ * mMinFrameTime is BSS and nothing on this platform writes it, so the
+ * subtraction is a no-op and the engine's delta is true elapsed -- RIGHT UP TO
+ * THE 0.1s CLAMP. Below 10fps (heavy crowd scenes, and every scene-load hitch)
+ * the engine advances animation by at most 100ms per frame while real time and
+ * the FMOD audio clock advance by more. That is slow-motion animation that
+ * drifts behind dialogue, and it gets worse the heavier the scene -- which is
+ * exactly the "animations play at the wrong speed" and "facial animation breaks
+ * in high-load scenes" reports.
+ *
+ * 1.10 removed this governor and left Metrics::NewFrame native. The intent was
+ * right -- the engine keeps a safe delta and a real delta and controllers pick
+ * between them, so flattening both is lossy -- but the 0.1s clamp means native
+ * is not correct either.
+ *
+ * So: widen the ceiling to 0.25s instead of removing the correction. Normal
+ * frames are untouched (the engine's own value is already true elapsed and well
+ * under the clamp, so the >0.5ms guard below simply never fires). Only frames
+ * the engine would have clamped get repaired, and genuine multi-second stalls
+ * still clamp so a scene load cannot fling the pose across the room. */
 #define ANIM_DT_MIN_SECONDS   (1.0f / 240.0f)
 #define ANIM_DT_MAX_SECONDS   (1.0f / 4.0f)
 #define ANIM_STALL_RESET_US   500000ULL
@@ -1268,10 +1238,10 @@ static float animation_governor_update(float engine_frame_time,
     if (elapsed_us >= 4000ULL && elapsed_us <= ANIM_STALL_RESET_US) {
         target = clamp_animation_dt((float)elapsed_us / 1000000.0f);
     } else if (elapsed_us > ANIM_STALL_RESET_US) {
-        /* Never feed a multi-second load pause directly into simulation, but do
+        /* Never feed a multi-second load pause straight into simulation, but do
          * account for a useful slice of it. Reusing the previous small dt dropped
-         * the whole pause while audio continued and permanently moved mouths and
-         * animation behind the soundtrack. */
+         * the whole pause while audio kept playing, which is what permanently
+         * moved mouths and animation behind the soundtrack. */
         target = ANIM_DT_MAX_SECONDS;
     } else if (playback_dt_is_usable(engine_frame_time)) {
         target = clamp_animation_dt(engine_frame_time);
@@ -1279,8 +1249,8 @@ static float animation_governor_update(float engine_frame_time,
         target = clamp_animation_dt(engine_actual_frame_time);
     }
 
-    /* Animation and audio must see the same wall-clock cadence. The old 50% EMA
-     * intentionally lagged variable-rate scenes by one or more frames. */
+    /* Animation and audio must see the same wall-clock cadence, so no EMA here:
+     * smoothing intentionally lags variable-rate scenes by a frame or more. */
     g_anim_governed_dt = target;
     g_anim_governor_initialized = 1;
 
@@ -1320,17 +1290,17 @@ static void metrics_force_animation_dt(float dt, const char *phase, uint32_t cou
         return;
     }
 
-    /* REVERTED 2026-06-30: forcing dt = the fixed frame-pace period made
-     * animations play in slow motion / near-frozen (user: "extremely slow,
-     * worked better before"). Use the governor-derived dt (real elapsed time) so
-     * animation plays at correct wall-clock speed. The real stutter fix is the
-     * O0 shader-compiler change, not the dt. */
     const float fixed_dt = clamp_animation_dt(dt);
     const float old_ft = g_metrics_diag.frame_time ? *g_metrics_diag.frame_time : fixed_dt;
     const float old_aft = g_metrics_diag.actual_frame_time ? *g_metrics_diag.actual_frame_time : fixed_dt;
     const float old_total = g_metrics_diag.total_time ? *g_metrics_diag.total_time : 0.0f;
     int changed = 0;
 
+    /* Only correct a delta the engine actually got wrong. On a normal frame the
+     * engine's value already IS the elapsed time, both of these differ by well
+     * under half a millisecond, and this whole function is a no-op -- which is
+     * what preserves the engine's own safe/actual distinction in the common
+     * case and limits the rewrite to frames the 0.1s clamp truncated. */
     if (g_metrics_diag.frame_time && abs_float_delta(*g_metrics_diag.frame_time, fixed_dt) > 0.0005f) {
         *g_metrics_diag.frame_time = fixed_dt;
         changed = 1;
@@ -1346,9 +1316,9 @@ static void metrics_force_animation_dt(float dt, const char *phase, uint32_t cou
         playback_dt_is_usable(old_ft) &&
         old_ft <= 1.0f &&
         *g_metrics_diag.total_time >= old_ft) {
-        /* Metrics::NewFrame already added old_ft. Apply the difference in both
-         * directions; the previous one-sided correction never added missing time
-         * for a 60-120ms frame reported by the engine as 33ms. */
+        /* Metrics::NewFrame already folded old_ft into mTotalTime. Apply the
+         * difference in both directions so the clock the engine reports stays
+         * consistent with the deltas we just handed it. */
         *g_metrics_diag.total_time += (fixed_dt - old_ft);
         changed = 1;
     }
@@ -2108,19 +2078,24 @@ static void hook_metrics_new_frame(uint32_t min_frame_time_bits) {
                             sizeof(g_hook_metrics_new_frame.patch_instr));
     }
 
+    /* Runs AFTER the real NewFrame has written mFrameTime/mActualFrameTime and
+     * BEFORE the rest of the loop consumes them -- the only point where the 0.1s
+     * clamp can still be repaired for the frame it applies to. On frames the
+     * engine timed correctly this is a no-op (see metrics_force_animation_dt). */
     const float engine_ft = g_metrics_diag.frame_time ? *g_metrics_diag.frame_time : 0.0f;
     const float engine_aft = g_metrics_diag.actual_frame_time ? *g_metrics_diag.actual_frame_time : 0.0f;
     const float fixed_dt = animation_governor_update(engine_ft, engine_aft, "newframe", count);
     metrics_force_animation_dt(fixed_dt, "newframe", count);
 
+    metrics_diag_tick(count, "newframe");
 }
 
 static void hook_gameengine_loop(void) {
     static uint32_t count = 0;
 
     count++;
-    /* STREAMING FIX: pump the async preload batch every frame while a
-     * ScenePreload is in flight. */
+    /* STREAMING: advance the async preload batch while a ScenePreload is in
+     * flight. Bounded per frame and by a hard deadline -- see stream_pump_preload. */
     stream_pump_preload();
     if ((count & 0x0fU) == 1U) {
         force_animation_runtime_flags("loop");
@@ -2160,14 +2135,18 @@ static void hook_gameengine_loop(void) {
     force_application_active("loop-post");
     force_native_render_dimensions("loop-post");
     metrics_diag_tick(count, "post");
+    /* Fail-safe only: if the Metrics::NewFrame hook did not install, this is the
+     * one remaining place the clamped delta can be repaired. When that hook IS
+     * live this is a no-op, because it already wrote the same value this frame. */
     metrics_force_animation_dt(
         animation_governor_current_or_repair(
             g_metrics_diag.frame_time ? *g_metrics_diag.frame_time : 0.0f,
             g_metrics_diag.actual_frame_time ? *g_metrics_diag.actual_frame_time : 0.0f),
         "loop-post",
         count);
-    /* Steady frame pacing so the engine's animation delta is consistent. */
-    mcsm_pace_frame();
+    /* The render presenter is the only frame-rate gate. Sleeping the simulation
+     * here as well stacked two independent caps; a small vblank miss at 30 FPS
+     * became a 3-vblank/20 FPS frame and starved animation preparation. */
 }
 
 static void hook_gameengine_render(void) {
@@ -2402,26 +2381,14 @@ static void hook_playback_controller_update(uint32_t frame_time_bits,
 
     MCSM_DIAG_COUNTER(count);
 
-    const float frame_time = float_from_bits(frame_time_bits);
-    const float actual_frame_time = float_from_bits(actual_frame_time_bits);
     uint32_t out_frame_bits = frame_time_bits;
     uint32_t out_actual_bits = actual_frame_time_bits;
-    float out_frame_time = frame_time;
-    float out_actual_frame_time = actual_frame_time;
 
-    if (g_boot_scene_active) {
-        const float governed_dt =
-            animation_governor_current_or_repair(frame_time, actual_frame_time);
-        if (abs_float_delta(out_frame_time, governed_dt) > 0.0005f) {
-            out_frame_time = governed_dt;
-            out_frame_bits = float_bits(out_frame_time);
-        }
-        if (abs_float_delta(out_actual_frame_time, governed_dt) > 0.0005f) {
-            out_actual_frame_time = governed_dt;
-            out_actual_bits = float_bits(out_actual_frame_time);
-        }
-        metrics_force_animation_dt(governed_dt, "playback", count);
-    }
+    /* Do not rewrite either channel. Shipped engine code selects between the
+     * safe frame delta and actual wall-clock delta per controller. Keeping that
+     * distinction is what lets facial/audio controllers catch up after a hitch
+     * without flinging ordinary body animation forward. The optional anim_rate
+     * block above has already accumulated the original pair when explicitly used. */
 
     /* libGameEngine was built softfp, so these float arguments arrive in r0/r1.
      * Keep both hook entry and original call in integer registers and only
@@ -3194,6 +3161,105 @@ static int hook_indexbuffer_platform_unlock(void *self) {
     return ok ? 1 : 0;
 }
 
+/* ---- map_buffers = 1: PRE-ALLOCATING LOCK HOOKS (2026-08-06) --------------
+ *
+ * This is the missing half the `map_buffers` comment at the bottom of this file
+ * asks for, and the reason enabling it used to crash on boot.
+ *
+ * Disassembly of the engine (T3VertexBuffer::PlatformLock @0x57b998 ->
+ * RenderDevice::MapGLBuffer @0x578fcc) shows MapGLBuffer only ever reaches
+ * RenderDevice::AllocateGLBuffer on the branch taken when cap 22
+ * (mRenderCaps & 0x400000, EXT_map_buffer_range) is CLEAR. On this device the
+ * boot log reports `OES_mapbuffer=1 EXT_map_buffer_range=1`, so caps 21 and 22
+ * are both set, the allocating branch is never taken, and the engine maps a GL
+ * buffer name whose storage nothing ever created. The shipped libvitaGL.a is
+ * built NO_DEBUG, so glMapNamedBufferRange returns `ptr + offset` with no null
+ * check -- and ptr is NULL. The skinner then writes hundreds of KB near address
+ * zero. That is the boot crash, not anything wrong with the zero-copy idea.
+ *
+ * So: keep a hook on PlatformLock ONLY (never on Unlock -- the engine's own
+ * glUnmapBuffer must run), guarantee storage exists at the right size, then
+ * SO_CONTINUE into the engine so it maps and skins straight into GPU memory.
+ * glBufferData is issued once per buffer and again only if the size changes,
+ * which is what removes the per-frame malloc + full respecify + free that makes
+ * framerate collapse once a scene has more than a couple of animated NPCs.
+ *
+ * ⚠ NOT ON BY DEFAULT. This is written from static analysis of the engine and
+ * the installed vitaGL, and has not been run on hardware. `map_buffers = 1` in
+ * settings/graphics.txt selects it. Verify with the SKINPROBE line: respec/f and
+ * KB/f should fall to ~0. Promote to default only after a device run. */
+#define VB_ALLOC_NAME_CAP 8192
+static uint32_t g_vb_alloc_size[VB_ALLOC_NAME_CAP];
+
+static void vb_ensure_gl_storage(uint32_t name, GLenum target, size_t bytes) {
+    if (!name || !bytes) {
+        return;
+    }
+    /* Names beyond the table are rare; respecify them every lock rather than
+     * risk mapping unallocated storage. Correctness first, then the fast path. */
+    if (name < VB_ALLOC_NAME_CAP && g_vb_alloc_size[name] == (uint32_t)bytes) {
+        return;
+    }
+    glBindBuffer(target, name);
+    glBufferData(target, (GLsizeiptr)bytes, NULL, GL_DYNAMIC_DRAW);
+    const GLenum err = glGetError();
+    if (err == GL_NO_ERROR) {
+        if (name < VB_ALLOC_NAME_CAP) {
+            g_vb_alloc_size[name] = (uint32_t)bytes;
+        }
+    } else {
+        if (name < VB_ALLOC_NAME_CAP) {
+            g_vb_alloc_size[name] = 0;
+        }
+        l_warn("MAPBUF: glBufferData(name=%u, %u bytes) failed err=0x%04X",
+               (unsigned)name, (unsigned)bytes, (unsigned)err);
+    }
+    glBindBuffer(target, 0);
+}
+
+static so_hook g_hook_vb_prealloc_lock;
+static so_hook g_hook_ib_prealloc_lock;
+
+static int hook_vertexbuffer_prealloc_lock(void *self, int write) {
+    if (self) {
+        const uint32_t *u32 = (const uint32_t *)self;
+        /* Only the FIRST lock allocates: a nested lock already has a live mapped
+         * pointer at +0xd0 and the engine just bumps the count at +0xe0. */
+        if (u32[0xe0 / 4] == 0 && u32[0xd0 / 4] == 0) {
+            vb_ensure_gl_storage(u32[0x20 / 4], GL_ARRAY_BUFFER,
+                                 (size_t)u32[0xc0 / 4] * (size_t)u32[0xc4 / 4]);
+        }
+    }
+    return SO_CONTINUE(int, g_hook_vb_prealloc_lock, self, write);
+}
+
+static int hook_indexbuffer_prealloc_lock(void *self, int write) {
+    if (self) {
+        const uint32_t *u32 = (const uint32_t *)self;
+        if (u32[0x24 / 4] == 0 && u32[0x3c / 4] == 0) {
+            vb_ensure_gl_storage(u32[0x20 / 4], GL_ELEMENT_ARRAY_BUFFER,
+                                 (size_t)u32[0x2c / 4] * (size_t)u32[0x30 / 4]);
+        }
+    }
+    return SO_CONTINUE(int, g_hook_ib_prealloc_lock, self, write);
+}
+
+static void patch_vertexbuffer_prealloc_lock(void) {
+    (void)hook_symbol_checked(&so_mod_gameengine,
+                              "_ZN14T3VertexBuffer12PlatformLockEb",
+                              "T3VertexBuffer::PlatformLock (map_buffers prealloc)",
+                              (uintptr_t)&hook_vertexbuffer_prealloc_lock,
+                              &g_hook_vb_prealloc_lock);
+}
+
+static void patch_indexbuffer_prealloc_lock(void) {
+    (void)hook_symbol_checked(&so_mod_gameengine,
+                              "_ZN13T3IndexBuffer12PlatformLockEb",
+                              "T3IndexBuffer::PlatformLock (map_buffers prealloc)",
+                              (uintptr_t)&hook_indexbuffer_prealloc_lock,
+                              &g_hook_ib_prealloc_lock);
+}
+
 static void patch_vertexbuffer_platform_lock(void) {
     so_hook hook;
     (void)hook_symbol_checked(&so_mod_gameengine,
@@ -3248,6 +3314,11 @@ static void patch_engine_diag_hooks(void) {
     force_animation_runtime_flags("patch");
     patch_chore_full_update_path();
 
+    /* Production hook: this is where the engine's 0.1s frame-delta clamp gets
+     * repaired (see the governor above). It is called once per frame from the
+     * single game-loop thread and uses the exact-prologue trampoline below --
+     * NOT SO_CONTINUE -- so it does not rewrite live instruction bytes on a hot
+     * multi-threaded path. The SO_CONTINUE fallback stays only as a fail-safe. */
     if (hook_symbol_checked(&so_mod_gameengine,
                             "_ZN7Metrics8NewFrameEf",
                             "Metrics::NewFrame",
@@ -3293,14 +3364,19 @@ static void patch_engine_diag_hooks(void) {
                               (uintptr_t)&hook_renderdevice_begin_frame,
                               &g_hook_render_begin_frame);
 
-    if (hook_symbol_checked(&so_mod_gameengine,
+    /* Rate 1 is the correctness/default path and needs no hook at all. Advanced
+     * rates 2/3 still work by accumulating the engine's original two deltas. */
+    if (mcsm_anim_rate() > 1 &&
+        hook_symbol_checked(&so_mod_gameengine,
                             "_ZN18PlaybackController25UpdatePlaybackControllersEff",
-                            "PlaybackController::UpdatePlaybackControllers",
+                            "PlaybackController::UpdatePlaybackControllers (explicit reduced rate)",
                             (uintptr_t)&hook_playback_controller_update,
                             &g_hook_playback_controller_update)) {
         enable_validated_hot_trampoline("PlaybackController::UpdatePlaybackControllers",
                                         &g_hook_playback_controller_update,
                                         &g_playback_controller_update_tramp);
+    } else if (mcsm_anim_rate() == 1) {
+        l_info("ANIM: playback controllers left native at full rate");
     }
 
     if (hook_symbol_checked(&so_mod_gameengine,
@@ -4181,25 +4257,40 @@ static int hook_lua_resource_is_loaded(void *L) {
 }
 #endif /* DEBUG_SOLOADER */
 
-/* STREAMING FIX (2026-06-21): On Android ScenePreload returns immediately
- * after queuing async work; the main game loop pumps AdvancePreloadBatch
- * each frame until the scene is ready.  On Vita the main loop stops pumping
- * right after ScenePreload, so the async preload never completes and the
- * earlier hack returned 0 (skip) — forcing ALL textures to upload at
- * SceneOpen time synchronously → 2076 uploads for ~308 unique textures →
- * GPU OOM at ~7200 frames with free_cdram dropping to ~12MB.
+/* ★ SCENE-PRELOAD PUMP (restored 2026-08-06) ------------------------------
  *
- * The engine-level fix: let ScenePreload run natively, capture the Lua
- * state, then drive AdvancePreloadBatch from our GameEngine_Loop hook until
- * the preload is complete.  This keeps only the current scene's textures
- * resident in VRAM, exactly as the Android build does. */
+ * luaResourceAdvancePreloadBatch (engine 0x00c41858) is a Lua-callable C
+ * function: on Android the game's script update loop calls it every frame until
+ * the async preload started by ScenePreload reports done. On this port that
+ * pumping does not happen, so a preload that is started is never advanced --
+ * the scene never becomes ready and the game sits waiting for it while FMOD
+ * keeps streaming dialogue on its own thread. That is the "frozen with audio
+ * still playing at a scene change, have to quit and relaunch" report, and why
+ * it reproduces around story branches (the Ruben choice) where a new scene is
+ * preloaded.
+ *
+ * 1.10 deleted the pump. The objection behind that was fair -- the old version
+ * cached a raw lua_State and could in principle keep calling forever -- so this
+ * restores the pump WITH the bounds it never had:
+ *   - at most 2 batch calls and 4ms of work per frame (as before),
+ *   - a hard wall-clock deadline, after which we stop pumping regardless, so a
+ *     wedged or stale preload degrades to the old behaviour instead of pinning
+ *     the sim thread every frame for the rest of the session,
+ *   - the pump is dropped the moment a batch reports completion.
+ *
+ * The engine keeps one long-lived script lua_State, so the cached pointer stays
+ * valid for the window this is used in (ScenePreload -> preload complete). */
+#define STREAM_PRELOAD_MAX_US   (20ULL * 1000000ULL)  /* hard stop for one preload */
+
 static void    *g_preload_lua_state = NULL;
-static volatile int g_preload_pending   = 0;
+static volatile int g_preload_pending = 0;
+static uint64_t g_preload_started_us = 0;
 #ifdef DEBUG_SOLOADER
 static volatile int g_preload_log_once  = 0;
 #endif
-/* Direct function pointer to luaResourceAdvancePreloadBatch so we can
- * pump it from the C++ game loop without round-tripping through Lua. */
+
+/* Direct function pointer to luaResourceAdvancePreloadBatch so the batch can be
+ * driven from the C++ game loop without a round trip through Lua. */
 typedef int (*AdvancePreloadBatchFn)(void *L);
 static AdvancePreloadBatchFn g_advance_preload_fn = NULL;
 
@@ -4229,10 +4320,20 @@ static void stream_pump_preload(void) {
         return;
     }
 
+    const uint64_t pump_t0 = sceKernelGetSystemTimeWide();
+
+    /* Hard deadline. A preload this old is not going to finish by being pumped
+     * harder, and continuing to call into it every frame is the failure mode the
+     * removal was worried about. Give up and let the engine proceed. */
+    if (g_preload_started_us && (pump_t0 - g_preload_started_us) > STREAM_PRELOAD_MAX_US) {
+        g_preload_pending = 0;
+        l_warn("STREAM: preload pump deadline reached; releasing pump");
+        return;
+    }
+
 #ifdef DEBUG_SOLOADER
     int pumped = 0;
 #endif
-    const uint64_t pump_t0 = sceKernelGetSystemTimeWide();
     for (int i = 0; i < 2 && g_preload_pending; ++i) {
         int ret = g_advance_preload_fn(g_preload_lua_state);
 #ifdef DEBUG_SOLOADER
@@ -4245,8 +4346,7 @@ static void stream_pump_preload(void) {
 #endif
             break;
         }
-        const uint64_t elapsed_us = sceKernelGetSystemTimeWide() - pump_t0;
-        if (elapsed_us >= 4000ULL) {
+        if ((sceKernelGetSystemTimeWide() - pump_t0) >= 4000ULL) {
             break;
         }
     }
@@ -4281,8 +4381,9 @@ static int hook_lua_scene_preload(void *L) {
     l_info("STREAM: luaScenePreload #%u scene='%s' (real preload)",
            count, nm ? nm : "(?)");
 #endif
-    g_preload_lua_state = L;
-    g_preload_pending   = 1;
+    g_preload_lua_state  = L;
+    g_preload_pending    = 1;
+    g_preload_started_us = sceKernelGetSystemTimeWide();
 #ifdef DEBUG_SOLOADER
     g_preload_log_once  = 0;
 #endif
@@ -7169,9 +7270,16 @@ void so_patch(void) {
      * unallocated-pointer hazard. Not attempted yet; do not enable this until it
      * is, and re-verify against the installed lib. */
     if (mcsm_cfg()->map_buffers) {
-        l_info("PERF: map_buffers=1 — NOT installing the T3Vertex/IndexBuffer "
-               "Platform(Un)Lock hooks; the engine's own zero-copy glMapBuffer "
-               "path takes over (expect SKINPROBE respec/f -> ~0)");
+        /* Replace the staging-buffer hooks with pre-allocating lock hooks and let
+         * the engine's own zero-copy glMapBuffer path do the rest. The Unlock
+         * hooks are deliberately NOT installed so the engine's glUnmapBuffer runs.
+         * See the block comment on vb_ensure_gl_storage for why the bare
+         * "install nothing" version of this crashed on boot. */
+        patch_vertexbuffer_prealloc_lock();
+        patch_indexbuffer_prealloc_lock();
+        l_info("PERF: map_buffers=1 — engine zero-copy glMapBuffer path active, "
+               "with loader-side glBufferData pre-allocation (expect SKINPROBE "
+               "respec/f -> ~0)");
     } else {
         patch_vertexbuffer_platform_lock();
         patch_vertexbuffer_platform_unlock();

@@ -1,6 +1,7 @@
 #include <psp2/power.h>
 #include "utils/init.h"
 #include "utils/config.h"   /* clock_mhz / clock_adaptive for the CLOCK re-assert */
+#include "utils/glutil.h"   /* reset present deadlines across LiveArea suspend/resume */
 #include "utils/utils.h"    /* framebuffer / render-scale dimensions, file helpers */
 #include "utils/logger.h"
 #include "utils/dialog.h"
@@ -80,6 +81,37 @@ typedef struct NativeInitPokeContext {
 } NativeInitPokeContext;
 
 static void start_input_poll_thread(void);
+static void start_lifecycle_thread(void);
+
+enum {
+    MCSM_LIFECYCLE_PAUSE  = 1u << 0,
+    MCSM_LIFECYCLE_RESUME = 1u << 1,
+};
+
+/* ★ 2026-08-06 — CORRECTED AGAINST psp2/power.h.
+ *
+ * The previous masks were written from remembered "ABI values" and did not match
+ * this SDK:
+ *   0x00040000 / 0x00020000  are not power-callback flags at all here,
+ *   0x00000080               is SCE_POWER_CONFIGURATION_MODE_A from an unrelated
+ *                            enum, not a callback bit,
+ *   0x00010000               is SCE_POWER_CB_SHUTDOWN, not a pause,
+ *   0x20000000               is SCE_POWER_CB_PS_BUTTON_PRESS.
+ *
+ * Treating the PS button as a pause is the damaging one: the button fires on
+ * every quick-menu peek, and a peek does not necessarily produce any resume
+ * notification. The old code then latched paused=1 and g_app_background=true
+ * with nothing to clear them -- input polling stopped for the rest of the
+ * session and the engine stayed parked. Suspend and resume are the only two
+ * transitions worth acting on, and only SUSPENDING is a real pause. */
+#define MCSM_POWER_PAUSE_MASK  (SCE_POWER_CB_SUSPENDING)
+#define MCSM_POWER_RESUME_MASK (SCE_POWER_CB_RESUMING | SCE_POWER_CB_RESUME_LIVEAREA)
+
+static atomic_uint g_lifecycle_pending = ATOMIC_VAR_INIT(0);
+static atomic_bool g_app_background = ATOMIC_VAR_INIT(false);
+
+/* 50ms per gated tick, so 200 ticks ~= 10s of no input before the gate gives up. */
+#define MCSM_BACKGROUND_GATE_MAX_TICKS 200U
 
 #define SDL_WINDOWEVENT_SHOWN 1
 #define SDL_WINDOWEVENT_EXPOSED 3
@@ -552,6 +584,109 @@ static void *nativeinit_poke_thread(void *arg) {
 
 #define INPUT_READY_PRESENT_FRAMES 60U
 
+/* Power callbacks execute from a callback-aware wait and must stay tiny. They
+ * only publish state here; SDL/engine lifecycle work runs afterwards on the
+ * owning worker thread. In particular, never call GL, JNI or the logger from
+ * this callback. */
+static int lifecycle_power_callback(int notify_id,
+                                    int notify_count,
+                                    int power_info,
+                                    void *user_data) {
+    (void)notify_id;
+    (void)notify_count;
+    (void)user_data;
+
+    const unsigned info = (unsigned)power_info;
+    unsigned pending = 0;
+
+    if (info & MCSM_POWER_PAUSE_MASK) {
+        pending |= MCSM_LIFECYCLE_PAUSE;
+        /* Stop new controller events immediately, even if SDL is still busy
+         * completing its background transition on the worker. */
+        atomic_store_explicit(&g_app_background, true, memory_order_release);
+    }
+    if (info & MCSM_POWER_RESUME_MASK) {
+        pending |= MCSM_LIFECYCLE_RESUME;
+    }
+    if (pending) {
+        atomic_fetch_or_explicit(&g_lifecycle_pending, pending, memory_order_release);
+    }
+    return 0;
+}
+
+static void *lifecycle_thread(void *arg) {
+    (void)arg;
+
+    const SceUID callback = sceKernelCreateCallback(
+            "mcsm_power_lifecycle", 0, lifecycle_power_callback, NULL);
+    if (callback < 0) {
+        l_warn("lifecycle: sceKernelCreateCallback failed: 0x%08X", (unsigned)callback);
+        return NULL;
+    }
+
+    const int register_rc = scePowerRegisterCallback(callback);
+    if (register_rc < 0) {
+        l_warn("lifecycle: scePowerRegisterCallback failed: 0x%08X", (unsigned)register_rc);
+        sceKernelDeleteCallback(callback);
+        return NULL;
+    }
+    telemetry_log("LIFE", "Vita power callback registered");
+
+    int paused = 0;
+
+    for (;;) {
+        /* This callback-aware wait is what lets the power callback run. The
+         * callback merely sets atomics; dispatch always happens below. */
+        sceKernelDelayThreadCB(50000);
+
+        if (launch_state_get_stage() < LS_NATIVE_RESIZE) {
+            continue;
+        }
+
+        /* ★ DO NOT CALL SDL nativePause/nativeResume FROM HERE.
+         *
+         * They look like the natural thing to call, and 1.10 did. But
+         * SDL_SendAppEvent dispatches the app's registered event watchers
+         * SYNCHRONOUSLY on the calling thread, and the Telltale engine's
+         * Android lifecycle handling tears down audio and GL surfaces from
+         * exactly those callbacks. Running that on this worker means touching
+         * the GL context from a thread that does not own it -- that is the
+         * crash when pausing to LiveArea.
+         *
+         * Everything actually needed on resume can be done from here safely:
+         * drop the stale present deadlines and let the render thread rebuild
+         * them. The engine's own inactive/wait-for-messages flags are re-asserted
+         * every frame by force_application_active() in patch.c, so a suspend that
+         * parks the engine now self-heals on the next frame. */
+        const unsigned pending = atomic_exchange_explicit(
+                &g_lifecycle_pending, 0, memory_order_acq_rel);
+        if (!pending) {
+            continue;
+        }
+        telemetry_log("LIFE", "dispatch pending=0x%X paused=%d", pending, paused);
+
+        if (pending & MCSM_LIFECYCLE_PAUSE) {
+            paused = 1;
+            mcsm_present_timing_reset();
+        }
+
+        if (pending & MCSM_LIFECYCLE_RESUME) {
+            /* A vcount-based present deadline captured before the suspend is
+             * meaningless afterwards; reset before and after so a render racing
+             * this transition cannot keep one. */
+            mcsm_present_timing_reset();
+            /* The controller sampling mode is restored by the input poll itself
+             * (controls.c re-asserts SCE_CTRL_MODE_ANALOG_WIDE every poll), so a
+             * suspend that reset it to digital recovers without help here. */
+            mcsm_present_timing_reset();
+            paused = 0;
+            atomic_store_explicit(&g_app_background, false, memory_order_release);
+        }
+    }
+
+    return NULL;
+}
+
 static int input_delivery_ready(void) {
     static atomic_bool ready = ATOMIC_VAR_INIT(false);
     if (atomic_load_explicit(&ready, memory_order_relaxed)) {
@@ -587,6 +722,23 @@ static void *input_poll_thread(void *arg) {
     unsigned int gated_count = 0;
 #endif
     while (1) {
+        /* Self-healing gate. Suspending sets this; a resume notification clears
+         * it. If a resume notification never arrives -- which is exactly how
+         * 1.10 ended up with permanently dead controls -- give up on the gate
+         * rather than leaving the player with no input. Polling a controller
+         * while genuinely suspended is harmless; not polling forever is not. */
+        if (atomic_load_explicit(&g_app_background, memory_order_acquire)) {
+            static unsigned int background_ticks = 0;
+            if (++background_ticks > MCSM_BACKGROUND_GATE_MAX_TICKS) {
+                background_ticks = 0;
+                atomic_store_explicit(&g_app_background, false, memory_order_release);
+                telemetry_log("INPUT", "background gate expired; resuming input polling");
+                continue;
+            }
+            sceKernelDelayThread(50000);
+            continue;
+        }
+
         if (!input_delivery_ready()) {
 #ifdef DEBUG_SOLOADER
             gated_count++;
@@ -629,6 +781,20 @@ static void start_input_poll_thread(void) {
         telemetry_log("INPUT", "background poll thread started");
     } else {
         l_warn("failed to create input poll thread");
+    }
+}
+
+static void start_lifecycle_thread(void) {
+    pthread_t thread;
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, 0x40000);
+
+    if (pthread_create(&thread, &attr, lifecycle_thread, NULL) == 0) {
+        pthread_detach(thread);
+        telemetry_log("LIFE", "lifecycle worker started");
+    } else {
+        l_warn("failed to create lifecycle worker");
     }
 }
 
@@ -789,6 +955,7 @@ int main(void) {
     telemetry_log("BOOT", "calling soloader_init_all");
     soloader_init_all();
     telemetry_log("BOOT", "soloader_init_all returned");
+    start_lifecycle_thread();
     start_input_poll_thread();
 
     pthread_t watchdog;

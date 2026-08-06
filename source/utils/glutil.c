@@ -26,6 +26,7 @@
 #include <stdio.h>
 #include <malloc.h>
 #include <stdint.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 #include <psp2/kernel/sysmem.h>
@@ -41,6 +42,15 @@ char next_shader_fname[256];
 void load_shader(GLuint shader, const char * string, size_t length);
 
 static const char k_gl_vendor[] = "Imagination Technologies";
+
+/* Lifecycle callbacks run on a different thread from the GL owner. Publish a
+ * reset request atomically and let gl_swap clear its own scheduler state on the
+ * next present; directly writing the 64-bit deadlines cross-thread would race. */
+static atomic_uint g_present_timing_reset_pending = ATOMIC_VAR_INIT(1u);
+
+void mcsm_present_timing_reset(void) {
+    atomic_store_explicit(&g_present_timing_reset_pending, 1u, memory_order_release);
+}
 
 /* GPU IDENTITY -> ENGINE QUALITY TIER (2026-07-29).
  * libGameEngine.so carries a GPU database and keys its quality decisions off the
@@ -1244,12 +1254,32 @@ static int g_present_vb_whole = 0;
 static int g_present_period_rem = 0;  /* numerator of the leftover fraction (rem/den us) */
 static int g_present_period_den = 0;  /* denominator; 0 = no fractional part */
 
+/* Owned by the render thread. Lifecycle code only sets the atomic reset request
+ * above, which gl_swap consumes before consulting any of these deadlines. */
+static unsigned g_present_next_vc = 0;
+static uint64_t g_present_target_us = 0;
+static int g_present_rem_acc = 0;
+static uint64_t g_present_last_us = 0;
+
 /* Last present-to-present interval (us), written every frame by gl_swap. Read
  * (racy but benign — a heuristic on an aligned 32-bit word) by the clock
  * governor in patch.c so it never downclocks a scene whose render/present is
  * already missing the frame target (sim-work alone is blind to the ~900-draw
  * submission cost). 0 = not yet measured. */
 volatile uint32_t g_mcsm_present_dt_us = 0;
+
+static void mcsm_present_timing_apply_reset(void) {
+    if (!atomic_exchange_explicit(&g_present_timing_reset_pending, 0u,
+                                  memory_order_acq_rel)) {
+        return;
+    }
+
+    g_present_next_vc = 0;
+    g_present_target_us = 0;
+    g_present_rem_acc = 0;
+    g_present_last_us = 0;
+    g_mcsm_present_dt_us = 0;
+}
 
 void gl_init() {
     /* The game renders at its (override) resolution into a matching FBO; the FBO is
@@ -1494,6 +1524,12 @@ void gl_swap() {
     static unsigned int s_swap_counter = 0;
 #endif
     static unsigned char s_power_tick_countdown = 0;
+
+    /* A suspend can stop this thread for an arbitrary time and some firmware
+     * paths reset the display vcount. Drop every pre-suspend target before a
+     * wait can interpret it as millions of future vblanks. */
+    mcsm_present_timing_apply_reset();
+
     /* SAVE-RENAME KEYBOARD pump (2026-07-18): the Vita IME renders itself during
      * vglSwapBuffers; harvest the entered name when the user finishes + feed it
      * back to the engine as key events. Runs every present, near-free when idle. */
@@ -1566,13 +1602,22 @@ void gl_swap() {
          *
          * Missed frames resync instead of accumulating debt, so a slow patch can never
          * produce a catch-up burst afterwards. */
-        static unsigned s_next_vc = 0;
-
         const unsigned vc = (unsigned)sceDisplayGetVcount();
         const int vb = g_present_vb_whole;
-        if (!s_next_vc) s_next_vc = vc + (unsigned)vb;
+        if (!g_present_next_vc) g_present_next_vc = vc + (unsigned)vb;
 
-        const int remaining = (int)(s_next_vc - vc);   /* signed: survives wraparound */
+        int remaining = (int)(g_present_next_vc - vc);   /* signed: survives wraparound */
+
+        /* A normal target is at most one cadence ahead. Keep a little tolerance
+         * for an edge landing, but never hand WaitVblankStartMulti a stale huge
+         * unsigned count after LiveArea/system resume. Late frames keep their
+         * existing no-wait recovery behavior. */
+        if (remaining > vb * 2 + 2) {
+            g_present_next_vc = vc + (unsigned)vb;
+            remaining = vb;
+        } else if (remaining <= 0) {
+            remaining = 0;
+        }
 
         /* NEVER AUTO-DOWNSHIFT THE USER'S CAP.
          *
@@ -1594,23 +1639,29 @@ void gl_swap() {
         /* Schedule the next slot. Late frames present at vc+1 (the swap's own wait), so
          * the next slot is measured from there rather than from a target we already
          * missed -- that is what stops debt accumulating. */
-        s_next_vc = (remaining > 0 ? s_next_vc : vc + 1u) + (unsigned)g_present_vb_whole;
+        g_present_next_vc = (remaining > 0 ? g_present_next_vc : vc + 1u) +
+                            (unsigned)g_present_vb_whole;
     } else if (g_present_period_us > 0) {
         /* FRACTIONAL cap (24, 40, ...): no single vblank count expresses it, so keep the
          * exact microsecond timeline with its remainder carry. Reachable only by hand
          * from graphics.txt -- every shipped profile is a whole-vblank rate. */
-        static uint64_t s_target_us = 0;
-        static int      s_rem_acc   = 0;
         uint64_t pnow = sceKernelGetSystemTimeWide();
-        if (!s_target_us) s_target_us = pnow;
-        s_target_us += (uint64_t)g_present_period_us;
+        if (!g_present_target_us) g_present_target_us = pnow;
+        g_present_target_us += (uint64_t)g_present_period_us;
         if (g_present_period_den) {
-            s_rem_acc += g_present_period_rem;
-            if (s_rem_acc >= g_present_period_den) { s_rem_acc -= g_present_period_den; s_target_us++; }
+            g_present_rem_acc += g_present_period_rem;
+            if (g_present_rem_acc >= g_present_period_den) {
+                g_present_rem_acc -= g_present_period_den;
+                g_present_target_us++;
+            }
         }
-        if (pnow > s_target_us + (uint64_t)g_present_period_us) { s_target_us = pnow; s_rem_acc = 0; }
+        if (pnow > g_present_target_us + (uint64_t)g_present_period_us) {
+            g_present_target_us = pnow;
+            g_present_rem_acc = 0;
+        }
         const uint64_t undershoot = 2500;
-        uint64_t wake = (s_target_us > undershoot) ? s_target_us - undershoot : 0;
+        uint64_t wake = (g_present_target_us > undershoot) ?
+                        g_present_target_us - undershoot : 0;
         if (pnow < wake) sceKernelDelayThread((SceUInt)(wake - pnow));
     }
     launch_state_mark_gl_phase(1);   /* in vglSwapBuffers (present) */
@@ -1649,10 +1700,9 @@ void gl_swap() {
      * fires only on dips, and the logger is buffered. */
     const uint64_t present_now_us = sceKernelGetSystemTimeWide();
     {
-        static uint64_t s_last_us = 0;
         const uint64_t now_us = present_now_us;
-        if (s_last_us) {
-            uint64_t dt_us = now_us - s_last_us;
+        if (g_present_last_us) {
+            uint64_t dt_us = now_us - g_present_last_us;
             /* Publish the true present cadence for the clock governor (every frame,
              * all builds — NOT gated by logging). */
             g_mcsm_present_dt_us = (dt_us > 0xFFFFFFFFULL) ? 0xFFFFFFFFu : (uint32_t)dt_us;
@@ -1711,7 +1761,7 @@ void gl_swap() {
             }
 #endif /* DEBUG_SOLOADER */
         }
-        s_last_us = now_us;
+        g_present_last_us = now_us;
 #ifdef DEBUG_SOLOADER
         g_frame_draw_calls = 0;
         g_frame_draw_verts = 0;
@@ -1915,6 +1965,33 @@ static GLuint g_diag_bound_texture_2d[GL_DIAG_TEX_UNIT_CAP];
  * 0 = unknown, 1 = POT, 2 = NPOT. Indexed by GL texture id. */
 #define GL_TEX_POT_CAP 16384
 static uint8_t g_tex_pot[GL_TEX_POT_CAP];
+
+/* ★ 2026-08-06 — the mip-completeness tracker that lived here has been REMOVED.
+ *
+ * It carried a 16384-entry McsmTexMipState table (~192KB of BSS on a port that
+ * counts every megabyte) whose purpose was to prove a texture had a full mip
+ * chain and then hand back the game's requested mipmap min-filter. It never
+ * worked: the four functions that populate the masks -- mip_track_image_begin,
+ * mip_track_image_result, mip_track_subimage_result, mip_track_generated_chain
+ * -- were never called from anywhere, so `complete` was permanently 0. The
+ * compiler said so ("defined but not used"); the table was pure cost.
+ *
+ * Worse, the half-wired version changed real behaviour. force_complete_filter_ex
+ * consulted the never-set state and, for a texture whose requested filter was
+ * NEAREST_MIPMAP_*, fell through to demipmap_min_filter() and applied plain
+ * GL_NEAREST -- where every previous build forced GL_LINEAR. Point-sampling a
+ * minified face texture aliases Telltale's black outline texels in and out
+ * between frames: that is the "black lines on faces when zoomed out" and the
+ * broken-looking eyes in crowded scenes.
+ *
+ * Restored rule (proven, and what shipped before 1.10): uncompressed textures
+ * get GL_LINEAR, and NEAREST is used only when the user opts into it for world
+ * art via `nearest_filter`. */
+
+/* Implemented after the downsample/depth-texture tables are declared.  Internal
+ * PVR eviction and the public glDeleteTextures wrapper both use the same reset so
+ * a recycled GL name can never inherit POT, wrap, or shim state. */
+MCSM_DIAG_HELPER static void texture_name_forget(GLuint id);
 
 static int gl_is_pow2(GLsizei v) {
     return v > 0 && (v & (v - 1)) == 0;
@@ -2260,6 +2337,7 @@ static void texlru_reclaim_vitagl(GLuint keep_id) {
          * Clearing it to 0 severs the chain and gets live textures deleted -- see
          * the state table above texlru_lookup(). */
         victim->bytes = 0; victim->use = 0;
+        texture_name_forget(vid);
         freed++;
     }
     if (freed) {
@@ -2299,6 +2377,7 @@ static void texlru_make_room(GLuint need, GLuint keep_id) {
             l_info("TEXLRU: evicted #%u tex=%u (live count=%u total=%uKB)",
                    s_texlru_evicted, vid, s_texlru_count, s_texlru_total / 1024u);
         victim->id = 0; victim->bytes = 0; victim->use = 0;
+        texture_name_forget(vid);
     }
     /* PVR DEFERS the texture-object free until the GPU drains — glFlush wasn't
      * enough (residual err=0x505 unchanged). glFinish blocks until the GPU is
@@ -2321,6 +2400,16 @@ static void texlru_record(GLuint id, GLuint bytes) {
     e->bytes = bytes; e->use = ++s_texlru_clock;
     s_texlru_total += bytes;
 }
+static void texlru_forget(GLuint id) {
+    texlru_ent *e = texlru_lookup(id, 0);
+    if (!e || !e->bytes) return;
+    s_texlru_total -= e->bytes;
+    if (s_texlru_count) s_texlru_count--;
+    /* Keep the id as a tombstone so deleting through the public wrapper cannot
+     * sever the bounded-probe chain for colliding live entries. */
+    e->bytes = 0;
+    e->use = 0;
+}
 /* Before an upload: free LRU non-live texture objects so we stay under the
  * driver's object-count limit (and byte backstop). */
 static void texlru_before_upload(GLint bound_tex, GLsizei bytes) {
@@ -2338,6 +2427,7 @@ static inline void texlru_before_upload(GLint bound_tex, GLsizei bytes) {
 static inline void texlru_after_upload(GLint bound_tex, GLsizei bytes, GLenum err) {
     (void)bound_tex; (void)bytes; (void)err;
 }
+static inline void texlru_forget(GLuint id) { (void)id; }
 #endif /* USE_PVR_PSP2 */
 
 void glBindTexture_soloader(GLenum target, GLuint texture) {
@@ -2785,11 +2875,11 @@ MCSM_DIAG_HELPER static uint8_t *convert_rgb565_to_rgba8888(const uint16_t *src,
     return dst;
 }
 
-/* The game uploads only level 0 and never calls glGenerateMipmap, yet it sets
- * mipmapping min-filters on textures. A texture with a mipmap min-filter but no
- * mip levels is INCOMPLETE and samples as solid black/flat colour — exactly the
- * "backgrounds are just colours" symptom. Downgrade mipmap min-filters to their
- * non-mipmap base so single-level textures stay complete and sample correctly. */
+/* A mipmap filter is safe only while every level down to 1x1 exists.  The old
+ * blanket demipmap fixed genuinely single-level textures, but device logs prove
+ * that many uncompressed assets upload complete authored mip chains.  Keep this
+ * base-filter conversion as the incomplete-chain fallback; the tracker below
+ * restores the exact request only after proving the chain. */
 static GLint demipmap_min_filter(GLenum pname, GLint param) {
     if (pname != 0x2801 /*GL_TEXTURE_MIN_FILTER*/) return param;
     switch (param) {
@@ -2861,43 +2951,43 @@ void glTexParameterf_soloader(GLenum target, GLenum pname, GLfloat param) {
 }
 
 void glTexParameteriv_soloader(GLenum target, GLenum pname, const GLint *params) {
-    if (pname == 0x2801 /*GL_TEXTURE_MIN_FILTER*/ && params) {
-        const GLint param = demipmap_min_filter(pname, params[0]);
-        glTexParameteri(target, pname, param);
-        return;
-    }
-    if (params) glTexParameteri(target, pname, params[0]);
+    if (!params) return;
+    const GLint applied = clamp_repeat_wrap(
+        pname, demipmap_min_filter(pname, params[0]));
+    log_tex_param(target, pname, params[0], applied);
+    glTexParameteri(target, pname, applied);
 }
 
 void glTexParameterfv_soloader(GLenum target, GLenum pname, const GLfloat *params) {
-    if (pname == 0x2801 /*GL_TEXTURE_MIN_FILTER*/ && params) {
-        const GLfloat param = (GLfloat)demipmap_min_filter(pname, (GLint)params[0]);
-        glTexParameterf(target, pname, param);
-        return;
-    }
+    if (!params) return;
     /* All GLES2 texture parameters are scalar (no vector params like BORDER_COLOR
      * exist on Vita), so route the fallback through the scalar setter. Avoids the
      * implicitly-declared glTexParameterfv (no vitaGL prototype -> unchecked ABI). */
-    if (params) glTexParameterf(target, pname, params[0]);
+    const GLint requested = (GLint)params[0];
+    const GLint applied = clamp_repeat_wrap(
+        pname, demipmap_min_filter(pname, requested));
+    log_tex_param(target, pname, requested, applied);
+    glTexParameterf(target, pname, (GLfloat)applied);
 }
 
 void glTexParameterx_soloader(GLenum target, GLenum pname, GLfixed param) {
     /* glTexParameterx is a no-op stub in pvr_gles_stubs.c. Route through
-     * glTexParameteri (a real PVR GLES2 function) with the demipmapped
+     * glTexParameteri (a real PVR GLES2 function) with the completeness-safe
      * value so texture parameters are actually applied to the driver. */
-    glTexParameteri(target, pname, demipmap_min_filter(pname, (GLint)param));
+    const GLint requested = (GLint)param;
+    const GLint applied = clamp_repeat_wrap(
+        pname, demipmap_min_filter(pname, requested));
+    log_tex_param(target, pname, requested, applied);
+    glTexParameteri(target, pname, applied);
 }
 
 void glTexParameterxv_soloader(GLenum target, GLenum pname, const GLfixed *params) {
-    if (pname == 0x2801 /*GL_TEXTURE_MIN_FILTER*/ && params) {
-        const GLint param = demipmap_min_filter(pname, (GLint)params[0]);
-        glTexParameteri(target, pname, param);
-        return;
-    }
-    /* For non-min-filter params, convert fixed-point to int and use glTexParameteri */
-    if (params) {
-        glTexParameteri(target, pname, (GLint)params[0]);
-    }
+    if (!params) return;
+    const GLint requested = (GLint)params[0];
+    const GLint applied = clamp_repeat_wrap(
+        pname, demipmap_min_filter(pname, requested));
+    log_tex_param(target, pname, requested, applied);
+    glTexParameteri(target, pname, applied);
 }
 
 /* Telltale uploads single-level textures and never sets a min filter, so they
@@ -2923,20 +3013,26 @@ static int world_nearest_enabled(void) {
 }
 static inline void force_complete_filter_ex(GLenum target, int allow_nearest) {
     if (target != 0x0DE1 /*GL_TEXTURE_2D*/) return;
+    const GLuint bt = (GLuint)s_texlru_bound;
     const int nearest = allow_nearest && world_nearest_enabled();
-    glTexParameteri(target, 0x2801 /*GL_TEXTURE_MIN_FILTER*/, nearest ? 0x2600 /*NEAREST*/ : 0x2601 /*LINEAR*/);
+    /* The game uploads level 0 only, so a mipmap min-filter would leave the
+     * texture incomplete. Force a base filter: LINEAR, so minified art (faces at
+     * distance, crowd scenes) filters instead of aliasing its outline texels into
+     * flickering black lines. NEAREST is opt-in for blocky world art only. */
+    glTexParameteri(target, 0x2801 /*GL_TEXTURE_MIN_FILTER*/,
+                    nearest ? 0x2600 /*GL_NEAREST*/ : 0x2601 /*GL_LINEAR*/);
     if (nearest) glTexParameteri(target, 0x2800 /*GL_TEXTURE_MAG_FILTER*/, 0x2600 /*NEAREST*/);
     /* ELONGATION FIX (2026-07-16): if the engine asked for WRAP=REPEAT before the
      * upload (POT unknown then -> clamp_repeat_wrap forced CLAMP = stretched
      * tiling), restore REPEAT now that the upload has proved the texture POT. */
-    GLuint bt = (GLuint)s_texlru_bound;
     if (bt && bt < GL_TEX_POT_CAP && g_tex_want_repeat[bt] && g_tex_pot[bt] == 1u) {
         glTexParameteri(target, 0x2802 /*WRAP_S*/, 0x2901 /*GL_REPEAT*/);
         glTexParameteri(target, 0x2803 /*WRAP_T*/, 0x2901 /*GL_REPEAT*/);
     }
     (void)drain_gl_errors_limited();
 }
-/* Uncompressed (UI/2D) textures always keep LINEAR; only compressed world art may go NEAREST. */
+/* Incomplete uncompressed textures keep a safe base filter; only a proven authored
+ * chain gets its requested mip filter back. Compressed level-0 textures stay base. */
 static inline void force_complete_filter(GLenum target) { force_complete_filter_ex(target, 0); }
 
 void glCompressedTexImage2D_soloader(GLenum target, GLint level, GLenum internalformat,
@@ -3085,6 +3181,21 @@ static void dsamp_unmark(GLuint id) {
 }
 static int dsamp_is(GLuint id) {
     return id != 0 && id < GL_TEX_POT_CAP && g_tex_dsamp[id] == 1u;
+}
+
+/* Reset every per-texture-name table when a GL name goes away, so a recycled id
+ * cannot inherit the previous texture's POT / wrap-intent / downsample state.
+ * 1.10 declared this and never defined it. Both callers survive but neither is
+ * reachable in the shipped vitaGL build -- texlru_reclaim_vitagl has been an
+ * early-return since 2026-07-29 and the other call is in the PVR branch -- hence
+ * MCSM_DIAG_HELPER. It is defined rather than deleted so the PVR backend links
+ * and so re-enabling reclaim does not silently reintroduce stale name state. */
+MCSM_DIAG_HELPER static void texture_name_forget(GLuint id) {
+    if (!id || id >= GL_TEX_POT_CAP) return;
+    g_tex_pot[id] = 0u;
+    g_tex_want_repeat[id] = 0u;
+    g_tex_dsamp[id] = 0u;
+    texlru_forget(id);
 }
 
 /* ---- Depth-stencil render-target shim (2026-06-23) ------------------------

@@ -32,6 +32,10 @@ void gl_preload();
 
 void gl_swap();
 
+/* Queue a render-thread reset of all present/vblank deadlines. Call whenever
+ * returning from LiveArea or system suspend before SDL resumes the engine. */
+void mcsm_present_timing_reset(void);
+
 /* (mcsm_gl_state_invalidate() was declared here for the redundant-call dedups. All
  * three were retired on 2026-07-30/31 after their counters measured them dead on
  * device, so there are no shadows left to invalidate and the definition went with

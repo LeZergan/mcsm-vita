@@ -124,18 +124,13 @@ static void savedata_note_write_fd(int fd) {
     }
 }
 
-static int savedata_snapshot_fd(int fd, char *path, size_t path_size, int *should_flush, int *did_write) {
+static int savedata_snapshot_fd(int fd, char *path, size_t path_size, int *did_write) {
     int idx = savedata_find_fd(fd);
     if (idx < 0) {
         return 0;
     }
     if (path && path_size > 0) {
         sceClibSnprintf(path, path_size, "%s", g_savedata_fds[idx].path);
-    }
-    if (should_flush) {
-        /* A writable open that did not write has nothing to persist. Fsyncing it
-         * anyway can block the game thread during resource probes. */
-        *should_flush = g_savedata_fds[idx].wrote;
     }
     if (did_write) {
         *did_write = g_savedata_fds[idx].wrote;
@@ -292,8 +287,14 @@ static const char *ensure_android_virtual_file(const char *path) {
                                             * the safety net. Slightly more re-open churn on CH1. */
 #define ASSET_VFD_RAW_CACHE_RETRY_TARGET 8u
 
+enum {
+    ASSET_VFD_FREE = 0,
+    ASSET_VFD_OPEN = 1,
+    ASSET_VFD_CLOSING = 2,
+};
+
 typedef struct AssetVfd {
-    int used;
+    int used;       /* ASSET_VFD_* state; CLOSING rejects new operations. */
     /* 512 (was PATH_MAX=4096) x ASSET_VFD_MAX slots. Real asset paths
      * (ux0:data/mcsm/Android/obb/<pkg>/NNN.ttarch2:<res>) are ~150 chars; 512 keeps a
      * 3x margin. All writes here use sizeof(path), so shrinking cannot overflow —
@@ -303,12 +304,19 @@ typedef struct AssetVfd {
     off_t length;
     int raw_fd;   /* cached real fd: opened once, reused via pread (HUGE: avoids
                    * an open()+close() per read, which was the 20-min-load killer) */
-    unsigned int busy;
+    unsigned int busy;       /* in-flight open/read/pread operations */
+    unsigned int generation; /* protects completions from slot reuse (ABA) */
     unsigned int last_used;
 } AssetVfd;
 
 static AssetVfd g_asset_vfds[ASSET_VFD_MAX];
-static atomic_flag g_asset_vfd_lock = ATOMIC_FLAG_INIT;
+/* Publish one process-wide kernel mutex on first use. A failed mutex allocation
+ * permanently selects the yielding fallback, so lock/unlock can never switch
+ * mechanisms halfway through a critical section. */
+#define ASSET_VFD_MUTEX_UNINITIALIZED (-1)
+#define ASSET_VFD_MUTEX_FALLBACK      (-2)
+static atomic_int g_asset_vfd_mutex = ATOMIC_VAR_INIT(ASSET_VFD_MUTEX_UNINITIALIZED);
+static atomic_flag g_asset_vfd_fallback_lock = ATOMIC_FLAG_INIT;
 static unsigned int g_asset_vfd_live_raw = 0;
 static unsigned int g_asset_vfd_clock = 0;
 #ifdef DEBUG_SOLOADER
@@ -316,13 +324,85 @@ static unsigned int g_asset_vfd_open_count = 0;
 static unsigned int g_asset_vfd_trim_log_count = 0;
 #endif
 
+static int asset_vfd_get_mutex(void) {
+    int mutex = atomic_load_explicit(&g_asset_vfd_mutex, memory_order_acquire);
+    if (mutex != ASSET_VFD_MUTEX_UNINITIALIZED) {
+        return mutex;
+    }
+
+    const SceUID created = sceKernelCreateMutex("mcsm_asset_vfd", 0, 0, NULL);
+    const int published = created >= 0 ? created : ASSET_VFD_MUTEX_FALLBACK;
+    int expected = ASSET_VFD_MUTEX_UNINITIALIZED;
+    if (!atomic_compare_exchange_strong_explicit(&g_asset_vfd_mutex,
+                                                  &expected,
+                                                  published,
+                                                  memory_order_acq_rel,
+                                                  memory_order_acquire)) {
+        if (created >= 0) {
+            sceKernelDeleteMutex(created);
+        }
+        return expected;
+    }
+    return published;
+}
+
 static void asset_vfd_lock(void) {
-    while (atomic_flag_test_and_set_explicit(&g_asset_vfd_lock, memory_order_acquire)) {
+    const int mutex = asset_vfd_get_mutex();
+    if (mutex >= 0) {
+        /* A valid mutex should not fail. Yield and retry instead of proceeding
+         * unlocked if the scheduler temporarily interrupts the call. */
+        while (sceKernelLockMutex(mutex, 1, NULL) < 0) {
+            sceKernelDelayThread(100);
+        }
+        return;
+    }
+
+    while (atomic_flag_test_and_set_explicit(&g_asset_vfd_fallback_lock,
+                                              memory_order_acquire)) {
+        /* Never burn an entire Vita core waiting for a short metadata section. */
+        sceKernelDelayThread(100);
     }
 }
 
 static void asset_vfd_unlock(void) {
-    atomic_flag_clear_explicit(&g_asset_vfd_lock, memory_order_release);
+    const int mutex = atomic_load_explicit(&g_asset_vfd_mutex, memory_order_acquire);
+    if (mutex >= 0) {
+        sceKernelUnlockMutex(mutex, 1);
+        return;
+    }
+    atomic_flag_clear_explicit(&g_asset_vfd_fallback_lock, memory_order_release);
+}
+
+/* Called with the table lock held after the final user of a closing slot leaves.
+ * The raw fd is returned for close() outside the critical section. Generation is
+ * intentionally retained and incremented on the next allocation. */
+static int asset_vfd_finalize_close_locked(int slot) {
+    AssetVfd *vfd = &g_asset_vfds[slot];
+    if (vfd->used != ASSET_VFD_CLOSING || vfd->busy != 0) {
+        return -1;
+    }
+
+    const int raw_fd = vfd->raw_fd;
+    if (raw_fd >= 0 && g_asset_vfd_live_raw > 0) {
+        g_asset_vfd_live_raw -= 1;
+    }
+    vfd->used = ASSET_VFD_FREE;
+    vfd->path[0] = '\0';
+    vfd->pos = 0;
+    vfd->length = 0;
+    vfd->raw_fd = -1;
+    vfd->busy = 0;
+    vfd->last_used = 0;
+    return raw_fd;
+}
+
+static int asset_vfd_release_locked(int slot, unsigned int generation) {
+    AssetVfd *vfd = &g_asset_vfds[slot];
+    if (vfd->generation != generation || vfd->busy == 0) {
+        return -1;
+    }
+    vfd->busy -= 1;
+    return asset_vfd_finalize_close_locked(slot);
 }
 
 static int asset_vfd_slot(int fd) {
@@ -353,7 +433,9 @@ void asset_vfd_trim_cached_fds(unsigned int target_open) {
         int best = -1;
         unsigned int best_use = UINT_MAX;
         for (int i = 0; i < ASSET_VFD_MAX; ++i) {
-            if (!g_asset_vfds[i].used || g_asset_vfds[i].raw_fd < 0 || g_asset_vfds[i].busy != 0) {
+            if (g_asset_vfds[i].used != ASSET_VFD_OPEN ||
+                g_asset_vfds[i].raw_fd < 0 ||
+                g_asset_vfds[i].busy != 0) {
                 continue;
             }
             if (g_asset_vfds[i].last_used < best_use) {
@@ -397,7 +479,7 @@ static int asset_vfd_snapshot(int fd, char *path, size_t path_size, off_t *pos, 
     }
 
     asset_vfd_lock();
-    if (!g_asset_vfds[slot].used) {
+    if (g_asset_vfds[slot].used != ASSET_VFD_OPEN) {
         asset_vfd_unlock();
         errno = EBADF;
         return -1;
@@ -431,7 +513,7 @@ int asset_vfd_open(const char *path, off_t length) {
     asset_vfd_lock();
     int slot = -1;
     for (int i = 0; i < ASSET_VFD_MAX; ++i) {
-        if (!g_asset_vfds[i].used) {
+        if (g_asset_vfds[i].used == ASSET_VFD_FREE) {
             slot = i;
             break;
         }
@@ -443,30 +525,61 @@ int asset_vfd_open(const char *path, off_t length) {
         return -1;
     }
 
-    g_asset_vfds[slot].used = 1;
-    g_asset_vfds[slot].pos = 0;
-    g_asset_vfds[slot].length = length >= 0 ? length : 0;
-    sceClibSnprintf(g_asset_vfds[slot].path, sizeof(g_asset_vfds[slot].path), "%s", path);
-    /* Open the real file ONCE here and keep it; reads use pread on this cached fd
-     * instead of open()+close() per read (that was making loads take ~20 min). */
-    g_asset_vfds[slot].raw_fd = open(path, O_RDONLY);
-    g_asset_vfds[slot].busy = 0;
-    g_asset_vfds[slot].last_used = ++g_asset_vfd_clock;
-    int raw_fd = g_asset_vfds[slot].raw_fd;
-    if (raw_fd >= 0) {
-        g_asset_vfd_live_raw += 1;
+    AssetVfd *vfd = &g_asset_vfds[slot];
+    vfd->generation += 1;
+    if (vfd->generation == 0) {
+        vfd->generation = 1;
     }
+    const unsigned int generation = vfd->generation;
+    vfd->used = ASSET_VFD_OPEN;
+    vfd->pos = 0;
+    vfd->length = length >= 0 ? length : 0;
+    sceClibSnprintf(vfd->path, sizeof(vfd->path), "%s", path);
+    vfd->raw_fd = -1;
+    /* Reserve one operation while the slow memory-card open runs unlocked. */
+    vfd->busy = 1;
+    vfd->last_used = ++g_asset_vfd_clock;
     int fd = ASSET_VFD_BASE + slot;
 #ifdef DEBUG_SOLOADER
     unsigned int open_count = ++g_asset_vfd_open_count;
 #endif
     asset_vfd_unlock();
 
-    if (raw_fd < 0) {
-        int err = errno;
-        l_warn("[ASSETVFD] raw open failed fd=%d errno=%d path=%s", fd, err, path);
+    /* Never hold the global table lock across memory-card I/O. The generation
+     * check below prevents a late result from attaching to a recycled slot. */
+    int raw_fd = open(path, O_RDONLY);
+    if (raw_fd < 0 && errno == EMFILE) {
         asset_vfd_trim_cached_fds(ASSET_VFD_RAW_CACHE_RETRY_TARGET);
-        errno = err;
+        raw_fd = open(path, O_RDONLY);
+    }
+    const int raw_errno = raw_fd < 0 ? errno : 0;
+    int attached = 0;
+    int deferred_close_fd = -1;
+    asset_vfd_lock();
+    vfd = &g_asset_vfds[slot];
+    if (vfd->used == ASSET_VFD_OPEN &&
+        vfd->generation == generation &&
+        vfd->raw_fd < 0 &&
+        raw_fd >= 0) {
+        vfd->raw_fd = raw_fd;
+        g_asset_vfd_live_raw += 1;
+        vfd->last_used = ++g_asset_vfd_clock;
+        attached = 1;
+    }
+    deferred_close_fd = asset_vfd_release_locked(slot, generation);
+    asset_vfd_unlock();
+
+    if (raw_fd >= 0 && !attached) {
+        close(raw_fd);
+    }
+    if (deferred_close_fd >= 0) {
+        close(deferred_close_fd);
+    }
+
+    if (raw_fd < 0) {
+        l_warn("[ASSETVFD] raw open failed fd=%d errno=%d path=%s", fd, raw_errno, path);
+        asset_vfd_trim_cached_fds(ASSET_VFD_RAW_CACHE_RETRY_TARGET);
+        errno = raw_errno;
     } else {
         asset_vfd_trim_cached_fds(ASSET_VFD_RAW_CACHE_SOFT_MAX);
     }
@@ -492,20 +605,12 @@ int asset_vfd_is(int fd) {
 
 __attribute__((noinline))
 static ssize_t asset_vfd_cold_pread(int slot, int fd, void *buf, size_t count,
-                                    off_t offset, const char *operation) {
-    char path[sizeof(g_asset_vfds[0].path)];
-
-    asset_vfd_lock();
-    const int ok = slot >= 0 && g_asset_vfds[slot].used;
-    if (ok) {
-        sceClibSnprintf(path, sizeof(path), "%s", g_asset_vfds[slot].path);
+                                    off_t offset, unsigned int generation,
+                                    const char *path, const char *operation,
+                                    int *promoted_out) {
+    if (promoted_out) {
+        *promoted_out = 0;
     }
-    asset_vfd_unlock();
-    if (!ok) {
-        errno = EBADF;
-        return -1;
-    }
-
     int tmp = open(path, O_RDONLY);
     if (tmp < 0 && errno == EMFILE) {
         /* Preserve the proven Chapter 2+ recovery path: make fd headroom and retry. */
@@ -522,7 +627,9 @@ static ssize_t asset_vfd_cold_pread(int slot, int fd, void *buf, size_t count,
     const int saved_errno = errno;
     int promoted = 0;
     asset_vfd_lock();
-    if (g_asset_vfds[slot].used && g_asset_vfds[slot].raw_fd < 0) {
+    if (g_asset_vfds[slot].used == ASSET_VFD_OPEN &&
+        g_asset_vfds[slot].generation == generation &&
+        g_asset_vfds[slot].raw_fd < 0) {
         g_asset_vfds[slot].raw_fd = tmp;
         g_asset_vfd_live_raw += 1;
         g_asset_vfds[slot].last_used = ++g_asset_vfd_clock;
@@ -532,8 +639,8 @@ static ssize_t asset_vfd_cold_pread(int slot, int fd, void *buf, size_t count,
     if (!promoted) {
         close(tmp);
     }
-    if (promoted) {
-        asset_vfd_trim_cached_fds(ASSET_VFD_RAW_CACHE_SOFT_MAX);
+    if (promoted_out) {
+        *promoted_out = promoted;
     }
     errno = saved_errno;
     return ret;
@@ -543,13 +650,15 @@ ssize_t asset_vfd_read(int fd, void *buf, size_t count) {
     const int slot = asset_vfd_slot(fd);
     off_t pos = 0;
     off_t length = 0;
+    unsigned int generation = 0;
+    char path[sizeof(g_asset_vfds[0].path)];
     if (slot < 0) {
         errno = EBADF;
         return -1;
     }
 
     asset_vfd_lock();
-    if (!g_asset_vfds[slot].used) {
+    if (g_asset_vfds[slot].used != ASSET_VFD_OPEN) {
         asset_vfd_unlock();
         errno = EBADF;
         return -1;
@@ -563,33 +672,42 @@ ssize_t asset_vfd_read(int fd, void *buf, size_t count) {
     if ((off_t)count > length - pos) {
         count = (size_t)(length - pos);
     }
-    int raw_fd = -1;
-    if (g_asset_vfds[slot].raw_fd >= 0) {
-        raw_fd = g_asset_vfds[slot].raw_fd;
-        g_asset_vfds[slot].busy += 1;
-        g_asset_vfds[slot].last_used = ++g_asset_vfd_clock;
+    generation = g_asset_vfds[slot].generation;
+    const int raw_fd = g_asset_vfds[slot].raw_fd;
+    if (raw_fd < 0) {
+        sceClibSnprintf(path, sizeof(path), "%s", g_asset_vfds[slot].path);
     }
+    /* Every path, including a cold open, owns a reference until completion. */
+    g_asset_vfds[slot].busy += 1;
+    g_asset_vfds[slot].last_used = ++g_asset_vfd_clock;
     asset_vfd_unlock();
 
     ssize_t ret;
+    int promoted = 0;
     if (raw_fd >= 0) {
         ret = pread(raw_fd, buf, count, pos);   /* cached fd: no open/close/seek */
     } else {
-        ret = asset_vfd_cold_pread(slot, fd, buf, count, pos, "read");
+        ret = asset_vfd_cold_pread(slot, fd, buf, count, pos, generation,
+                                   path, "read", &promoted);
     }
+    const int saved_errno = errno;
 
-    if (ret > 0 || raw_fd >= 0) {
-        asset_vfd_lock();
-        if (g_asset_vfds[slot].used) {
-            if (ret > 0) {
-                g_asset_vfds[slot].pos = pos + ret;
-            }
-            if (raw_fd >= 0 && g_asset_vfds[slot].busy > 0) {
-                g_asset_vfds[slot].busy -= 1;
-            }
+    int deferred_close_fd = -1;
+    asset_vfd_lock();
+    if (g_asset_vfds[slot].generation == generation) {
+        if (ret > 0 && g_asset_vfds[slot].used == ASSET_VFD_OPEN) {
+            g_asset_vfds[slot].pos = pos + ret;
         }
-        asset_vfd_unlock();
+        deferred_close_fd = asset_vfd_release_locked(slot, generation);
     }
+    asset_vfd_unlock();
+    if (deferred_close_fd >= 0) {
+        close(deferred_close_fd);
+    }
+    if (promoted) {
+        asset_vfd_trim_cached_fds(ASSET_VFD_RAW_CACHE_SOFT_MAX);
+    }
+    errno = saved_errno;
 
 #ifdef DEBUG_SOLOADER
     static unsigned int log_count = 0;
@@ -604,6 +722,8 @@ ssize_t asset_vfd_read(int fd, void *buf, size_t count) {
 ssize_t asset_vfd_pread(int fd, void *buf, size_t count, off_t offset) {
     const int slot = asset_vfd_slot(fd);
     off_t length = 0;
+    unsigned int generation = 0;
+    char path[sizeof(g_asset_vfds[0].path)];
     if (offset < 0) {
         errno = EINVAL;
         return -1;
@@ -614,7 +734,7 @@ ssize_t asset_vfd_pread(int fd, void *buf, size_t count, off_t offset) {
     }
 
     asset_vfd_lock();
-    if (!g_asset_vfds[slot].used) {
+    if (g_asset_vfds[slot].used != ASSET_VFD_OPEN) {
         asset_vfd_unlock();
         errno = EBADF;
         return -1;
@@ -627,28 +747,38 @@ ssize_t asset_vfd_pread(int fd, void *buf, size_t count, off_t offset) {
     if ((off_t)count > length - offset) {
         count = (size_t)(length - offset);
     }
-    int raw_fd = -1;
-    if (g_asset_vfds[slot].raw_fd >= 0) {
-        raw_fd = g_asset_vfds[slot].raw_fd;
-        g_asset_vfds[slot].busy += 1;
-        g_asset_vfds[slot].last_used = ++g_asset_vfd_clock;
+    generation = g_asset_vfds[slot].generation;
+    const int raw_fd = g_asset_vfds[slot].raw_fd;
+    if (raw_fd < 0) {
+        sceClibSnprintf(path, sizeof(path), "%s", g_asset_vfds[slot].path);
     }
+    g_asset_vfds[slot].busy += 1;
+    g_asset_vfds[slot].last_used = ++g_asset_vfd_clock;
     asset_vfd_unlock();
 
     ssize_t ret;
+    int promoted = 0;
     if (raw_fd >= 0) {
         ret = pread(raw_fd, buf, count, offset);   /* cached fd: no open/close/seek */
     } else {
-        ret = asset_vfd_cold_pread(slot, fd, buf, count, offset, "pread");
+        ret = asset_vfd_cold_pread(slot, fd, buf, count, offset, generation,
+                                   path, "pread", &promoted);
     }
+    const int saved_errno = errno;
 
-    if (raw_fd >= 0) {
-        asset_vfd_lock();
-        if (g_asset_vfds[slot].used && g_asset_vfds[slot].busy > 0) {
-            g_asset_vfds[slot].busy -= 1;
-        }
-        asset_vfd_unlock();
+    int deferred_close_fd = -1;
+    asset_vfd_lock();
+    if (g_asset_vfds[slot].generation == generation) {
+        deferred_close_fd = asset_vfd_release_locked(slot, generation);
     }
+    asset_vfd_unlock();
+    if (deferred_close_fd >= 0) {
+        close(deferred_close_fd);
+    }
+    if (promoted) {
+        asset_vfd_trim_cached_fds(ASSET_VFD_RAW_CACHE_SOFT_MAX);
+    }
+    errno = saved_errno;
 
 #ifdef DEBUG_SOLOADER
     static unsigned int log_count = 0;
@@ -668,7 +798,7 @@ off_t asset_vfd_lseek(int fd, off_t offset, int whence) {
     }
 
     asset_vfd_lock();
-    if (!g_asset_vfds[slot].used) {
+    if (g_asset_vfds[slot].used != ASSET_VFD_OPEN) {
         asset_vfd_unlock();
         errno = EBADF;
         return -1;
@@ -733,7 +863,7 @@ int asset_vfd_close(int fd) {
     char path[PATH_MAX];
 #endif
     asset_vfd_lock();
-    if (!g_asset_vfds[slot].used) {
+    if (g_asset_vfds[slot].used != ASSET_VFD_OPEN) {
         asset_vfd_unlock();
         errno = EBADF;
         return -1;
@@ -741,18 +871,13 @@ int asset_vfd_close(int fd) {
 #ifdef DEBUG_SOLOADER
     sceClibSnprintf(path, sizeof(path), "%s", g_asset_vfds[slot].path);
 #endif
-    int raw_fd = g_asset_vfds[slot].raw_fd;
-    g_asset_vfds[slot].raw_fd = -1;
-    if (raw_fd >= 0 && g_asset_vfd_live_raw > 0) {
-        g_asset_vfd_live_raw -= 1;
-    }
-    g_asset_vfds[slot].used = 0;
-    g_asset_vfds[slot].path[0] = '\0';
-    g_asset_vfds[slot].pos = 0;
-    g_asset_vfds[slot].length = 0;
-    g_asset_vfds[slot].busy = 0;
-    g_asset_vfds[slot].last_used = 0;
+    /* Reject new operations immediately, but keep the slot and its raw fd alive
+     * until every in-flight pread finishes. This prevents close/reuse races. */
+    g_asset_vfds[slot].used = ASSET_VFD_CLOSING;
+    const int deferred = g_asset_vfds[slot].busy != 0;
+    const int raw_fd = asset_vfd_finalize_close_locked(slot);
     asset_vfd_unlock();
+    (void)deferred;
 
     int close_rc = 0;
     int close_errno = 0;
@@ -764,7 +889,7 @@ int asset_vfd_close(int fd) {
     }
 
 #ifdef DEBUG_SOLOADER
-    l_info("[ASSETVFD] close fd=%d path=%s", fd, path);
+    l_info("[ASSETVFD] close fd=%d deferred=%d path=%s", fd, deferred, path);
 #endif
     if (close_rc < 0) {
         errno = close_errno;
@@ -1225,15 +1350,28 @@ int close_soloader(int fd) {
     }
 
     char savedata_path[1024];
-    int should_flush = 0;
     int did_write = 0;
-    int is_savedata = savedata_snapshot_fd(fd, savedata_path, sizeof(savedata_path), &should_flush, &did_write);
+    int is_savedata = savedata_snapshot_fd(fd, savedata_path, sizeof(savedata_path), &did_write);
     if (is_savedata) {
         /* Untrack before close: once close returns another thread may immediately
          * reuse this integer fd, and late cleanup would delete the new record. */
         savedata_untrack_fd(fd);
     }
-    if (is_savedata && should_flush) {
+    /* ★ 2026-08-06 — FSYNC RESTORED.
+     *
+     * 1.10 dropped this on the grounds that Telltale commits saves through a
+     * temp-file/rename flow and close() already releases the file. On a console
+     * that is only true if the process gets to exit cleanly. This one does not:
+     * players are force-quitting from the LiveArea/PS menu whenever the game
+     * wedges, which is precisely when unflushed memory-card writes are lost.
+     * That is the "choices survive two or three reboots and then vanish, then
+     * the next set of choices does the same" report -- writes landing sometimes
+     * and not others, exactly the signature of a missing durability barrier.
+     *
+     * This is NOT the unconditional barrier the removal describes: it fires only
+     * for a fd that (a) is tracked savedata and (b) actually wrote. A read-only
+     * open, and the resource probes the game does constantly, never reach it. */
+    if (is_savedata && did_write) {
         int frc = fsync(fd);
         l_info("SAVEIO fsync before close fd=%d rc=%d errno=%d", fd, frc, errno);
     }
