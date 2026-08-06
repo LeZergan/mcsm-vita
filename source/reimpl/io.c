@@ -405,6 +405,48 @@ static int asset_vfd_release_locked(int slot, unsigned int generation) {
     return asset_vfd_finalize_close_locked(slot);
 }
 
+/* ★ 2026-08-06 — PROGRESSIVE fd-exhaustion recovery.
+ *
+ * Running out of real file descriptors is THE documented cause of "a chapter
+ * loads forever and nothing appears": an asset open fails, the engine gets a
+ * short/failed read for a resource it needs, and its loader never completes.
+ *
+ * Both open sites previously did ONE trim to 8 and ONE retry. That is enough for
+ * a mild squeeze, but not for a burst -- and a burst is exactly what a chapter
+ * transition is, with several .ttarch2 archives being probed at once while the
+ * engine still holds its own descriptors. If that single retry also failed the
+ * open returned -1 and the load hung.
+ *
+ * Now: trim progressively harder and retry after each step, ending at 0 (close
+ * EVERY cached fd that no read is using). Dropping the cache entirely is cheap
+ * and safe -- each entry is lazily reopened by asset_vfd_cold_pread on its next
+ * read -- so failing an open while reclaimable descriptors are still parked in
+ * the cache is never the right outcome. ENFILE (system-wide limit) is handled
+ * alongside EMFILE (per-process); only EMFILE was checked before. */
+static int asset_vfd_open_real(const char *path) {
+    int fd = open(path, O_RDONLY);
+    if (fd >= 0 || (errno != EMFILE && errno != ENFILE)) {
+        return fd;
+    }
+
+    static const unsigned int targets[] = { 16u, 8u, 4u, 0u };
+    for (unsigned int i = 0; i < sizeof(targets) / sizeof(targets[0]); ++i) {
+        asset_vfd_trim_cached_fds(targets[i]);
+        fd = open(path, O_RDONLY);
+        if (fd >= 0) {
+            l_warn("[ASSETVFD] fd exhaustion recovered after trimming to %u cached fds "
+                   "(path=%s)", targets[i], path);
+            return fd;
+        }
+        if (errno != EMFILE && errno != ENFILE) {
+            return -1;
+        }
+    }
+    l_error("[ASSETVFD] OUT OF FILE DESCRIPTORS even with the whole cache dropped "
+            "(errno=%d path=%s) — a load will stall here", errno, path);
+    return -1;
+}
+
 static int asset_vfd_slot(int fd) {
     if (fd < ASSET_VFD_BASE) {
         return -1;
@@ -519,9 +561,23 @@ int asset_vfd_open(const char *path, off_t length) {
         }
     }
     if (slot < 0) {
+        /* Report the table's composition, not just "full". OPEN slots are live
+         * handles the engine still owns; a large CLOSING count means handles were
+         * closed while reads were in flight and the last reader never released
+         * them, which is a leak rather than genuine demand -- and the two need
+         * completely different fixes. Without this the log said only "no free
+         * slots" and the difference was unknowable. */
+        unsigned int n_open = 0, n_closing = 0, n_raw = 0;
+        for (int i = 0; i < ASSET_VFD_MAX; ++i) {
+            if (g_asset_vfds[i].used == ASSET_VFD_OPEN)         n_open++;
+            else if (g_asset_vfds[i].used == ASSET_VFD_CLOSING) n_closing++;
+            if (g_asset_vfds[i].raw_fd >= 0)                    n_raw++;
+        }
         asset_vfd_unlock();
         errno = EMFILE;
-        l_error("[ASSETVFD] no free virtual fd slots for %s", path);
+        l_error("[ASSETVFD] virtual fd table FULL (%d slots: %u open, %u closing, "
+                "%u holding a real fd, live_raw=%u) for %s — a load will stall here",
+                ASSET_VFD_MAX, n_open, n_closing, n_raw, g_asset_vfd_live_raw, path);
         return -1;
     }
 
@@ -547,11 +603,7 @@ int asset_vfd_open(const char *path, off_t length) {
 
     /* Never hold the global table lock across memory-card I/O. The generation
      * check below prevents a late result from attaching to a recycled slot. */
-    int raw_fd = open(path, O_RDONLY);
-    if (raw_fd < 0 && errno == EMFILE) {
-        asset_vfd_trim_cached_fds(ASSET_VFD_RAW_CACHE_RETRY_TARGET);
-        raw_fd = open(path, O_RDONLY);
-    }
+    int raw_fd = asset_vfd_open_real(path);
     const int raw_errno = raw_fd < 0 ? errno : 0;
     int attached = 0;
     int deferred_close_fd = -1;
@@ -611,12 +663,8 @@ static ssize_t asset_vfd_cold_pread(int slot, int fd, void *buf, size_t count,
     if (promoted_out) {
         *promoted_out = 0;
     }
-    int tmp = open(path, O_RDONLY);
-    if (tmp < 0 && errno == EMFILE) {
-        /* Preserve the proven Chapter 2+ recovery path: make fd headroom and retry. */
-        asset_vfd_trim_cached_fds(ASSET_VFD_RAW_CACHE_RETRY_TARGET);
-        tmp = open(path, O_RDONLY);
-    }
+    /* Progressive fd-exhaustion recovery; see asset_vfd_open_real(). */
+    int tmp = asset_vfd_open_real(path);
     if (tmp < 0) {
         l_warn("[ASSETVFD] %s fd=%d open failed path=%s errno=%d",
                operation, fd, path, errno);
