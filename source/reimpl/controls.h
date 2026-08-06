@@ -30,6 +30,9 @@ typedef enum ControlsStickId {
 } ControlsStickId;
 
 extern void controls_handler_key(int32_t keycode, ControlsAction action);
+/* Reconciles the shoulder press latch against the live button levels so a
+ * missed edge cannot leave L or R permanently swallowed. Called every poll. */
+extern void controls_shoulder_level_sync(int left_down, int right_down);
 extern void controls_handler_touch(int32_t id, float x, float y, ControlsAction action);
 extern void controls_handler_analog(ControlsStickId which, float x, float y, ControlsAction action);
 

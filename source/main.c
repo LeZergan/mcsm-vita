@@ -1808,6 +1808,23 @@ static int controls_emit_sdl_pad_button(int32_t keycode, ControlsAction action) 
     return sent;
 }
 
+/* ★ 2026-08-06 — THE SHOULDER LATCH MUST NOT BE ABLE TO STICK.
+ *
+ * [0] = L, [1] = R. This collapses the duplicate deliveries described at its use
+ * site, but it is a SECOND state machine tracking the same physical button that
+ * poll_pad() already tracks -- and two independent trackers for one resource is
+ * the shape that has bitten this port before (see the ARM-clock ownership gap).
+ * If a DOWN is delivered and its matching UP is ever missed -- a failed
+ * sceCtrlPeekBufferPositiveExt2, a suspend, the background input gate -- the
+ * latch stays 1 and every following press of THAT SIDE is silently swallowed
+ * while the other side keeps working. That asymmetry is precisely the reported
+ * "R is fine, L is kinda fucked".
+ *
+ * controls_shoulder_level_sync() below is called every poll with the real button
+ * levels, so the latch is reconciled against hardware continuously and can never
+ * stay stuck for more than one frame. */
+static unsigned char g_shoulder_down[2] = {0, 0};
+
 /* CONTROLLER FIX (2026-07-17): drive Vita L/R as SDL trigger AXES a4/a5
  * (SDL_CONTROLLER_AXIS_TRIGGERLEFT/RIGHT). The fight ButtonMash QTE reads L2/R2
  * ONLY via SDL_GameControllerGetAxis, so the shoulders must MOVE these axes — the
@@ -1820,6 +1837,31 @@ static int controls_emit_sdl_trigger(int32_t keycode, ControlsAction action) {
     const float v = (action == CONTROLS_ACTION_DOWN) ? 1.0f : 0.0f;
     g_sdl_joy(&jni, NULL, SDL_JOYSTICK_ID_VITA, axis, v);
     return 1;
+}
+
+/* Called every poll from poll_pad() with the LIVE shoulder levels. If the latch
+ * disagrees with the hardware it is corrected here, and a shoulder the engine
+ * still believes is held gets a real release delivered down every route rather
+ * than being left stuck. Costs two comparisons per poll on the input thread. */
+void controls_shoulder_level_sync(int left_down, int right_down) {
+    const int level[2] = { left_down ? 1 : 0, right_down ? 1 : 0 };
+    for (int side = 0; side < 2; ++side) {
+        if (g_shoulder_down[side] == (unsigned char)level[side]) {
+            continue;
+        }
+        if (level[side]) {
+            /* Hardware is down but we never saw the press: let the normal edge
+             * path deliver it, so every route (SDL button, trigger axis, native
+             * queue) stays consistent. */
+            g_shoulder_down[side] = 0;
+            controls_handler_key(side == 0 ? AKEYCODE_BUTTON_L1 : AKEYCODE_BUTTON_R1,
+                                 CONTROLS_ACTION_DOWN);
+        } else {
+            g_shoulder_down[side] = 1;
+            controls_handler_key(side == 0 ? AKEYCODE_BUTTON_L1 : AKEYCODE_BUTTON_R1,
+                                 CONTROLS_ACTION_UP);
+        }
+    }
 }
 
 void controls_handler_key(int32_t keycode, ControlsAction action) {
@@ -1877,15 +1919,14 @@ void controls_handler_key(int32_t keycode, ControlsAction action) {
         (keycode == AKEYCODE_BUTTON_L1 || keycode == AKEYCODE_BUTTON_R1);
 
     if (is_shoulder_remap) {
-        /* One physical edge fans out to both console identities below. Suppress
-         * duplicate DOWN/DOWN or UP/UP deliveries so exposing L1+L2 compatibility
-         * cannot double-trigger a QTE or leave one route latched after resume. */
-        static unsigned char shoulder_down[2] = {0, 0};
+        /* One physical edge fans out to both console identities below, and the
+         * pad table now reports each shoulder under either of its two possible
+         * bits, so collapse duplicate DOWN/DOWN or UP/UP deliveries. */
         const int side = (keycode == AKEYCODE_BUTTON_L1) ? 0 : 1;
         const unsigned char next = (action == CONTROLS_ACTION_DOWN) ? 1U : 0U;
         if (action != CONTROLS_ACTION_DOWN && action != CONTROLS_ACTION_UP) return;
-        if (shoulder_down[side] == next) return;
-        shoulder_down[side] = next;
+        if (g_shoulder_down[side] == next) return;
+        g_shoulder_down[side] = next;
     }
 
     sdl_pad_sent = controls_emit_sdl_pad_button(keycode, action);

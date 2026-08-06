@@ -235,6 +235,23 @@ static ButtonMapping mapping[] = {
         { SCE_CTRL_CIRCLE,    AKEYCODE_BUTTON_B },
         { SCE_CTRL_SQUARE,    AKEYCODE_BUTTON_X },
         { SCE_CTRL_TRIANGLE,  AKEYCODE_BUTTON_Y },
+        /* ★ 2026-08-06 — ACCEPT BOTH SHOULDER ENCODINGS.
+         *
+         * psp2/ctrl.h defines TWO distinct bits per shoulder:
+         *     SCE_CTRL_LTRIGGER = SCE_CTRL_L2 = 0x0100   SCE_CTRL_L1 = 0x0400
+         *     SCE_CTRL_RTRIGGER = SCE_CTRL_R2 = 0x0200   SCE_CTRL_R1 = 0x0800
+         * Which one a press sets depends on the pad and the sampling mode: the
+         * handheld's own shoulders report as the TRIGGER bits, while an external
+         * DualShock (PS TV) and some extended-mode paths report L1/R1. This table
+         * only listed L1/R1, so on any path that reports the trigger bit the
+         * shoulder produced no event at all -- "L is kinda fucked" while the other
+         * side happens to work.
+         *
+         * Listing both bits per side means the press is seen either way. A pad that
+         * sets BOTH at once would deliver two edges, which is exactly what the
+         * per-side latch in controls_handler_key() collapses. */
+        { SCE_CTRL_LTRIGGER,  AKEYCODE_BUTTON_L1 },
+        { SCE_CTRL_RTRIGGER,  AKEYCODE_BUTTON_R1 },
         { SCE_CTRL_L1,        AKEYCODE_BUTTON_L1 },
         { SCE_CTRL_R1,        AKEYCODE_BUTTON_R1 },
         { SCE_CTRL_START,     AKEYCODE_BUTTON_START },
@@ -312,6 +329,14 @@ void poll_pad() {
     current_buttons = pad.buttons;
     pressed_buttons = current_buttons & ~old_buttons;
     released_buttons = ~current_buttons & old_buttons;
+
+    /* Reconcile the shoulder latch in main.c against the REAL button levels every
+     * poll. Either encoding counts as pressed (see the mapping table). Without
+     * this a single missed edge -- failed peek, suspend, background gate -- leaves
+     * one side latched and silently eats every later press of that shoulder. */
+    controls_shoulder_level_sync(
+        (current_buttons & (SCE_CTRL_LTRIGGER | SCE_CTRL_L1)) != 0,
+        (current_buttons & (SCE_CTRL_RTRIGGER | SCE_CTRL_R1)) != 0);
 
     for (int i = 0; i < sizeof(mapping) / sizeof(ButtonMapping); i++) {
         if (pressed_buttons & mapping[i].sce_button) {
