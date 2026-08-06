@@ -2071,56 +2071,96 @@ void mcsm_skin_report(void) {
  * If InitializeTemp is never called, or the default is already valid, this does
  * nothing at all. */
 static so_hook g_hook_rf_init_temp;
+static so_hook g_hook_rf_init_user;
 static void *g_temp_concrete_loc = NULL;
+static int   g_user_location_registered = 0;
 
 typedef void (*RfSetDefaultLocFn)(void *ptr_to_ptr);
 typedef void (*RfGetDefaultLocFn)(void *out_ptr);
+typedef void (*RfInitUserFn)(void *ptr_to_ptr);
 
+/* Both Initialize functions take r0 = POINTER to the by-value Ptr<>, which is a
+ * single word; deref it for the raw ResourceConcreteLocation pointer. */
 static void hook_rf_initialize_temp(void *ptr_to_ptr) {
-    /* Both Initialize functions take r0 = POINTER to the by-value Ptr<>, which is
-     * a single word; deref it for the raw ResourceConcreteLocation pointer. */
     if (ptr_to_ptr) {
         g_temp_concrete_loc = *(void **)ptr_to_ptr;
     }
+    l_info("RESLOC: ResourceFinder::InitializeTemp(concrete=%p)", g_temp_concrete_loc);
     SO_CONTINUE_VOID(g_hook_rf_init_temp, ptr_to_ptr);
+}
 
-    static int repaired = 0;
-    if (repaired || !g_temp_concrete_loc) {
-        l_info("RESLOC: InitializeTemp(concrete=%p) — no repair attempted",
-               g_temp_concrete_loc);
+static void hook_rf_initialize_user(void *ptr_to_ptr) {
+    g_user_location_registered = 1;
+    l_info("RESLOC: ResourceFinder::InitializeUser(concrete=%p) — the engine "
+           "registered <User> itself", ptr_to_ptr ? *(void **)ptr_to_ptr : NULL);
+    SO_CONTINUE_VOID(g_hook_rf_init_user, ptr_to_ptr);
+}
+
+/* Run ONCE, after the engine has finished its own resource setup (called from
+ * GameEngine::Start), so neither repair can race an Initialize* that is still to
+ * come. Both repairs are skipped when the engine already did the job. */
+static void repair_resource_locations(void) {
+    static int done = 0;
+    if (done) return;
+    done = 1;
+
+    if (!g_temp_concrete_loc) {
+        l_warn("RESLOC: <Temp> concrete location never seen — cannot repair "
+               "resource locations; property-set saves will keep failing silently");
         return;
     }
-    repaired = 1;
 
+    /* (1) <User>. ResourceFinder::Initialize() only builds the master locator; the
+     * per-location registrations come from platform startup, and on Android <User>
+     * is a real per-app directory. Nothing supplies one here, so <User> is never
+     * registered -- which is the reason this file carries a pile of
+     * logical:<User>/ -> logical:<Temp>/ path rewrites. Registering it at the SAME
+     * concrete location <Temp> uses makes those paths resolve natively, and that
+     * location is known-writable because it is where the save bundles land. */
+    if (!g_user_location_registered) {
+        RfInitUserFn init_user = (RfInitUserFn)so_symbol(&so_mod_gameengine,
+            "_ZN14ResourceFinder14InitializeUserE3PtrI24ResourceConcreteLocationE");
+        if (init_user) {
+            void *want = g_temp_concrete_loc;
+            init_user(&want);
+            g_user_location_registered = 1;
+            l_info("RESLOC: ★ <User> was NEVER registered — now registered at <Temp>'s "
+                   "concrete location (%p), so logical:<User>/... resolves natively",
+                   g_temp_concrete_loc);
+        } else {
+            l_warn("RESLOC: ResourceFinder::InitializeUser not found");
+        }
+    }
+
+    /* (2) The default location, used for names with no location qualifier at all.
+     * GameEngine::SavePrefs asks for the bare Symbol("prefs.prop"), and
+     * ResourceFinder::LocateResource returns NULL for a name with no location --
+     * at which point the save returns before touching a file (0x00cb0844). */
     RfGetDefaultLocFn get_def = (RfGetDefaultLocFn)so_symbol(&so_mod_gameengine,
         "_ZN14ResourceFinder18GetDefaultLocationEv");
     RfSetDefaultLocFn set_def = (RfSetDefaultLocFn)so_symbol(&so_mod_gameengine,
         "_ZN14ResourceFinder18SetDefaultLocationE3PtrI24ResourceConcreteLocationE");
     if (!get_def || !set_def) {
-        l_warn("RESLOC: ResourceFinder Get/SetDefaultLocation not found — "
-               "property-set saves will keep failing");
+        l_warn("RESLOC: Get/SetDefaultLocation not found — bare-name saves will "
+               "keep failing");
         return;
     }
 
     void *current = NULL;
-    get_def(&current);                       /* sret: writes one word */
-    l_info("RESLOC: InitializeTemp(concrete=%p) default_location=%p",
-           g_temp_concrete_loc, current);
-
+    get_def(&current);
     if (current) {
-        l_info("RESLOC: default location already set — leaving it alone");
+        l_info("RESLOC: default location already set (%p) — left alone", current);
         return;
     }
 
     void *want = g_temp_concrete_loc;
     set_def(&want);
-
     void *after = NULL;
     get_def(&after);
     if (after == g_temp_concrete_loc) {
-        l_info("RESLOC: ★ default location was NULL, now points at <Temp>'s concrete "
-               "location (%p) — unqualified property sets (prefs.prop / user.prop / "
-               "choice.prop) can now locate, which is what SavePrefs requires", after);
+        l_info("RESLOC: ★ default location was NULL, now <Temp>'s concrete location "
+               "(%p) — bare names like 'prefs.prop' can locate, which is exactly what "
+               "SavePrefs requires before it will write", after);
     } else {
         l_warn("RESLOC: SetDefaultLocation did not take (now %p, wanted %p)",
                after, g_temp_concrete_loc);
@@ -2133,6 +2173,11 @@ static void patch_resource_default_location(void) {
                               "ResourceFinder::InitializeTemp",
                               (uintptr_t)&hook_rf_initialize_temp,
                               &g_hook_rf_init_temp);
+    (void)hook_symbol_checked(&so_mod_gameengine,
+                              "_ZN14ResourceFinder14InitializeUserE3PtrI24ResourceConcreteLocationE",
+                              "ResourceFinder::InitializeUser",
+                              (uintptr_t)&hook_rf_initialize_user,
+                              &g_hook_rf_init_user);
 }
 
 static void patch_saveprefs_path(void) {
@@ -2319,6 +2364,9 @@ static void hook_gameengine_start(void) {
     force_animation_runtime_flags("start-pre");
     SO_CONTINUE_VOID(g_hook_gameengine_start);
     force_animation_runtime_flags("start-post");
+    /* Engine resource setup is complete by here, so a missing <User> or default
+     * location is genuinely missing rather than merely not registered yet. */
+    repair_resource_locations();
 }
 
 static void hook_metrics_new_frame(uint32_t min_frame_time_bits) {
