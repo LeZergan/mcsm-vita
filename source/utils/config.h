@@ -186,6 +186,42 @@ typedef struct {
                                * turns whole surfaces solid white -- glass and other
                                * blended surfaces are exactly where this shows. The
                                * value comes only from graphics.txt.                    */
+    /* ---- absorbed 2026-08-06 from their own one-off settings files -----------
+     * These were each a separate file under ux0:data/mcsm/settings/ that the
+     * owning module opened by hand, which contradicted this header's own promise
+     * that there are "exactly two files to edit/ship" -- there were twenty-one.
+     * Every one is now a graphics.txt key with the same meaning and the same
+     * default, so behaviour is unchanged for anyone who never made those files. */
+    int  mipmaps;             /* 1 = build mip chains for POT RGBA textures (was
+                               * mipmaps.txt, opt-in). 0 = default.               */
+    int  mipmap_min;          /* min dimension that gets a mip chain, 1..4096 (was
+                               * mipmap_min.txt).                                  */
+    int  downsample_min;      /* smallest level-0 dimension that may be halved on
+                               * upload (was downsample_min.txt).                  */
+    int  vram_reserve;        /* MB of user RAM withheld from vitaGL's texture pool
+                               * for the engine's mmap pools, 32..208 (was
+                               * vram_reserve.txt).                                */
+    int  gxm_tune;            /* 1 = enlarge the GXM ring buffers (default),
+                               * 0 = leave the tiny defaults (was no_gxm_tune.txt,
+                               * whose PRESENCE meant disable -- so this is that
+                               * flag inverted).                                    */
+    int  render_hooks;        /* 1 = install the render-lever hooks (default),
+                               * 0 = skip them (was no_render_hooks.txt, inverted). */
+    int  keep_resident;       /* 1 = keep streamed scene resources resident. OFF by
+                               * default -- it caused "female Jesse reverts to male"
+                               * (was keep_resident.txt, which was opt-in).        */
+    int  gc_core3;            /* 1 = put the GC thread on core 3 when the kernel
+                               * allows it (default), 0 = leave it to the scheduler
+                               * (was no_core3.txt, inverted).                      */
+    int  anim_nonskel;        /* include non-skeleton chore agents in the group
+                               * filter: 1 = yes, 0 = no, -1 = follow skinning_full
+                               * (the default, as before) (was anim_nonskel.txt).  */
+    int  audio_rate;          /* FMOD output sample rate, 0 = engine default
+                               * (was audio_rate.txt).                             */
+    int  dump_shaders;        /* 1 = write cooked shader sources to disk, a
+                               * diagnostic (was dump_shaders.txt).                */
+    int  anim_diag;           /* 1 = log the ANIM-POSE bone-palette diagnostic
+                               * (was animdiag.txt).                               */
     /* system */
     int  clock_adaptive;      /* 0 = ARM pinned, 1 = adaptive floor (battery)    */
     int  clock_mhz;           /* ARM target MHz. 444 = stock max. Higher only has
@@ -196,7 +232,38 @@ typedef struct {
 typedef struct {
     char language[16];        /* locale, "" = English                            */
     int  chapters[8];         /* episode 1..8: 1 show / 0 hide / -1 engine picks  */
+    /* ---- absorbed 2026-08-06, as above ------------------------------------- */
+    int  logging;             /* 1 = write loader.log (default), 0 = suppress all
+                               * logging (was nolog.txt, whose PRESENCE meant off,
+                               * so this is that flag inverted).                   */
+    int  log_sync;            /* 1 = flush every log line immediately so a hang's
+                               * tail survives; costs write latency (was
+                               * logsync.txt).                                      */
+    int  legacy_touch;        /* 1 = use the legacy TouchScreenState pointer path
+                               * (was legacytouch.txt).                            */
+    int  audio_gain;          /* output gain in percent, 50..200, default 125
+                               * (was audio_gain.txt).                             */
+    int  fmod_probe;          /* 1 = run the FMOD native-output probe, a diagnostic
+                               * (was fmod_native_probe.txt).                       */
+    char trophy_commid[16];   /* NP communication id override, "" = use the id the
+                               * build packaged (was trophy_commid.txt).            */
 } McsmGame;
+
+/* game.txt is also where the optional achievement-name -> trophy-id map lives,
+ * as repeated `trophy_map = <name>:<id>` lines. It used to be its own
+ * trophies.txt with a different syntax. Absent entries still fall back to
+ * deriving the id from the name, which is what actually happens in practice. */
+int mcsm_game_trophy_id_for(const char *name);
+
+/* Raw single-key lookup in one of the two settings files ("graphics.txt" or
+ * "game.txt") that does NOT log and does NOT parse the rest of the file.
+ *
+ * For callers that cannot use mcsm_cfg()/mcsm_game() safely: the logger reads
+ * `logging`/`log_sync` while holding its own mutex, and the normal parser ends
+ * with an l_info that would re-enter it; the pthread shim reads `gc_core3` from
+ * inside thread creation, which can run before the rest of the loader is ready.
+ * Returns `fallback` when the file or the key is missing. */
+int mcsm_flag_raw(const char *file, const char *key, int fallback);
 
 /* Lazily parse graphics.txt / game.txt on first call, then return the result. */
 const McsmCfg  *mcsm_cfg(void);

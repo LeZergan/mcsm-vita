@@ -727,8 +727,8 @@ static void *input_poll_thread(void *arg) {
          * 1.10 ended up with permanently dead controls -- give up on the gate
          * rather than leaving the player with no input. Polling a controller
          * while genuinely suspended is harmless; not polling forever is not. */
+        static unsigned int background_ticks = 0;
         if (atomic_load_explicit(&g_app_background, memory_order_acquire)) {
-            static unsigned int background_ticks = 0;
             if (++background_ticks > MCSM_BACKGROUND_GATE_MAX_TICKS) {
                 background_ticks = 0;
                 atomic_store_explicit(&g_app_background, false, memory_order_release);
@@ -738,6 +738,9 @@ static void *input_poll_thread(void *arg) {
             sceKernelDelayThread(50000);
             continue;
         }
+        /* Cleared on every ungated pass, so a resume that arrives normally does not
+         * leave a partial count behind for the NEXT suspend to inherit. */
+        background_ticks = 0;
 
         if (!input_delivery_ready()) {
 #ifdef DEBUG_SOLOADER
@@ -1191,16 +1194,9 @@ static float clamp01(float value) {
 
 static int legacy_touch_pointer_enabled(void) {
     if (g_legacy_touch_pointer_enabled < 0) {
-        /* mcsm_open_setting(), like every other tunable -- see the note in
-         * glutil.c's animdiag block. */
-        FILE *fd = mcsm_open_setting("legacytouch.txt", "r");
-        if (fd) {
-            fclose(fd);
-            g_legacy_touch_pointer_enabled = 1;
-            l_info("INPUT legacy TouchScreenState pointer path enabled by legacytouch.txt");
-        } else {
-            g_legacy_touch_pointer_enabled = 0;
-        }
+        g_legacy_touch_pointer_enabled = mcsm_game()->legacy_touch ? 1 : 0;
+        if (g_legacy_touch_pointer_enabled)
+            l_info("INPUT legacy TouchScreenState pointer path enabled by game.txt legacy_touch");
     }
     return g_legacy_touch_pointer_enabled;
 }

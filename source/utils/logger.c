@@ -7,6 +7,7 @@
 
 #include "utils/logger.h"
 #include "utils/utils.h"
+#include "utils/config.h"   /* mcsm_flag_raw -- the non-logging reader */
 
 #include <psp2/io/fcntl.h>
 #include <psp2/kernel/clib.h>
@@ -30,13 +31,11 @@ static char buffer_b[2048];
 static int _log_enabled = -1; /* -1 unchecked, 1 enabled, 0 disabled */
 static int log_enabled_locked(void) {
     if (_log_enabled < 0) {
-        /* Kept as raw sceIoOpen rather than mcsm_open_setting: this runs
-         * under the log mutex, and that helper lives in utils.c, which logs
-         * on failure -- re-entering the logger while it holds its own lock.
-         * There is deliberately no data-root fallback. */
-        SceUID f = sceIoOpen(DATA_PATH "settings/nolog.txt", SCE_O_RDONLY, 0);
-        if (f >= 0) { sceIoClose(f); _log_enabled = 0; }
-        else _log_enabled = 1;
+        /* game.txt `logging`. Read through mcsm_flag_raw(), NOT mcsm_game():
+         * this runs under the log mutex, and the normal parser writes a summary
+         * line through l_info -- which would re-enter the logger while it holds
+         * that lock. The raw reader neither logs nor opens anything else. */
+        _log_enabled = mcsm_flag_raw("game.txt", "logging", 1);
     }
     return _log_enabled;
 }
@@ -49,13 +48,8 @@ static int log_enabled_locked(void) {
 static int _log_sync = -1; /* -1 unchecked, 1 sync-every-line, 0 batched */
 static int log_sync_locked(void) {
     if (_log_sync < 0) {
-        /* Kept as raw sceIoOpen rather than mcsm_open_setting: this runs
-         * under the log mutex, and that helper lives in utils.c, which logs
-         * on failure -- re-entering the logger while it holds its own lock.
-         * There is deliberately no data-root fallback. */
-        SceUID f = sceIoOpen(DATA_PATH "settings/logsync.txt", SCE_O_RDONLY, 0);
-        if (f >= 0) { sceIoClose(f); _log_sync = 1; }
-        else _log_sync = 0;
+        /* game.txt `log_sync`; raw reader for the same re-entrancy reason as above. */
+        _log_sync = mcsm_flag_raw("game.txt", "log_sync", 0);
     }
     return _log_sync;
 }

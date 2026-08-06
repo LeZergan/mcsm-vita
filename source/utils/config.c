@@ -8,6 +8,8 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <psp2/io/fcntl.h>      /* raw settings read, see mcsm_flag_raw */
+#include <psp2/kernel/clib.h>   /* sceClibSnprintf */
 
 /* ---- graphics.txt (profiles) ------------------------------------------- */
 
@@ -104,6 +106,23 @@ static void apply_profile(McsmCfg *c, int prof) {
         extern void vglSetShaderCachePath(const char *path) __attribute__((weak));
         c->blit_flip = (&vglSetShaderCachePath != NULL) ? 0 : 1;
     }
+
+    /* Absorbed 2026-08-06 from their own settings files. Every default below is
+     * the behaviour you got when that file did NOT exist, so nothing changes for
+     * an existing install -- see config.h. Profile-independent: these are
+     * compatibility/diagnostic levers, not part of the quality presets. */
+    c->mipmaps        = 0;      /* mipmaps.txt was opt-in            */
+    c->mipmap_min     = 1024;   /* mipmap_min.txt default (VRAM-tight) */
+    c->downsample_min = 2048;   /* downsample_min.txt default        */
+    c->vram_reserve   = 48;     /* vram_reserve.txt default (MB)     */
+    c->gxm_tune       = 1;      /* no_gxm_tune.txt absent = tuned    */
+    c->render_hooks   = 1;      /* no_render_hooks.txt absent = on   */
+    c->keep_resident  = 0;      /* keep_resident.txt was OPT-IN      */
+    c->gc_core3       = 1;      /* no_core3.txt absent = core 3 used */
+    c->anim_nonskel   = -1;     /* -1 = follow skinning_full, as before */
+    c->audio_rate     = 0;      /* 0 = engine default                */
+    c->dump_shaders   = 0;      /* diagnostic, off                   */
+    c->anim_diag      = 0;      /* diagnostic, off                   */
 
     switch (prof) {
     case PROF_QUALITY:
@@ -264,6 +283,10 @@ static void load_cfg(void) {
     char ares[16] = "", afps[16] = "", avsync[16] = "", aoutl[16] = "", ashad[16] = "";
     char anfilt[16] = "", afbz[16] = "", aupsc[16] = "", adist[16] = "", aclk[16] = "", adet[16] = "", agpu[32] = "";
     char aarate[16] = "";
+    /* Absorbed one-off settings files (see config.h). */
+    char mips[16] = "", mipmin[16] = "", dsmin[16] = "", vramres[16] = "", gxmt[16] = "";
+    char rhooks[16] = "", keepres[16] = "", core3[16] = "", anonskel[16] = "";
+    char arate_hz[16] = "", dumpsh[16] = "", adiag[16] = "";
 
     FILE *f = mcsm_open_setting("graphics.txt", "r");
     if (f) {
@@ -313,6 +336,22 @@ static void load_cfg(void) {
             else if (!strcmp(k, "skinning"))      cfg_set(skin, sizeof(skin), v);
             else if (!strcmp(k, "clock"))         cfg_set(clk, sizeof(clk), v);
             else if (!strcmp(k, "anim_rate"))     cfg_set(arate, sizeof(arate), v);
+            /* Absorbed one-off files. Captured here and applied AFTER
+             * apply_profile() with every other key -- writing g_cfg directly from
+             * this loop would be silently undone, because apply_profile runs after
+             * the file is read and re-seeds the whole struct. */
+            else if (!strcmp(k, "mipmaps"))        cfg_set(mips, sizeof(mips), v);
+            else if (!strcmp(k, "mipmap_min"))     cfg_set(mipmin, sizeof(mipmin), v);
+            else if (!strcmp(k, "downsample_min")) cfg_set(dsmin, sizeof(dsmin), v);
+            else if (!strcmp(k, "vram_reserve"))   cfg_set(vramres, sizeof(vramres), v);
+            else if (!strcmp(k, "gxm_tune"))       cfg_set(gxmt, sizeof(gxmt), v);
+            else if (!strcmp(k, "render_hooks"))   cfg_set(rhooks, sizeof(rhooks), v);
+            else if (!strcmp(k, "keep_resident"))  cfg_set(keepres, sizeof(keepres), v);
+            else if (!strcmp(k, "gc_core3"))       cfg_set(core3, sizeof(core3), v);
+            else if (!strcmp(k, "anim_nonskel"))   cfg_set(anonskel, sizeof(anonskel), v);
+            else if (!strcmp(k, "audio_rate"))     cfg_set(arate_hz, sizeof(arate_hz), v);
+            else if (!strcmp(k, "dump_shaders"))   cfg_set(dumpsh, sizeof(dumpsh), v);
+            else if (!strcmp(k, "anim_diag"))      cfg_set(adiag, sizeof(adiag), v);
             else if (!strcmp(k, "detail"))        cfg_set(det, sizeof(det), v);
             else if (!strcmp(k, "render_quality")) cfg_set(rq, sizeof(rq), v);
             else if (!strcmp(k, "gpu_tier"))      cfg_set(gt, sizeof(gt), v);
@@ -443,6 +482,21 @@ static void load_cfg(void) {
         if (mapb[0])  g_cfg.map_buffers = parse_bool(mapb, g_cfg.map_buffers);
         if (bflip[0]) g_cfg.blit_flip   = parse_bool(bflip, g_cfg.blit_flip);
         if (pvita[0]) g_cfg.platform_vita = parse_bool(pvita, g_cfg.platform_vita);
+        /* Absorbed one-off settings files. Ranges match the validation the old
+         * per-file readers did, so an out-of-range value keeps the default
+         * instead of reaching the GL/kernel call that used to reject it. */
+        if (mips[0])     g_cfg.mipmaps       = parse_bool(mips, g_cfg.mipmaps);
+        if (mipmin[0])   { int m = atoi(mipmin);   if (m >= 1 && m <= 4096) g_cfg.mipmap_min = m; }
+        if (dsmin[0])    { int d = atoi(dsmin);    if (d >= 1 && d <= 4096) g_cfg.downsample_min = d; }
+        if (vramres[0])  { int r = atoi(vramres);  if (r >= 32 && r <= 208) g_cfg.vram_reserve = r; }
+        if (gxmt[0])     g_cfg.gxm_tune      = parse_bool(gxmt, g_cfg.gxm_tune);
+        if (rhooks[0])   g_cfg.render_hooks  = parse_bool(rhooks, g_cfg.render_hooks);
+        if (keepres[0])  g_cfg.keep_resident = parse_bool(keepres, g_cfg.keep_resident);
+        if (core3[0])    g_cfg.gc_core3      = parse_bool(core3, g_cfg.gc_core3);
+        if (anonskel[0]) g_cfg.anim_nonskel  = parse_bool(anonskel, g_cfg.anim_nonskel);
+        if (arate_hz[0]) { int a = atoi(arate_hz); if (a >= 8000 && a <= 48000) g_cfg.audio_rate = a; }
+        if (dumpsh[0])   g_cfg.dump_shaders  = parse_bool(dumpsh, g_cfg.dump_shaders);
+        if (adiag[0])    g_cfg.anim_diag     = parse_bool(adiag, g_cfg.anim_diag);
         if (trtest[0]) { int n=atoi(trtest); if (n>0 && n<128) g_cfg.trophy_test=n; }
         if (fmodch[0]) { int n=atoi(fmodch); if (n>0 && n<=256) g_cfg.fmod_channels=n; }
         if (spmin[0])  g_cfg.scene_prio_min = atoi(spmin);
@@ -468,9 +522,89 @@ const McsmCfg *mcsm_cfg(void) {
 static McsmGame g_game;
 static int      g_game_loaded = 0;
 
+/* Achievement-name -> trophy-id map, absorbed from the old trophies.txt. */
+#define GAME_TROPHY_MAP_MAX 128
+#define GAME_TROPHY_NAME_MAX 64
+typedef struct { char name[GAME_TROPHY_NAME_MAX]; int id; } GameTrophyMapEntry;
+static GameTrophyMapEntry g_trophy_map[GAME_TROPHY_MAP_MAX];
+static int g_trophy_map_count = 0;
+
+static void trophy_map_add(const char *v) {
+    /* `trophy_map = <achievement name>:<id>` -- an achievement name may contain
+     * a colon, so split on the LAST one rather than the first. */
+    const char *colon = NULL;
+    for (const char *p = v; *p; ++p) if (*p == ':') colon = p;
+    if (!colon || colon == v || g_trophy_map_count >= GAME_TROPHY_MAP_MAX) return;
+    const int id = atoi(colon + 1);
+    if (id < 0 || id >= 128) return;
+    GameTrophyMapEntry *e = &g_trophy_map[g_trophy_map_count];
+    size_t n = (size_t)(colon - v);
+    if (n >= sizeof(e->name)) n = sizeof(e->name) - 1;
+    memcpy(e->name, v, n);
+    e->name[n] = '\0';
+    e->id = id;
+    g_trophy_map_count++;
+}
+
+int mcsm_game_trophy_id_for(const char *name) {
+    if (!name) return -1;
+    (void)mcsm_game();   /* ensures game.txt (and the map) has been parsed */
+    for (int i = 0; i < g_trophy_map_count; ++i)
+        if (!strcmp(g_trophy_map[i].name, name)) return g_trophy_map[i].id;
+    return -1;
+}
+
+/* Deliberately standalone: no mcsm_open_setting (it logs on failure) and no
+ * l_info, so the logger can call this from inside its own mutex without
+ * re-entering itself. See the declaration in config.h. */
+int mcsm_flag_raw(const char *file, const char *key, int fallback) {
+    /* sceIoOpen/sceIoRead, NOT stdio, and deliberately NOT the full parser.
+     *
+     * Two callers need a single flag from a context where the normal path is
+     * unsafe: the logger reads `logging`/`log_sync` while holding its own mutex
+     * (the parser ends with l_info, which would re-enter it), and the pthread
+     * shim reads `gc_core3` from inside thread creation, which can happen before
+     * anything else is ready. Both used to read their own tiny file this way;
+     * this keeps that property while the values live in the two shared files. */
+    char path[128];
+    sceClibSnprintf(path, sizeof(path), DATA_PATH "settings/%s", file);
+    SceUID fd = sceIoOpen(path, SCE_O_RDONLY, 0);
+    if (fd < 0) return fallback;
+    char buf[1024];
+    const int n = sceIoRead(fd, buf, (SceSize)(sizeof(buf) - 1));
+    sceIoClose(fd);
+    if (n <= 0) return fallback;
+    buf[n] = '\0';
+
+    int result = fallback;
+    char line[160], k[24], v[64];
+    const char *p = buf;
+    while (*p) {
+        size_t len = 0;
+        while (p[len] && p[len] != '\n') len++;
+        if (len >= sizeof(line)) len = sizeof(line) - 1;
+        memcpy(line, p, len);
+        line[len] = '\0';
+        p += len;
+        while (*p == '\n' || *p == '\r') p++;
+        if (split_kv(line, k, sizeof(k), v, sizeof(v)) && !strcmp(k, key)) {
+            result = parse_bool(v, fallback);
+            break;
+        }
+    }
+    return result;
+}
+
 static void load_game(void) {
     g_game.language[0] = '\0';
     for (int i = 0; i < 8; ++i) g_game.chapters[i] = -1;
+    g_game.logging      = 1;
+    g_game.log_sync     = 0;
+    g_game.legacy_touch = 0;
+    g_game.audio_gain   = 125;  /* audio_gain.txt default was 125% */
+    g_game.fmod_probe   = 0;
+    g_game.trophy_commid[0] = '\0';
+    g_trophy_map_count  = 0;
 
     char lang[16] = "", chap[64] = "";
     char chov[8][8] = {{0}};                      /* per-chapter override lines (chapter1..8);
@@ -483,6 +617,17 @@ static void load_game(void) {
             if (!split_kv(line, k, sizeof(k), v, sizeof(v))) continue;
             if      (!strcmp(k, "language")) cfg_set(lang, sizeof(lang), v);
             else if (!strcmp(k, "chapters")) cfg_set(chap, sizeof(chap), v);
+            else if (!strcmp(k, "logging"))       g_game.logging      = parse_bool(v, 1);
+            else if (!strcmp(k, "log_sync"))      g_game.log_sync     = parse_bool(v, 0);
+            else if (!strcmp(k, "legacy_touch"))  g_game.legacy_touch = parse_bool(v, 0);
+            else if (!strcmp(k, "fmod_probe"))    g_game.fmod_probe   = parse_bool(v, 0);
+            else if (!strcmp(k, "audio_gain")) {
+                const int g = atoi(v);            /* same 50..200 clamp as before */
+                if (g >= 50 && g <= 200) g_game.audio_gain = g;
+            }
+            else if (!strcmp(k, "trophy_commid"))
+                cfg_set(g_game.trophy_commid, sizeof(g_game.trophy_commid), v);
+            else if (!strcmp(k, "trophy_map"))    trophy_map_add(v);
             else if (strlen(k) == 8 && !strncmp(k, "chapter", 7) && k[7] >= '1' && k[7] <= '8')
                 cfg_set(chov[k[7] - '1'], sizeof(chov[0]), v);   /* chapterN = on/off/auto */
         }
@@ -512,6 +657,9 @@ static void load_game(void) {
     }
 
     g_game_loaded = 1;
+    l_info("CONFIG(game): logging=%d log_sync=%d legacy_touch=%d audio_gain=%d fmod_probe=%d commid=\"%s\" trophy_map=%d",
+           g_game.logging, g_game.log_sync, g_game.legacy_touch, g_game.audio_gain,
+           g_game.fmod_probe, g_game.trophy_commid, g_trophy_map_count);
     l_info("CONFIG(game): language=\"%s\" chapters=%s -> [1:%d 2:%d 3:%d 4:%d 5:%d 6:%d 7:%d 8:%d] (1=show 0=hide -1=auto)",
            g_game.language, chap[0] ? chap : "auto",
            g_game.chapters[0], g_game.chapters[1], g_game.chapters[2], g_game.chapters[3],

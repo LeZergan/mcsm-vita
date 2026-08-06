@@ -334,13 +334,9 @@ static int hook_fmod_studio_initialize(void *studio_system,
              * the same window that makes registerOutput legal. Override with
              * settings/audio_rate.txt (e.g. 24000) if it ever misbehaves. */
             if (low_level) {
-                int want_rate = 44100;
-                FILE *rf = mcsm_open_setting("audio_rate.txt", "r");
-                if (rf) {
-                    char b[16] = {0};
-                    if (fgets(b, sizeof(b), rf)) { int v = atoi(b); if (v >= 8000 && v <= 48000) want_rate = v; }
-                    fclose(rf);
-                }
+                /* graphics.txt `audio_rate`; 0 = keep the 44100 the assets use. */
+                const int cfg_rate = mcsm_cfg()->audio_rate;
+                int want_rate = cfg_rate > 0 ? cfg_rate : 44100;
                 typedef int (*setfmt_fn)(void *, int, int, int);
                 setfmt_fn setfmt = (setfmt_fn)so_symbol(&so_mod_fmod, "FMOD_System_SetSoftwareFormat");
                 if (setfmt) {
@@ -1448,17 +1444,17 @@ static void force_animation_runtime_flags(const char *phase) {
     if (g_set_chore_filter_includes_non_skeleton && refresh) {
         static int s_nonskel = -1;
         if (s_nonskel < 0) {
-            FILE *f = mcsm_open_setting("anim_nonskel.txt", "r");
-            /* Default now follows the profile rather than being hardcoded on.
+            /* Default follows the profile rather than being hardcoded on.
              * Including non-skeleton chores means MORE entries in a walk that is
              * already O(chores x agents) on one thread, and it was forced to 1
              * with no measurement behind it. The max-fps profile turns it off
              * along with the other per-character costs; quality/default keep it,
-             * since it is the engine's corrected behaviour. */
-            s_nonskel = mcsm_cfg()->skinning_full ? 1 : 0;
-            if (f) { char b[8]={0}; if (fgets(b,sizeof(b),f)) s_nonskel = (b[0]!='0'); fclose(f); }
-            l_info("ANIM: chore filter includes non-skeleton = %d%s", s_nonskel,
-                   s_nonskel ? " (default; set anim_nonskel.txt=0 to test without)" : " (anim_nonskel.txt)");
+             * since it is the engine's corrected behaviour. graphics.txt
+             * `anim_nonskel` overrides; -1 there means "follow skinning". */
+            const int want = mcsm_cfg()->anim_nonskel;
+            s_nonskel = (want < 0) ? (mcsm_cfg()->skinning_full ? 1 : 0) : (want ? 1 : 0);
+            l_info("ANIM: chore filter includes non-skeleton = %d (%s)", s_nonskel,
+                   (want < 0) ? "from skinning" : "graphics.txt anim_nonskel");
         }
         g_set_chore_filter_includes_non_skeleton(s_nonskel);
     }
@@ -5120,15 +5116,13 @@ static const char *resource_set_arg_name(void *L); /* fwd decl (defined below) *
  * visible gameplay bug. Correctness first; the freeze is an annoyance, a Jesse
  * the player did not choose is not.
  *
- * Opt back in with settings/keep_resident.txt if you play male Jesse and
- * want the ~4-5s character-swap freezes gone. */
+ * Opt back in with graphics.txt `keep_resident = on` if you play male Jesse
+ * and want the ~4-5s character-swap freezes gone. */
 static int keep_resident_opt_in(void) {
     static int s_on = -1;
     if (s_on < 0) {
-        FILE *f = mcsm_open_setting("keep_resident.txt", "r");
-        s_on = f ? 1 : 0;
-        if (f) fclose(f);
-        if (s_on) l_warn("PERF: keep-resident ENABLED via keep_resident.txt — "
+        s_on = mcsm_cfg()->keep_resident ? 1 : 0;
+        if (s_on) l_warn("PERF: keep-resident ENABLED via graphics.txt keep_resident — "
                          "note this forces MALE Jesse regardless of your choice.");
     }
     return s_on;
@@ -6925,10 +6919,8 @@ static int unsafe_render_hooks_enabled(void) {
      * no_render_hooks.txt turns them back off if anything regresses. */
     static int s_on = -1;
     if (s_on < 0) {
-        FILE *f = mcsm_open_setting("no_render_hooks.txt", "r");
-        s_on = f ? 0 : 1;
-        if (f) fclose(f);
-        if (!s_on) l_info("PERF: far-clip/detail hooks disabled (no_render_hooks.txt)");
+        s_on = mcsm_cfg()->render_hooks ? 1 : 0;
+        if (!s_on) l_info("PERF: far-clip/detail hooks disabled (graphics.txt render_hooks=off)");
     }
     return s_on;
 }

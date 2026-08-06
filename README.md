@@ -143,8 +143,33 @@ loaded.
 - **This build runs slower than a normal one.** Writing the log costs frame time,
   so please do not judge performance on it, and say in your report that you were
   on the logging build.
-- **To turn logging off** without changing builds, create an empty file at
-  `ux0:data/mcsm/settings/nolog.txt`. Delete that file to turn it back on.
+- **To turn logging off** without changing builds, add `logging = off` to
+  `ux0:data/mcsm/settings/game.txt`. Set it back to `on` (or delete the line) to
+  re-enable it.
+
+## Settings
+
+There are exactly **two** settings files, both in `ux0:data/mcsm/settings/`:
+
+| File | Holds |
+| --- | --- |
+| `graphics.txt` | `profile` (quality / balanced / performance / battery / custom) and every performance and visual lever |
+| `game.txt` | language, which episodes are listed, logging, audio gain, and trophy options |
+
+Anything not listed in a file keeps its default, so both files can be as short as
+one line. Older builds scattered these across ~20 single-purpose files
+(`nolog.txt`, `mipmaps.txt`, `vram_reserve.txt`, `keep_resident.txt` and so on);
+those are gone and are ignored if present. The equivalent keys now live in the
+two files above — for example `mipmaps = on`, `vram_reserve = 48`,
+`keep_resident = on` in `graphics.txt`, and `logging = off`, `audio_gain = 125`
+in `game.txt`.
+
+Two worth knowing about:
+
+- `outlines = off` in `graphics.txt` — skips the per-mesh toon-outline pass. It is
+  the single biggest draw-count saving available, so it is the first thing to try
+  if crowded scenes run badly.
+- `logging = off` in `game.txt` — see above.
 
 ## Builder and game features
 

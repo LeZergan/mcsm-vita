@@ -246,19 +246,8 @@ static int clamp_audio_frames(int frames) {
 int audio_gain_q8(void) {
     static int s_gain_q8 = -1;
     if (s_gain_q8 < 0) {
-        int percent = 125;
-        /* All optional configuration lives beside graphics.txt in settings/. */
-        FILE *fp = mcsm_open_setting("audio_gain.txt", "r");
-        if (fp) {
-            char buf[32];
-            if (fgets(buf, sizeof(buf), fp)) {
-                int requested = atoi(buf);
-                if (requested >= 50 && requested <= 200) {
-                    percent = requested;
-                }
-            }
-            fclose(fp);
-        }
+        /* game.txt `audio_gain`, already clamped to 50..200 at parse time. */
+        const int percent = mcsm_game()->audio_gain;
         s_gain_q8 = (percent * 256 + 50) / 100;
         l_info("AUDIO gain=%d%%", percent);
     }

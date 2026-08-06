@@ -20,6 +20,7 @@
 
 #include "utils/utils.h"
 #include "utils/logger.h"
+#include "utils/config.h"   /* gc_core3 */
 
 #define PTHR_MAX_OBJECTS 1024
 
@@ -205,9 +206,10 @@ static atomic_int g_core3_mask = ATOMIC_VAR_INIT(-1); /* -1=unresolved */
 static int mcsm_resolve_core_mask(void) {
     int cached = atomic_load_explicit(&g_core3_mask, memory_order_acquire);
     if (cached >= 0) return cached;
-    int want4 = 1;
-    FILE *f = mcsm_open_setting("no_core3.txt", "r");
-    if (f) { want4 = 0; fclose(f); }
+    /* Raw read, NOT mcsm_cfg(): this runs from inside thread creation, which can
+     * happen before the rest of the loader is ready, and the full parser opens
+     * two files and logs. See mcsm_flag_raw(). */
+    const int want4 = mcsm_flag_raw("graphics.txt", "gc_core3", 1) ? 1 : 0;
     const int resolved = want4 ? 0x000F0000 : 0x00070000;
     int expected = -1;
     (void)atomic_compare_exchange_strong_explicit(&g_core3_mask,

@@ -1311,16 +1311,7 @@ void gl_init() {
      * what lets us relax the downsampler (see dsamp_min_dim). free_user stays ~96MB
      * through scenes so leaving the engine ~64MB of newlib headroom is safe. */
     int ram_reserve_mb = 48;   /* pool = free_user(~96MB) - reserve; LOWER reserve = BIGGER RAM texture fallback pool. 48 -> ~48MB pool so heavy-scene VRAM OOM lands in RAM (not the black 1x1 placeholder) while leaving the engine ~48MB newlib mmap headroom. Tunable via vram_reserve.txt. */
-    {
-        FILE *rf = mcsm_open_setting("vram_reserve.txt", "r");
-        if (rf) {
-            int v = 0;
-            if (fscanf(rf, "%d", &v) == 1 && v >= 32 && v <= 208) {
-                ram_reserve_mb = v;
-            }
-            fclose(rf);
-        }
-    }
+    ram_reserve_mb = mcsm_cfg()->vram_reserve;   /* graphics.txt vram_reserve, MB */
     {
         SceKernelFreeMemorySizeInfo info;
         info.size = sizeof(info);
@@ -1336,8 +1327,7 @@ void gl_init() {
      * those CPU<->GPU ring waits = steadier fps in busy scenes. Must precede
      * vglInit. Default ON (very low risk — just larger buffers); opt-out via
      * no_gxm_tune.txt. */
-    { FILE *nt = mcsm_open_setting("no_gxm_tune.txt", "r");
-      if (nt) { fclose(nt); l_info("gl_init: GXM ring-buffer tuning DISABLED (no_gxm_tune.txt)"); }
+    { if (!mcsm_cfg()->gxm_tune) { l_info("gl_init: GXM ring-buffer tuning DISABLED (graphics.txt gxm_tune=off)"); }
       else {
           vglSetVDMBufferSize(512 * 1024);          /* 128KB -> 512KB */
           vglSetVertexBufferSize(4 * 1024 * 1024);  /* 2MB   -> 4MB   */
@@ -1991,7 +1981,7 @@ static uint8_t g_tex_pot[GL_TEX_POT_CAP];
 /* Implemented after the downsample/depth-texture tables are declared.  Internal
  * PVR eviction and the public glDeleteTextures wrapper both use the same reset so
  * a recycled GL name can never inherit POT, wrap, or shim state. */
-MCSM_DIAG_HELPER static void texture_name_forget(GLuint id);
+static void texture_name_forget(GLuint id);
 
 static int gl_is_pow2(GLsizei v) {
     return v > 0 && (v & (v - 1)) == 0;
@@ -3262,14 +3252,17 @@ void glDeleteTextures_soloader(GLsizei n, const GLuint *textures) {
         }
 #ifdef DEBUG_SOLOADER
         static unsigned s_deleted = 0;
-        static unsigned s_logged = 0;
+        static unsigned s_calls = 0;
         s_deleted += (unsigned)n;
-        if (s_logged < 16U || (s_logged % 256U) == 0U) {
-            s_logged++;
+        /* Throttle on the CALL count, not the log count: gating on the log count
+         * meant that once 16 lines had been written the periodic arm could never
+         * come true again, so this went permanently silent. */
+        if (s_calls < 16U || (s_calls % 256U) == 0U) {
             l_info("TEXNAME: glDeleteTextures n=%d first=%u (total freed=%u) — "
                    "per-name POT/wrap/downsample state cleared",
                    (int)n, textures[0], s_deleted);
         }
+        s_calls++;
 #endif
     }
     glDeleteTextures(n, textures);
@@ -3357,11 +3350,7 @@ void glFramebufferTexture2D_soloader(GLenum target, GLenum attachment,
  * VRAM per texture (caught by the RAM fallback pool) and a little upload time. */
 static int g_mipmap_gen = -1;
 static int mipmap_gen_enabled(void) {
-    if (g_mipmap_gen < 0) {
-        FILE *f = mcsm_open_setting("mipmaps.txt", "r");
-        g_mipmap_gen = f ? 1 : 0;
-        if (f) fclose(f);
-    }
+    if (g_mipmap_gen < 0) g_mipmap_gen = mcsm_cfg()->mipmaps ? 1 : 0;
     return g_mipmap_gen;
 }
 /* Only mipmap textures >= this dim. Small textures (UI, tiny props) barely
@@ -3371,11 +3360,8 @@ static int mipmap_gen_enabled(void) {
  * Tunable: mipmap_min.txt (1..4096). */
 static int g_mipmap_min = -1;
 static int mipmap_min_dim(void) {
-    if (g_mipmap_min < 0) {
-        g_mipmap_min = 1024;   /* VRAM was EXHAUSTED (free_cdram=0) — only mip the biggest textures (mips add 33% VRAM). */
-        FILE *f = mcsm_open_setting("mipmap_min.txt", "r");
-        if (f) { int v = 0; if (fscanf(f, "%d", &v) == 1 && v >= 1 && v <= 4096) g_mipmap_min = v; fclose(f); }
-    }
+    /* Default 1024: mips add ~33% VRAM, so only the biggest surfaces get a chain. */
+    if (g_mipmap_min < 0) g_mipmap_min = mcsm_cfg()->mipmap_min;
     return g_mipmap_min;
 }
 
@@ -3540,17 +3526,7 @@ void glTexImage2D_soloader(GLenum target, GLint level, GLint internalformat,
         * full-res and only halves truly huge 2048²+ textures. Now CACHED (read once,
         * not fopen'd on every one of ~2900 uploads per scene load). Tunable via
         * downsample_min.txt (512/1024=lower res, 4096=nothing halved). */
-    if (dsamp_min_dim < 0) {
-        dsamp_min_dim = 2048;
-        FILE *df = mcsm_open_setting("downsample_min.txt", "r");
-        if (df) {
-            int v = 0;
-            if (fscanf(df, "%d", &v) == 1 && (v == 512 || v == 1024 || v == 2048 || v == 4096)) {
-                dsamp_min_dim = v;
-            }
-            fclose(df);
-        }
-    }
+    if (dsamp_min_dim < 0) dsamp_min_dim = mcsm_cfg()->downsample_min;
     uint8_t *downsampled = NULL;
     /* RENDER-TARGET-SAFE downsample (2026-07-16): ONLY halve textures that arrive
      * WITH pixel data. Textures allocated data==NULL are render-targets / FBO
@@ -3955,15 +3931,8 @@ void glUniform4f_soloader(GLint location, GLfloat v0, GLfloat v1, GLfloat v2, GL
 static int mcsm_anim_pose_diag_enabled(void) {
     static int s_enabled = -1;
     if (s_enabled < 0) {
-        /* Diagnostic switches use the same canonical settings/ directory. */
-        FILE *fd = mcsm_open_setting("animdiag.txt", "r");
-        if (fd) {
-            fclose(fd);
-            s_enabled = 1;
-            l_info("ANIM-POSE diagnostics enabled by animdiag.txt");
-        } else {
-            s_enabled = 0;
-        }
+        s_enabled = mcsm_cfg()->anim_diag ? 1 : 0;
+        if (s_enabled) l_info("ANIM-POSE diagnostics enabled by graphics.txt anim_diag");
     }
     return s_enabled;
 }
@@ -4542,8 +4511,7 @@ void glShaderSource_soloader(GLuint shader, GLsizei count,
      * so it can be pulled + inspected. No effect on normal boots. */
     {
         static int s_dump = -1;
-        if (s_dump < 0) { FILE *df = mcsm_open_setting("dump_shaders.txt", "r");
-                          s_dump = df ? (fclose(df), 1) : 0;
+        if (s_dump < 0) { s_dump = mcsm_cfg()->dump_shaders ? 1 : 0;
                           if (s_dump) sceIoMkdir("ux0:data/mcsm/cooked", 0777); }
         if (s_dump) {
             char p[96]; snprintf(p, sizeof(p), "ux0:data/mcsm/cooked/shader_%u.glsl", (unsigned)shader);

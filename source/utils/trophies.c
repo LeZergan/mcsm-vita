@@ -171,13 +171,7 @@ static atomic_int g_setup_request = ATOMIC_VAR_INIT(0);
 static unsigned g_setup_recoveries = 0;
 static char g_setup_marker_path[128];
 
-/* name -> id map, loaded once from ux0:data/mcsm/settings/trophies.txt */
-#define TROPHY_MAP_MAX 128
-#define TROPHY_NAME_MAX 64
-typedef struct { char name[TROPHY_NAME_MAX]; int id; } TrophyMapEntry;
-static TrophyMapEntry g_map[TROPHY_MAP_MAX];
-static int g_map_count = 0;
-static int g_map_loaded = 0;
+/* The name -> id map lives in game.txt now; see mcsm_game_trophy_id_for(). */
 
 /* ---- worker ------------------------------------------------------------------- */
 
@@ -322,43 +316,9 @@ static int trophy_worker(SceSize args, void *argp) {
 
 /* ---- name -> id map ----------------------------------------------------------- */
 
-/* trophies.txt format, one per line, '#' comments allowed:
- *     <achievement name> = <trophy id>
- * The engine's achievement names live in packed .ttarch2 Lua and cannot be read
- * offline, so this is deliberately a runtime file: the log names every unmapped
- * achievement it sees, and those lines can be pasted straight in. */
-static void trophy_map_load(void) {
-    if (g_map_loaded) return;
-    g_map_loaded = 1;
-
-    FILE *f = mcsm_open_setting("trophies.txt", "r");
-    if (!f) {
-        l_info("TROPHY: no trophies.txt — achievement names will be logged unmapped");
-        return;
-    }
-    char line[160];
-    while (g_map_count < TROPHY_MAP_MAX && fgets(line, sizeof(line), f)) {
-        char *p = line;
-        while (*p == ' ' || *p == '\t') p++;
-        if (*p == '#' || *p == '\n' || *p == '\r' || *p == 0) continue;
-        char *eq = strchr(p, '=');
-        if (!eq) continue;
-        *eq = 0;
-        /* right-trim the key */
-        char *end = eq - 1;
-        while (end >= p && (*end == ' ' || *end == '\t')) *end-- = 0;
-        const int id = atoi(eq + 1);
-        if (id < 0 || !*p) continue;
-        size_t n = strlen(p);
-        if (n >= TROPHY_NAME_MAX) n = TROPHY_NAME_MAX - 1;
-        memcpy(g_map[g_map_count].name, p, n);
-        g_map[g_map_count].name[n] = 0;
-        g_map[g_map_count].id = id;
-        g_map_count++;
-    }
-    fclose(f);
-    l_info("TROPHY: loaded %d name->id mappings from trophies.txt", g_map_count);
-}
+/* The achievement-name -> trophy-id map moved into game.txt (repeated
+ * `trophy_map = <name>:<id>` lines) so the loader ships exactly two settings
+ * files. config.c owns the parsing; mcsm_game_trophy_id_for() is the lookup. */
 
 /* ---- public ------------------------------------------------------------------- */
 
@@ -379,6 +339,7 @@ int mcsm_trophies_setup_active(void) {
 #endif
 }
 
+#if MCSM_HAVE_TROPHY_PACK
 /* Open the registration dialog. Must run on the GL thread: a common dialog only
  * advances while frames are presented, and gl_swap is what pumps it. */
 static int trophy_open_setup_dialog(const char *why) {
@@ -399,6 +360,7 @@ static int trophy_open_setup_dialog(const char *why) {
            "unavailable this session; next boot retries", (unsigned)drc, why);
     return 0;
 }
+#endif /* MCSM_HAVE_TROPHY_PACK */
 
 int mcsm_trophies_setup_poll(void) {
 #if !MCSM_HAVE_TROPHY_PACK
@@ -407,8 +369,14 @@ int mcsm_trophies_setup_poll(void) {
     /* Recovery path: the worker proved the set is unregistered by having an unlock
      * rejected. Open the dialog here, where it can actually be pumped. */
     if (atomic_exchange_explicit(&g_setup_request, 0, memory_order_acq_rel)) {
-        if (!atomic_load_explicit(&g_setup_pending, memory_order_acquire)) {
-            (void)trophy_open_setup_dialog("unlock reported set not registered");
+        if (!atomic_load_explicit(&g_setup_pending, memory_order_acquire) &&
+            trophy_open_setup_dialog("unlock reported set not registered")) {
+            /* Report "dialog up" for THIS frame instead of falling through to
+             * GetStatus below. A dialog queried in the same call that created it
+             * need not have reached RUNNING yet, and a non-RUNNING answer here
+             * would Term it immediately and record a registration that never
+             * happened. The next present polls it normally. */
+            return 1;
         }
     }
 
@@ -479,20 +447,16 @@ int mcsm_trophies_init(void) {
      * A one-time override is a debugging tool; a permanent undetectable one is a
      * trap. If this line appears in a log and you did not put the file there,
      * DELETE THE FILE -- the compiled-in id is the correct one. */
-    { FILE *f = mcsm_open_setting("trophy_commid.txt", "r");
-      if (f) { char b[16] = {0};
-               if (fgets(b, sizeof(b), f)) {
-                   size_t n = strcspn(b, "\r\n"); b[n] = 0;
-                   if (b[0] && strcmp(b, g_comm_id) != 0) {
-                       l_warn("TROPHY: ☠ comm id OVERRIDDEN by settings/trophy_commid.txt: "
-                              "compiled-in '%s' -> '%s'. The packaged pack is "
-                              "sce_sys/trophy/%s_00/TROPHY.TRP, so unless that matches the "
-                              "override there will be NO trophies. Delete the file to use "
-                              "the build's own id.", g_comm_id, b, g_comm_id);
-                       strncpy(g_comm_id, b, sizeof(g_comm_id) - 1);
-                       g_comm_id[sizeof(g_comm_id) - 1] = 0;
-                   } }
-               fclose(f); } }
+    { const char *ov = mcsm_game()->trophy_commid;
+      if (ov[0] && strcmp(ov, g_comm_id) != 0) {
+          l_warn("TROPHY: ☠ comm id OVERRIDDEN by game.txt trophy_commid: "
+                 "compiled-in '%s' -> '%s'. The packaged pack is "
+                 "sce_sys/trophy/%s_00/TROPHY.TRP, so unless that matches the "
+                 "override there will be NO trophies. Remove the line to use "
+                 "the build's own id.", g_comm_id, ov, g_comm_id);
+          strncpy(g_comm_id, ov, sizeof(g_comm_id) - 1);
+          g_comm_id[sizeof(g_comm_id) - 1] = 0;
+      } }
 
     if (sceSysmoduleLoadModule(SCE_SYSMODULE_NP_TROPHY) < 0) {
         l_warn("TROPHY: NP_TROPHY sysmodule failed to load — trophies disabled");
@@ -650,7 +614,6 @@ int mcsm_trophies_init(void) {
         return start_rc;
     }
 
-    trophy_map_load();
     g_available = 1;
 
     /* PIPELINE SELF-TEST. Telltale achievements are driven by story-progress Lua, so
@@ -775,14 +738,13 @@ static void trophy_unlock_resolved(const char *name, int id, const char *how) {
 
 void mcsm_trophies_unlock_by_name(const char *name) {
     if (!name || !*name) return;
-    trophy_map_load();
     /* An explicit mapping always wins, so a wrong derivation can be corrected on
-     * device without a rebuild. */
-    for (int i = 0; i < g_map_count; i++) {
-        if (strcmp(g_map[i].name, name) == 0) {
-            trophy_unlock_resolved(name, g_map[i].id, "mapped");
-            return;
-        }
+     * device without a rebuild. The map now lives in game.txt as repeated
+     * `trophy_map = <name>:<id>` lines; it used to be its own trophies.txt. */
+    const int mapped = mcsm_game_trophy_id_for(name);
+    if (mapped >= 0) {
+        trophy_unlock_resolved(name, mapped, "mapped");
+        return;
     }
     const int derived = trophy_id_from_name(name);
     if (derived >= 0) {
@@ -793,6 +755,6 @@ void mcsm_trophies_unlock_by_name(const char *name) {
      * a repeating story beat cannot flood the log. */
     static unsigned s_unmapped = 0;
     if (s_unmapped++ < 64u)
-        l_info("TROPHY: achievement \"%s\" is UNMAPPED — add a line \"%s = <id>\" to "
-               "ux0:data/mcsm/settings/trophies.txt", name, name);
+        l_info("TROPHY: achievement \"%s\" is UNMAPPED — add a line "
+               "\"trophy_map = %s:<id>\" to ux0:data/mcsm/settings/game.txt", name, name);
 }

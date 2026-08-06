@@ -39,6 +39,7 @@
 #include <taihen.h>
 
 #include "../utils/logger.h"
+#include "../utils/config.h"   /* fmod_probe */
 
 #ifndef DATA_PATH
 #define DATA_PATH "ux0:data/mcsm/"
@@ -76,11 +77,7 @@ static int probe_symbol(const char *modname, const char *sym, uint32_t nid) {
 }
 
 void mcsm_fmod_native_probe(void) {
-    char flag[256];
-    snprintf(flag, sizeof(flag), DATA_PATH "settings/fmod_native_probe.txt");
-    FILE *fp = fopen(flag, "r");
-    if (!fp) return;
-    fclose(fp);
+    if (!mcsm_game()->fmod_probe) return;   /* game.txt fmod_probe */
 
     /* r41 tried ux0:data/mcsm/ and got 0x8002D003 with the file definitely present
      * (verified 1156243 bytes over FTP). That is the sandbox, not a missing file:
