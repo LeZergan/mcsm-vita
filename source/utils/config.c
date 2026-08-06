@@ -121,6 +121,8 @@ static void apply_profile(McsmCfg *c, int prof) {
     c->gc_core3       = 1;      /* no_core3.txt absent = core 3 used */
     c->anim_nonskel   = -1;     /* -1 = follow skinning_full, as before */
     c->audio_rate     = 0;      /* 0 = engine default                */
+    c->anim_dt_repair = 0;      /* engine owns its animation clocks  */
+    c->sim_probes     = 0;      /* chore/scene/script probes off     */
     c->dump_shaders   = 0;      /* diagnostic, off                   */
     c->anim_diag      = 0;      /* diagnostic, off                   */
 
@@ -286,7 +288,7 @@ static void load_cfg(void) {
     /* Absorbed one-off settings files (see config.h). */
     char mips[16] = "", mipmin[16] = "", dsmin[16] = "", vramres[16] = "", gxmt[16] = "";
     char rhooks[16] = "", keepres[16] = "", core3[16] = "", anonskel[16] = "";
-    char arate_hz[16] = "", dumpsh[16] = "", adiag[16] = "";
+    char arate_hz[16] = "", dumpsh[16] = "", adiag[16] = "", adtrep[16] = "", simprb[16] = "";
 
     FILE *f = mcsm_open_setting("graphics.txt", "r");
     if (f) {
@@ -350,6 +352,8 @@ static void load_cfg(void) {
             else if (!strcmp(k, "gc_core3"))       cfg_set(core3, sizeof(core3), v);
             else if (!strcmp(k, "anim_nonskel"))   cfg_set(anonskel, sizeof(anonskel), v);
             else if (!strcmp(k, "audio_rate"))     cfg_set(arate_hz, sizeof(arate_hz), v);
+            else if (!strcmp(k, "anim_dt_repair")) cfg_set(adtrep, sizeof(adtrep), v);
+            else if (!strcmp(k, "sim_probes"))     cfg_set(simprb, sizeof(simprb), v);
             else if (!strcmp(k, "dump_shaders"))   cfg_set(dumpsh, sizeof(dumpsh), v);
             else if (!strcmp(k, "anim_diag"))      cfg_set(adiag, sizeof(adiag), v);
             else if (!strcmp(k, "detail"))        cfg_set(det, sizeof(det), v);
@@ -495,6 +499,8 @@ static void load_cfg(void) {
         if (core3[0])    g_cfg.gc_core3      = parse_bool(core3, g_cfg.gc_core3);
         if (anonskel[0]) g_cfg.anim_nonskel  = parse_bool(anonskel, g_cfg.anim_nonskel);
         if (arate_hz[0]) { int a = atoi(arate_hz); if (a >= 8000 && a <= 48000) g_cfg.audio_rate = a; }
+        if (adtrep[0])   g_cfg.anim_dt_repair = parse_bool(adtrep, g_cfg.anim_dt_repair);
+        if (simprb[0])   g_cfg.sim_probes     = parse_bool(simprb, g_cfg.sim_probes);
         if (dumpsh[0])   g_cfg.dump_shaders  = parse_bool(dumpsh, g_cfg.dump_shaders);
         if (adiag[0])    g_cfg.anim_diag     = parse_bool(adiag, g_cfg.anim_diag);
         if (trtest[0]) { int n=atoi(trtest); if (n>0 && n<128) g_cfg.trophy_test=n; }

@@ -2125,9 +2125,14 @@ static void patch_chore_full_update_path(void) {
     }
 
 #if MCSM_SIM_PROBES
-    (void)hook_symbol_checked(&so_mod_gameengine, "_ZN9ChoreInst20UpdateChoreInstancesEv",
-                              "ChoreInst::UpdateChoreInstances (probe)",
-                              (uintptr_t)&hook_chore_update_all, &g_hook_chore_update_all);
+    /* Opt-in: this hooks the CHORE SYSTEM, i.e. instrumentation sitting directly on
+     * the animation path under investigation. Off unless graphics.txt asks for a
+     * measurement, so the default build leaves the chore tick untouched. */
+    if (mcsm_cfg()->sim_probes) {
+        (void)hook_symbol_checked(&so_mod_gameengine, "_ZN9ChoreInst20UpdateChoreInstancesEv",
+                                  "ChoreInst::UpdateChoreInstances (probe)",
+                                  (uintptr_t)&hook_chore_update_all, &g_hook_chore_update_all);
+    }
 #endif
     /* Phase probes: attribute the sim time that chore+playback do NOT explain
      * (device says those are only ~4.8ms of 26-40ms). */
@@ -2168,12 +2173,15 @@ static void patch_chore_full_update_path(void) {
      * live-code rewriting on two more functions, which is the mechanism this file
      * documents as the cause of the diorama crash. Install them only when they can
      * actually measure something. */
-    (void)hook_symbol_checked(&so_mod_gameengine, "_ZN5Scene12UpdateScenesEv",
-                              "Scene::UpdateScenes (probe)",
-                              (uintptr_t)&hook_scene_update, &g_hook_scene_update);
-    (void)hook_symbol_checked(&so_mod_gameengine, "_ZN13ScriptManager6UpdateEf",
-                              "ScriptManager::Update (probe)",
-                              (uintptr_t)&hook_script_update, &g_hook_script_update);
+    if (mcsm_cfg()->sim_probes) {
+        (void)hook_symbol_checked(&so_mod_gameengine, "_ZN5Scene12UpdateScenesEv",
+                                  "Scene::UpdateScenes (probe)",
+                                  (uintptr_t)&hook_scene_update, &g_hook_scene_update);
+        (void)hook_symbol_checked(&so_mod_gameengine, "_ZN13ScriptManager6UpdateEf",
+                                  "ScriptManager::Update (probe)",
+                                  (uintptr_t)&hook_script_update, &g_hook_script_update);
+        l_info("SIMSPLIT: sim probes ENABLED (graphics.txt sim_probes=on)");
+    }
 #endif
 
     /* Only set_controller is still a patch. update_all was removed as a proven
@@ -2269,15 +2277,18 @@ static void hook_gameengine_loop(void) {
     force_application_active("loop-post");
     force_native_render_dimensions("loop-post");
     metrics_diag_tick(count, "post");
-    /* Fail-safe only: if the Metrics::NewFrame hook did not install, this is the
-     * one remaining place the clamped delta can be repaired. When that hook IS
-     * live this is a no-op, because it already wrote the same value this frame. */
-    metrics_force_animation_dt(
-        animation_governor_current_or_repair(
-            g_metrics_diag.frame_time ? *g_metrics_diag.frame_time : 0.0f,
-            g_metrics_diag.actual_frame_time ? *g_metrics_diag.actual_frame_time : 0.0f),
-        "loop-post",
-        count);
+    /* Only when the repair is explicitly enabled. With anim_dt_repair = 0 the
+     * loader must not write the engine's timing state from here either -- leaving
+     * this call unguarded would have kept rewriting mFrameTime every frame while
+     * the log claimed NewFrame was left native. */
+    if (mcsm_cfg()->anim_dt_repair) {
+        metrics_force_animation_dt(
+            animation_governor_current_or_repair(
+                g_metrics_diag.frame_time ? *g_metrics_diag.frame_time : 0.0f,
+                g_metrics_diag.actual_frame_time ? *g_metrics_diag.actual_frame_time : 0.0f),
+            "loop-post",
+            count);
+    }
     /* The render presenter is the only frame-rate gate. Sleeping the simulation
      * here as well stacked two independent caps; a small vblank miss at 30 FPS
      * became a 3-vblank/20 FPS frame and starved animation preparation. */
@@ -3449,21 +3460,33 @@ static void patch_engine_diag_hooks(void) {
     patch_chore_full_update_path();
     patch_saveprefs_path();
 
-    /* Production hook: this is where the engine's 0.1s frame-delta clamp gets
-     * repaired (see the governor above). It is called once per frame from the
-     * single game-loop thread and uses the exact-prologue trampoline below --
-     * NOT SO_CONTINUE -- so it does not rewrite live instruction bytes on a hot
-     * multi-threaded path. The SO_CONTINUE fallback stays only as a fail-safe. */
-    if (hook_symbol_checked(&so_mod_gameengine,
-                            "_ZN7Metrics8NewFrameEf",
-                            "Metrics::NewFrame",
-                            (uintptr_t)&hook_metrics_new_frame,
-                            &g_hook_metrics_new_frame)) {
+    /* ★ OFF BY DEFAULT — THE ENGINE OWNS ITS ANIMATION CLOCKS.
+     *
+     * With anim_dt_repair = 0 (the default) Metrics::NewFrame is left completely
+     * native: no hook, no trampoline, and no loader code writes mFrameTime,
+     * mActualFrameTime or mTotalTime anywhere. That is the least-interference
+     * configuration, and it is the one animation should be judged on.
+     *
+     * The engine's 0.1s frame-delta clamp is real (disassembled at 0xc71e38, and
+     * visible in device logs as engine=0.100000/2.585000 after a load), but
+     * repairing it means writing the engine's own timing state from a hook on
+     * every frame, and that has never been shown to make animation better on
+     * hardware. `anim_dt_repair = on` in graphics.txt turns it back on without a
+     * rebuild if a measurement ever justifies it. */
+    if (!mcsm_cfg()->anim_dt_repair) {
+        l_info("ANIM: Metrics::NewFrame left NATIVE (anim_dt_repair=off) — the engine "
+               "owns mFrameTime/mActualFrameTime/mTotalTime; the loader writes none of them");
+    } else if (hook_symbol_checked(&so_mod_gameengine,
+                                   "_ZN7Metrics8NewFrameEf",
+                                   "Metrics::NewFrame",
+                                   (uintptr_t)&hook_metrics_new_frame,
+                                   &g_hook_metrics_new_frame)) {
         g_metrics_new_frame_tramp =
             mcsm_build_metrics_new_frame_tramp(&g_hook_metrics_new_frame);
         if (!g_metrics_new_frame_tramp) {
             l_warn("TRAMP: Metrics::NewFrame using guarded SO_CONTINUE fallback");
         }
+        l_info("ANIM: frame-delta repair ENABLED (anim_dt_repair=on)");
     }
 
     g_renderframe_push_view_addr =

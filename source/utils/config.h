@@ -227,6 +227,30 @@ typedef struct {
                                * (the default, as before) (was anim_nonskel.txt).  */
     int  audio_rate;          /* FMOD output sample rate, 0 = engine default
                                * (was audio_rate.txt).                             */
+    int  anim_dt_repair;      /* ★ 2026-08-06 — DEFAULT 0: THE ENGINE OWNS ITS OWN
+                               * ANIMATION CLOCKS AND THE LOADER DOES NOT TOUCH THEM.
+                               *
+                               * 0 = Metrics::NewFrame is not hooked at all and no
+                               *     loader code writes mFrameTime / mActualFrameTime
+                               *     / mTotalTime. This is the least-interference
+                               *     configuration and the one to judge animation on.
+                               * 1 = install the NewFrame hook and repair the engine's
+                               *     0.1s frame-delta clamp on hitch frames.
+                               *
+                               * The clamp is real (verified by disassembly at
+                               * 0xc71e38 and seen in device logs as
+                               * engine=0.100000/2.585000), but repairing it means
+                               * writing the engine's own timing state from a hook
+                               * every frame, and that has not been shown to make
+                               * animation better on a real device. Off unless a
+                               * measurement says otherwise.                        */
+    int  sim_probes;          /* 1 = install the Scene::UpdateScenes /
+                               * ScriptManager::Update / ChoreInst::UpdateChoreInstances
+                               * timing probes (logging builds only; they need the
+                               * phase macros compiled in). Default 0: these hook the
+                               * chore system itself, so they are instrumentation on
+                               * the very path being investigated. Turn on only to
+                               * capture a SIMSPLIT / chore-tick measurement.        */
     int  dump_shaders;        /* 1 = write cooked shader sources to disk, a
                                * diagnostic (was dump_shaders.txt).                */
     int  anim_diag;           /* 1 = log the ANIM-POSE bone-palette diagnostic
