@@ -107,6 +107,20 @@ body:
       label: Screenshot or video
       description: Drag in a screenshot or short video when it helps explain the problem.
 
+  - type: textarea
+    id: log
+    attributes:
+      label: Log file
+      description: |
+        The current 1.10 build writes `ux0:data/mcsm/loader.log`. Drag the file in here.
+
+        To capture it: play until the problem happens, close the game (PS button, then close
+        from the LiveArea if it is frozen), and copy the file off **before launching again** —
+        the log is wiped at the start of every launch. VitaShell's FTP server (SELECT) is the
+        easiest way to get it. Zip it if it is large.
+
+        This is by far the most useful thing you can attach for a freeze or a graphics fault.
+
   - type: checkboxes
     id: confirmations
     attributes:
@@ -114,6 +128,8 @@ body:
       options:
         - label: I am using the current MCSM 1.10 prerelease.
           required: true
+        - label: I know this build is a logging build and runs slower than normal, and I have not reported its framerate as a performance bug.
+          required: false
         - label: I understand that first-time shader compilation stutter is expected until the progcache is populated.
           required: true
         - label: I did not attach APKs, OBBs, game assets, or private save data.

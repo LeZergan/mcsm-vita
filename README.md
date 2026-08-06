@@ -5,6 +5,9 @@ Unofficial PS Vita loader for the Android PowerVR build of *Minecraft: Story Mod
 > [!WARNING]
 > **MCSM 1.10 is a public prerelease for testing.** Bugs, freezes, and performance problems are still possible. The release does not yet include a complete progcache, so new scenes will stutter while shaders compile. Replaying cached scenes should be smoother.
 
+> [!IMPORTANT]
+> **The release VPK is currently `MCSM-1.10-logging.vpk`, a logging build.** It writes `ux0:data/mcsm/loader.log` so freezes and graphics faults can be traced from real evidence. It runs slower than a normal build — please do not judge performance on it. See [Send a log](#send-a-log-important-for-this-prerelease).
+
 [Download prerelease](../../releases/tag/v1.10) · [Report a game problem](../../issues/new?template=bug-report.yml) · [Join Discord](https://discord.gg/EYYTxeXCq)
 
 | Component | Current version |
@@ -18,7 +21,7 @@ Unofficial PS Vita loader for the Android PowerVR build of *Minecraft: Story Mod
 
 The [MCSM 1.10 prerelease](../../releases/tag/v1.10) contains:
 
-- **`MCSM-1.10.vpk`** — the Vita loader, LiveArea artwork, and trophy resources.
+- **`MCSM-1.10-logging.vpk`** — the Vita loader, LiveArea artwork, and trophy resources. This is a **logging build** — see [Send a log](#send-a-log-important-for-this-prerelease).
 - **`MCSM-Vita-Data-Builder-v1.9.exe`** — prepares the Vita data folder from files you legally own.
 
 Android game files are not included. You must supply your own supported APK, main OBB, patch OBB, and optional episode files.
@@ -38,7 +41,7 @@ Install or enable:
 
 ### 2. Install the loader
 
-Install `MCSM-1.10.vpk` with VitaShell.
+Install `MCSM-1.10-logging.vpk` with VitaShell.
 
 ### 3. Build the data folder
 
@@ -103,6 +106,45 @@ Use the [game bug report form](../../issues/new?template=bug-report.yml) or post
 - a screenshot or short video when useful
 
 Never upload proprietary game assets, APKs, OBBs, or saves containing private information.
+
+## Send a log (important for this prerelease)
+
+**The release VPK is currently `MCSM-1.10-logging.vpk`, a logging build.** It writes a diagnostic log
+while you play, which is what lets a freeze or a graphics fault actually be
+traced instead of guessed at. Attaching one to your report is the single most
+useful thing you can do right now.
+
+The log file is:
+
+```
+ux0:data/mcsm/loader.log
+```
+
+### How to get it off the Vita
+
+1. Play until the problem happens.
+2. **Close the game.** If it is frozen, press PS, then close it from the LiveArea.
+3. **Do not launch the game again yet** — the log is wiped at the start of every
+   launch, so relaunching destroys the evidence you just captured.
+4. Copy `ux0:data/mcsm/loader.log` off the Vita. Either:
+   - open VitaShell, press **SELECT** to start the FTP server, and copy the file
+     from a PC, or
+   - copy it to a USB drive / SD card with VitaShell's file browser.
+5. Attach it to your [bug report](../../issues/new?template=bug-report.yml) or
+   post it in the [Discord](https://discord.gg/EYYTxeXCq).
+
+If the log is very large, zip it first. Please send the whole file rather than a
+screenshot of part of it — the useful part is usually the last few hundred lines
+before the failure, but the earlier lines say which settings and chapters were
+loaded.
+
+### Two things worth knowing
+
+- **This build runs slower than a normal one.** Writing the log costs frame time,
+  so please do not judge performance on it, and say in your report that you were
+  on the logging build.
+- **To turn logging off** without changing builds, create an empty file at
+  `ux0:data/mcsm/settings/nolog.txt`. Delete that file to turn it back on.
 
 ## Builder and game features
 
