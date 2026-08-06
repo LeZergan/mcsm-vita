@@ -1408,8 +1408,6 @@ static int return_address_in_symbol(void *retaddr, uintptr_t symbol_addr, size_t
 }
 
 
-static void stream_pump_preload(void);  /* forward decl; defined after boot hooks */
-
 static void resolve_animation_runtime_flags(void) {
     if (g_animation_flag_symbols_resolved) {
         return;
@@ -2425,9 +2423,6 @@ static void hook_gameengine_loop(void) {
     static uint32_t count = 0;
 
     count++;
-    /* STREAMING: advance the async preload batch while a ScenePreload is in
-     * flight. Bounded per frame and by a hard deadline -- see stream_pump_preload. */
-    stream_pump_preload();
     if ((count & 0x0fU) == 1U) {
         force_animation_runtime_flags("loop");
     }
@@ -4605,111 +4600,20 @@ static int hook_lua_resource_is_loaded(void *L) {
 }
 #endif /* DEBUG_SOLOADER */
 
-/* ★ SCENE-PRELOAD PUMP (restored 2026-08-06) ------------------------------
+/* ScenePreload runs through the engine's own scheduler; the loader does not
+ * drive it.
  *
- * luaResourceAdvancePreloadBatch (engine 0x00c41858) is a Lua-callable C
- * function: on Android the game's script update loop calls it every frame until
- * the async preload started by ScenePreload reports done. On this port that
- * pumping does not happen, so a preload that is started is never advanced --
- * the scene never becomes ready and the game sits waiting for it while FMOD
- * keeps streaming dialogue on its own thread. That is the "frozen with audio
- * still playing at a scene change, have to quit and relaunch" report, and why
- * it reproduces around story branches (the Ruben choice) where a new scene is
- * preloaded.
+ * A pump used to live here: it cached the raw lua_State from luaScenePreload and
+ * called luaResourceAdvancePreloadBatch from the C++ game loop. Two findings
+ * retired it. Disassembly of that engine function (0x00c41858) shows it does no
+ * preload work at all -- it adds a number to a global budget counter and returns.
+ * And across every device log the pump never executed once: luaScenePreload
+ * returns 0 on this port, which disarmed it immediately, so there are zero pump
+ * lines in any capture. It was dead code holding a raw lua_State across frames.
  *
- * 1.10 deleted the pump. The objection behind that was fair -- the old version
- * cached a raw lua_State and could in principle keep calling forever -- so this
- * restores the pump WITH the bounds it never had:
- *   - at most 2 batch calls and 4ms of work per frame (as before),
- *   - a hard wall-clock deadline, after which we stop pumping regardless, so a
- *     wedged or stale preload degrades to the old behaviour instead of pinning
- *     the sim thread every frame for the rest of the session,
- *   - the pump is dropped the moment a batch reports completion.
- *
- * The engine keeps one long-lived script lua_State, so the cached pointer stays
- * valid for the window this is used in (ScenePreload -> preload complete). */
-#define STREAM_PRELOAD_MAX_US   (20ULL * 1000000ULL)  /* hard stop for one preload */
-
-static void    *g_preload_lua_state = NULL;
-static volatile int g_preload_pending = 0;
-static uint64_t g_preload_started_us = 0;
-#ifdef DEBUG_SOLOADER
-static volatile int g_preload_log_once  = 0;
-#endif
-
-/* Direct function pointer to luaResourceAdvancePreloadBatch so the batch can be
- * driven from the C++ game loop without a round trip through Lua. */
-typedef int (*AdvancePreloadBatchFn)(void *L);
-static AdvancePreloadBatchFn g_advance_preload_fn = NULL;
-
-static int stream_resolve_preload_api(void) {
-    if (!g_advance_preload_fn) {
-        uintptr_t addr = so_symbol(&so_mod_gameengine,
-                          "_Z30luaResourceAdvancePreloadBatchP9lua_State");
-        if (!addr) {
-#ifdef DEBUG_SOLOADER
-            if (!g_preload_log_once) {
-                l_warn("STREAM: cannot resolve AdvancePreloadBatch symbol");
-                g_preload_log_once = 1;
-            }
-#endif
-            return 0;
-        }
-        g_advance_preload_fn = (AdvancePreloadBatchFn)addr;
-    }
-    return 1;
-}
-
-static void stream_pump_preload(void) {
-    if (!g_preload_pending || !g_preload_lua_state)
-        return;
-    if (!stream_resolve_preload_api()) {
-        g_preload_pending = 0;
-        return;
-    }
-
-    const uint64_t pump_t0 = sceKernelGetSystemTimeWide();
-
-    /* Hard deadline. A preload this old is not going to finish by being pumped
-     * harder, and continuing to call into it every frame is the failure mode the
-     * removal was worried about. Give up and let the engine proceed. */
-    if (g_preload_started_us && (pump_t0 - g_preload_started_us) > STREAM_PRELOAD_MAX_US) {
-        g_preload_pending = 0;
-        l_warn("STREAM: preload pump deadline reached; releasing pump");
-        return;
-    }
-
-#ifdef DEBUG_SOLOADER
-    int pumped = 0;
-#endif
-    for (int i = 0; i < 2 && g_preload_pending; ++i) {
-        int ret = g_advance_preload_fn(g_preload_lua_state);
-#ifdef DEBUG_SOLOADER
-        pumped++;
-#endif
-        if (ret <= 0) {
-            g_preload_pending = 0;
-#ifdef DEBUG_SOLOADER
-            l_info("STREAM: preload pump complete after %d calls", pumped);
-#endif
-            break;
-        }
-        if ((sceKernelGetSystemTimeWide() - pump_t0) >= 4000ULL) {
-            break;
-        }
-    }
-#ifdef DEBUG_SOLOADER
-    if (pumped && g_preload_pending && !g_preload_log_once) {
-        g_preload_log_once = 1;
-        l_info("STREAM: preload pump still pending after %d calls", pumped);
-    }
-    const uint32_t pump_ms = (uint32_t)((sceKernelGetSystemTimeWide() - pump_t0) / 1000ULL);
-    if (pump_ms > 25U) {
-        l_info("STREAM: preload pump budget overrun calls=%d work=%ums", pumped, pump_ms);
-    }
-#endif
-}
-
+ * (Codex deleted this before I did, for a different stated reason -- that the
+ * cached state could block indefinitely. The measured reason is simpler: it never
+ * ran, and would not have helped if it had.) */
 static so_hook g_hook_lua_scene_preload;
 static int hook_lua_scene_preload(void *L) {
 #ifdef DEBUG_SOLOADER
@@ -4729,19 +4633,10 @@ static int hook_lua_scene_preload(void *L) {
     l_info("STREAM: luaScenePreload #%u scene='%s' (real preload)",
            count, nm ? nm : "(?)");
 #endif
-    g_preload_lua_state  = L;
-    g_preload_pending    = 1;
-    g_preload_started_us = sceKernelGetSystemTimeWide();
-#ifdef DEBUG_SOLOADER
-    g_preload_log_once  = 0;
-#endif
     int ret = SO_CONTINUE(int, g_hook_lua_scene_preload, L);
 #ifdef DEBUG_SOLOADER
     l_info("STREAM: luaScenePreload #%u returned %d", count, ret);
 #endif
-    if (ret == 0) {
-        g_preload_pending = 0;
-    }
     return ret;
 }
 
