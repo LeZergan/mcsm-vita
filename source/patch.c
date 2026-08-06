@@ -1301,11 +1301,22 @@ static void metrics_force_animation_dt(float dt, const char *phase, uint32_t cou
         *g_metrics_diag.frame_time = fixed_dt;
         changed = 1;
     }
-    if (g_metrics_diag.actual_frame_time &&
-        abs_float_delta(*g_metrics_diag.actual_frame_time, fixed_dt) > 0.0005f) {
-        *g_metrics_diag.actual_frame_time = fixed_dt;
-        changed = 1;
-    }
+    /* ★ 2026-08-06 — DO NOT TOUCH mActualFrameTime.
+     *
+     * Metrics::NewFrame produces TWO clocks on purpose: mFrameTime is the safe,
+     * clamped delta (capped at 0.1s) and mActualFrameTime is the real wall-clock
+     * delta. Controllers pick between them, and the real one is how audio-driven
+     * playback catches up after a hitch.
+     *
+     * Overwriting it destroyed exactly that. Device log after a 2.6s load:
+     *     ANIM: metrics fixed  ft 0.100000->0.250000  aft 2.585000->0.250000
+     * The engine had the correct 2.585s and we replaced it with 0.25s, throwing
+     * away 2.3s of catch-up information it was relying on -- which is the
+     * "faces/audio out of sync after a hard load" behaviour.
+     *
+     * Repair only the clock the engine actually clamped. The real one is already
+     * right by construction, so leaving it alone is both more correct and less
+     * work. */
     /* averageFrameTime, fixedTimeStep and delay have separate engine meanings;
      * flattening them to one value destabilizes pacing and simulation. */
     if (g_metrics_diag.total_time &&
@@ -1940,6 +1951,81 @@ void mcsm_skin_report(void) {
     last_locks = locks; last_respec = respec; last_kb = kb;
     last_mallocs = mallocs; last_frames = frames;
 #endif
+}
+
+/* ★ 2026-08-06 — MAKE IN-GAME SETTINGS PERSIST.
+ *
+ * Device evidence (25-minute session, r147): SavePrefs ran repeatedly and
+ * `prefs.prop` appears NOWHERE in the log -- not one open, not one FAILED open,
+ * in either direction. The engine's preferences are therefore never written and
+ * never read back, so every in-game setting reverts on restart.
+ *
+ * Cause, from disassembly:
+ *     luaSavePrefs            @0x00c41830 -> GameEngine::SavePrefs()
+ *     GameEngine::SavePrefs   @0x00cb0dec builds String("prefs.prop") and saves
+ *                                         the GetPreferences() property set to it
+ * "prefs.prop" is a BARE name. Bare resource names do not bind to a writable
+ * location on this port -- the same root cause the saveslot/choice.prop
+ * redirects exist for -- so the save resolves to nothing and returns quietly.
+ *
+ * The existing redirect (redirect_logical_user_to_temp) already lists
+ * "prefs.prop", but it can only rewrite names passed as arguments to hooked LUA
+ * functions. luaSavePrefs takes no path: the string is built inside C++, so
+ * nothing at the Lua layer ever sees it. There is likewise nothing at the file
+ * layer to catch, because no open is ever attempted.
+ *
+ * So rewrite the name at its source. The function loads it as a PC-relative
+ * literal:
+ *     +0x10  e59f10ac  ldr r1, [pc, #172]     ; -> literal pool at +0xC4
+ *     +0x18  e08f1001  add r1, pc, r1         ; r1 = (fn+0x20) + literal
+ * Only the POOL WORD is rewritten, to point at our own
+ * "logical:<Temp>/prefs.prop" instead. That is a single data store -- no code is
+ * modified, nothing is rewritten on a hot path, and it happens once at init.
+ * `logical:<Temp>/` is known to resolve and to be writable here: it is exactly
+ * where the redirected saveslot bundles land in the same log.
+ *
+ * Both instruction encodings and the current string are verified before the
+ * store, so a different engine build simply skips the patch. */
+static void patch_saveprefs_path(void) {
+    static int applied = 0;
+    if (applied) return;
+    applied = 1;
+
+    /* Must stay resident for the life of the process: the engine re-reads this
+     * literal on every SavePrefs call. */
+    static const char k_prefs_path[] = "logical:<Temp>/prefs.prop";
+
+    const uintptr_t fn = so_symbol(&so_mod_gameengine, "_ZN10GameEngine9SavePrefsEv");
+    if (!fn) {
+        l_warn("PREFSPATH: GameEngine::SavePrefs not found — in-game settings will not persist");
+        return;
+    }
+
+    const uint32_t ldr_insn = *(volatile uint32_t *)(fn + 0x10);
+    const uint32_t add_insn = *(volatile uint32_t *)(fn + 0x18);
+    if (ldr_insn != 0xE59F10ACu || add_insn != 0xE08F1001u) {
+        l_warn("PREFSPATH: unexpected SavePrefs prologue (ldr=0x%08X add=0x%08X) — "
+               "not patching; in-game settings will not persist",
+               (unsigned)ldr_insn, (unsigned)add_insn);
+        return;
+    }
+
+    /* `add r1, pc, r1` reads PC as (its own address + 8) = fn + 0x20. */
+    volatile uint32_t *pool = (volatile uint32_t *)(fn + 0xC4);
+    const uintptr_t cur = (fn + 0x20) + (uintptr_t)*pool;
+    if (!cur || strcmp((const char *)cur, "prefs.prop") != 0) {
+        l_warn("PREFSPATH: literal is not \"prefs.prop\" — not patching; "
+               "in-game settings will not persist");
+        return;
+    }
+
+    const uint32_t want = (uint32_t)((uintptr_t)k_prefs_path - (fn + 0x20));
+    kuKernelCpuUnrestrictedMemcpy((void *)pool, &want, sizeof(want));
+    kuKernelFlushCaches((void *)pool, sizeof(want));
+
+    const uintptr_t now = (fn + 0x20) + (uintptr_t)*pool;
+    l_info("PREFSPATH: GameEngine::SavePrefs now writes '%s' (was 'prefs.prop') — "
+           "in-game settings persist", (const char *)now);
 }
 
 static void patch_chore_full_update_path(void) {
@@ -3309,6 +3395,7 @@ static void patch_engine_diag_hooks(void) {
     force_native_render_dimensions("patch");
     force_animation_runtime_flags("patch");
     patch_chore_full_update_path();
+    patch_saveprefs_path();
 
     /* Production hook: this is where the engine's 0.1s frame-delta clamp gets
      * repaired (see the governor above). It is called once per frame from the
