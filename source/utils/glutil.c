@@ -3549,6 +3549,53 @@ void glTexImage2D_soloader(GLenum target, GLint level, GLint internalformat,
         * Tunable via graphics.txt `downsample_min` (512 = save more, 4096 = halve
         * nothing). Read once and cached, not per upload. */
     if (dsamp_min_dim < 0) dsamp_min_dim = mcsm_cfg()->downsample_min;
+    int dsamp_min_dim_effective = dsamp_min_dim;
+
+    /* ★ VRAM-PRESSURE DOWNSAMPLE (2026-08-06) — the freeze fix that costs nothing
+     * until it is needed.
+     *
+     * A device log captured the hang directly: frames stuck, presents stopped,
+     * engine and input piling up behind a render thread that could not advance,
+     * with the vitaGL pools down from 79989KB/37927KB free to a MINIMUM of 277KB
+     * VRAM and 1762KB RAM. Both exhausted. This libvitaGL is built NO_DEBUG, so a
+     * failed allocation has no error path -- it simply never completes, and the
+     * whole game stops.
+     *
+     * Lowering `downsample_min` globally does prevent it, but it is a permanent
+     * visual cost paid in every scene to survive the few that run the pool dry --
+     * which is why that default was put back to 2048.
+     *
+     * So make it conditional on the thing that actually matters. Below the low
+     * mark, halve anything from 512 up; below the critical mark, halve everything
+     * that can be halved. Normal scenes never reach either and are byte-identical
+     * to before. The alternative in a scene that does reach them is not sharper
+     * textures, it is a hang. */
+    {
+        const unsigned free_vram_kb = (unsigned)(vglMemFree(VGL_MEM_VRAM) / 1024u);
+        const unsigned free_ram_kb  = (unsigned)(vglMemFree(VGL_MEM_RAM) / 1024u);
+        /* Both pools matter: textures spill from VRAM into the RAM pool, so the
+         * session that froze had drained VRAM first and then RAM. */
+        const unsigned worst_kb = (free_vram_kb < free_ram_kb) ? free_vram_kb : free_ram_kb;
+        int pressure_min = 0;
+        if (worst_kb < 4096u)       pressure_min = 256;   /* critical: halve nearly all */
+        else if (worst_kb < 16384u) pressure_min = 512;   /* low: halve the large ones  */
+
+        if (pressure_min && pressure_min < dsamp_min_dim) {
+            static unsigned s_pressure_logged = 0;
+            static int s_last_min = 0;
+            if (pressure_min != s_last_min && s_pressure_logged++ < 24U) {
+                s_last_min = pressure_min;
+                l_warn("VRAMPRESS: %uKB VRAM / %uKB RAM free — downsampling textures "
+                       ">=%dpx this upload (normally >=%d) to avoid exhausting the "
+                       "pools; this is what prevents the render thread hanging",
+                       free_vram_kb, free_ram_kb, pressure_min, dsamp_min_dim);
+            }
+            dsamp_min_dim_effective = pressure_min;
+        } else {
+            dsamp_min_dim_effective = dsamp_min_dim;
+        }
+    }
+
     uint8_t *downsampled = NULL;
     /* RENDER-TARGET-SAFE downsample (2026-07-16): ONLY halve textures that arrive
      * WITH pixel data. Textures allocated data==NULL are render-targets / FBO
@@ -3557,7 +3604,7 @@ void glTexImage2D_soloader(GLenum target, GLint level, GLint internalformat,
      * full size corrupts CDRAM (black menu / GPUCRASH). Requiring upload_pixels
      * makes the 512 threshold SAFE. */
     if (level == 0 && upload_pixels &&
-        width >= dsamp_min_dim && height >= dsamp_min_dim &&
+        width >= dsamp_min_dim_effective && height >= dsamp_min_dim_effective &&
         upload_type == GL_UNSIGNED_BYTE && upload_format == GL_RGBA) {
         downsampled = downsample_rgba8888_2x((const uint8_t *)upload_pixels, width, height);
         if (downsampled) {

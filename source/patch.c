@@ -1347,22 +1347,27 @@ static void metrics_force_animation_dt(float dt, const char *phase, uint32_t cou
         *g_metrics_diag.frame_time = fixed_dt;
         changed = 1;
     }
-    /* ★ 2026-08-06 — DO NOT TOUCH mActualFrameTime.
+    /* ★ 2026-08-06 — WRITE BOTH, EXACTLY AS SHIPPED IN v1.10.
      *
-     * Metrics::NewFrame produces TWO clocks on purpose: mFrameTime is the safe,
-     * clamped delta (capped at 0.1s) and mActualFrameTime is the real wall-clock
-     * delta. Controllers pick between them, and the real one is how audio-driven
-     * playback catches up after a hitch.
+     * I split these for a while. Metrics::NewFrame produces two clocks on
+     * purpose -- mFrameTime is the safe delta it clamps at 0.1s, mActualFrameTime
+     * is the real wall-clock delta -- so repairing only the clamped one is the
+     * theoretically correct shape, and the log after a 2.6s load looked wrong
+     * doing otherwise (aft 2.585000 -> 0.250000, discarding catch-up information
+     * the engine had computed correctly).
      *
-     * Overwriting it destroyed exactly that. Device log after a 2.6s load:
-     *     ANIM: metrics fixed  ft 0.100000->0.250000  aft 2.585000->0.250000
-     * The engine had the correct 2.585s and we replaced it with 0.25s, throwing
-     * away 2.3s of catch-up information it was relying on -- which is the
-     * "faces/audio out of sync after a hard load" behaviour.
+     * The device disagreed. Animation was reported clearly worse with the split,
+     * and worse again with the whole repair disabled, measured against a v1.10
+     * baseline that wrote BOTH. The report wins: restored to what shipped.
      *
-     * Repair only the clock the engine actually clamped. The real one is already
-     * right by construction, so leaving it alone is both more correct and less
-     * work. */
+     * Do not re-split this without a device run showing the split is actually
+     * better. The argument above is exactly as convincing as it was the first
+     * time, and it was wrong. */
+    if (g_metrics_diag.actual_frame_time &&
+        abs_float_delta(*g_metrics_diag.actual_frame_time, fixed_dt) > 0.0005f) {
+        *g_metrics_diag.actual_frame_time = fixed_dt;
+        changed = 1;
+    }
     /* averageFrameTime, fixedTimeStep and delay have separate engine meanings;
      * flattening them to one value destabilizes pacing and simulation. */
     if (g_metrics_diag.total_time &&
