@@ -2038,6 +2038,103 @@ void mcsm_skin_report(void) {
  *
  * Both instruction encodings and the current string are verified before the
  * store, so a different engine build simply skips the patch. */
+/* ★ 2026-08-06 — WHY NO PROPERTY SET EVER SAVES, AND THE REPAIR.
+ *
+ * Device evidence, consistent across two sessions: .bundle and .estore saves
+ * write fine, while prefs.prop / user.prop / choice.prop produce NO file I/O at
+ * all, in either direction. Not a path problem (the redirects apply correctly
+ * before the engine sees them), not permissions (Temp is demonstrably writable --
+ * the bundles land there), and not the filename (rewriting it changed nothing).
+ *
+ * The save bails before touching a file:
+ *     Symbol(name); ResourceFinder::LocateResource(symbol)
+ *     cmp r0,#0 ; beq <exit>                          (0x00cb0844)
+ * LocateResource (0xb642c0) asks the master locator for the resource's LOGICAL
+ * LOCATION and returns NULL when the name has none. A name with no location is
+ * unsaveable, silently.
+ *
+ * ResourceFinder keeps a DEFAULT location for exactly this case:
+ *     GetDefaultLocation()  0xb643f0   returns Ptr<ResourceConcreteLocation>
+ *     SetDefaultLocation()  0xb643b4   stores one, no refcounting -- it derefs
+ *                                      the Ptr and stores the raw pointer
+ *     InitializeTemp()      0xb63d70   registers <Temp>
+ *     InitializeUser()      0xb63eac   registers <User>
+ * On Android <User> is a real per-app directory. On this port it does not exist,
+ * so if the default location is left NULL then every unqualified property-set
+ * name fails to locate and every such save is dropped.
+ *
+ * The repair: capture the CONCRETE location the engine hands to InitializeTemp --
+ * known-good and known-writable, because that is where the bundles successfully
+ * land -- and, only if the default is currently NULL, make it the default. That is
+ * a single pointer store into a global the engine already owns: no allocation, no
+ * double registration, and no refcount hazard (SetDefaultLocation does not addref).
+ * If InitializeTemp is never called, or the default is already valid, this does
+ * nothing at all. */
+static so_hook g_hook_rf_init_temp;
+static void *g_temp_concrete_loc = NULL;
+
+typedef void (*RfSetDefaultLocFn)(void *ptr_to_ptr);
+typedef void (*RfGetDefaultLocFn)(void *out_ptr);
+
+static void hook_rf_initialize_temp(void *ptr_to_ptr) {
+    /* Both Initialize functions take r0 = POINTER to the by-value Ptr<>, which is
+     * a single word; deref it for the raw ResourceConcreteLocation pointer. */
+    if (ptr_to_ptr) {
+        g_temp_concrete_loc = *(void **)ptr_to_ptr;
+    }
+    SO_CONTINUE_VOID(g_hook_rf_init_temp, ptr_to_ptr);
+
+    static int repaired = 0;
+    if (repaired || !g_temp_concrete_loc) {
+        l_info("RESLOC: InitializeTemp(concrete=%p) — no repair attempted",
+               g_temp_concrete_loc);
+        return;
+    }
+    repaired = 1;
+
+    RfGetDefaultLocFn get_def = (RfGetDefaultLocFn)so_symbol(&so_mod_gameengine,
+        "_ZN14ResourceFinder18GetDefaultLocationEv");
+    RfSetDefaultLocFn set_def = (RfSetDefaultLocFn)so_symbol(&so_mod_gameengine,
+        "_ZN14ResourceFinder18SetDefaultLocationE3PtrI24ResourceConcreteLocationE");
+    if (!get_def || !set_def) {
+        l_warn("RESLOC: ResourceFinder Get/SetDefaultLocation not found — "
+               "property-set saves will keep failing");
+        return;
+    }
+
+    void *current = NULL;
+    get_def(&current);                       /* sret: writes one word */
+    l_info("RESLOC: InitializeTemp(concrete=%p) default_location=%p",
+           g_temp_concrete_loc, current);
+
+    if (current) {
+        l_info("RESLOC: default location already set — leaving it alone");
+        return;
+    }
+
+    void *want = g_temp_concrete_loc;
+    set_def(&want);
+
+    void *after = NULL;
+    get_def(&after);
+    if (after == g_temp_concrete_loc) {
+        l_info("RESLOC: ★ default location was NULL, now points at <Temp>'s concrete "
+               "location (%p) — unqualified property sets (prefs.prop / user.prop / "
+               "choice.prop) can now locate, which is what SavePrefs requires", after);
+    } else {
+        l_warn("RESLOC: SetDefaultLocation did not take (now %p, wanted %p)",
+               after, g_temp_concrete_loc);
+    }
+}
+
+static void patch_resource_default_location(void) {
+    (void)hook_symbol_checked(&so_mod_gameengine,
+                              "_ZN14ResourceFinder14InitializeTempE3PtrI24ResourceConcreteLocationE",
+                              "ResourceFinder::InitializeTemp",
+                              (uintptr_t)&hook_rf_initialize_temp,
+                              &g_hook_rf_init_temp);
+}
+
 static void patch_saveprefs_path(void) {
     static int applied = 0;
     if (applied) return;
@@ -3486,6 +3583,7 @@ static void patch_engine_diag_hooks(void) {
     force_native_render_dimensions("patch");
     force_animation_runtime_flags("patch");
     patch_chore_full_update_path();
+    patch_resource_default_location();
     patch_saveprefs_path();
 
     /* ★ OFF BY DEFAULT — THE ENGINE OWNS ITS ANIMATION CLOCKS.
