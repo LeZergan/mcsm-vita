@@ -1438,6 +1438,8 @@ static void force_animation_runtime_flags(const char *phase) {
     }
 
     resolve_animation_runtime_flags();
+    /* Function scope so the diagnostic below can print what was ACTUALLY applied. */
+    static int s_nonskel = -1;
     const int recursive_full = mcsm_anim_full();
     const int recursive_value =
         g_fix_recursive_animation_contribution ? (int)*g_fix_recursive_animation_contribution : -1;
@@ -1453,7 +1455,6 @@ static void force_animation_runtime_flags(const char *phase) {
      * collapses with more. Make it settable so its real cost can be measured
      * rather than assumed: anim_nonskel.txt = 0 disables it. */
     if (g_set_chore_filter_includes_non_skeleton && refresh) {
-        static int s_nonskel = -1;
         if (s_nonskel < 0) {
             /* Default follows the profile rather than being hardcoded on.
              * Including non-skeleton chores means MORE entries in a walk that is
@@ -1485,9 +1486,14 @@ static void force_animation_runtime_flags(const char *phase) {
 
     count++;
     if (count <= 8U || (count & 0x1ffU) == 0U) {
-        l_info("ANIM: forced runtime flags #%u phase=%s nonSkeleton=1 recursive=%d value=%u",
+        /* ☠ nonSkeleton was a LITERAL "1" in this format string, so the line
+         * reported the chore filter as enabled even when anim_nonskel had turned
+         * it off. A diagnostic that states a value it never read is worse than no
+         * diagnostic -- this project reads these logs to decide what is broken. */
+        l_info("ANIM: forced runtime flags #%u phase=%s nonSkeleton=%d recursive=%d value=%u",
                count,
                phase ? phase : "?",
+               s_nonskel,
                recursive_full,
                g_fix_recursive_animation_contribution ? (unsigned)*g_fix_recursive_animation_contribution : 0U);
     }

@@ -165,14 +165,23 @@ typedef struct {
                                * chain and PERF_FINDINGS_2026-07-30.md.        */
     int  anim_engine_flags;   /* 1 = override GameEngine's own animation-correctness
                                * flags (SetFixRecursiveAnimationContribution and the
-                               * non-skeleton chore filter). 0 = LEAVE THE ENGINE ALONE,
-                               * the default.
-                               * ☠ Forcing these caused character heads to detach from
-                               * bodies intermittently: recursive bone contribution is
-                               * how a head inherits its neck, and the loader was
-                               * stomping that global from another thread while the
-                               * engine's animation update read it. Never measured to
-                               * help. Kept only so the experiment is repeatable.   */
+                               * non-skeleton chore filter). ★ DEFAULT IS 1, AND IT
+                               * MUST STAY THAT WAY.
+                               *
+                               * ☠ THIS COMMENT USED TO SAY THE OPPOSITE -- that the
+                               * default was 0 and that forcing these detached heads
+                               * from bodies. Both halves were wrong, and the code has
+                               * defaulted to 1 since 2026-08-01. Anyone editing
+                               * graphics.txt from the old text would set it to `off`
+                               * and break their own skeletal animation.
+                               *
+                               * The device test: defaulting these OFF made animation
+                               * dramatically WORSE, not better. The engine's own
+                               * default leaves recursive bone contribution off, and
+                               * forcing it on is the thing holding skeletons
+                               * together. `anim_engine_flags = off` still exists,
+                               * but only to reproduce the broken state for
+                               * comparison -- it is NOT a performance setting.     */
     int  nearest_filter;      /* 1 = sample the COMPRESSED world atlas with GL_NEAREST.
                                * Minecraft tile art bilinearly interpolated across atlas
                                * edges shows bright/white seams between blocks (a BASE
