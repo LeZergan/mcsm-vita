@@ -2104,6 +2104,17 @@ static void repair_resource_locations(void) {
     if (done) return;
     done = 1;
 
+    /* ☠ OPT-IN. This applied cleanly on device -- the log shows the default
+     * location going from NULL to <Temp>'s concrete location -- and settings STILL
+     * did not save. So it has no demonstrated benefit, while it changes where every
+     * unqualified resource in the game resolves. That is far too broad a change to
+     * impose on everyone for nothing. `resloc_repair = on` in graphics.txt. */
+    if (!mcsm_cfg()->resloc_repair) {
+        l_info("RESLOC: repair disabled (resloc_repair=off) — the engine's own "
+               "resource locations are left exactly as it set them");
+        return;
+    }
+
     if (!g_temp_concrete_loc) {
         l_warn("RESLOC: <Temp> concrete location never seen — cannot repair "
                "resource locations; property-set saves will keep failing silently");

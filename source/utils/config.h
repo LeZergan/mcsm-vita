@@ -250,6 +250,14 @@ typedef struct {
                                * ResourceFinder::LocateResource() == NULL (0x00cb0844)
                                * before any I/O, so the name it would have used is
                                * irrelevant. Kept only to reproduce the experiment.   */
+    int  resloc_repair;       /* ☠ UNVERIFIED, DEFAULT 0. Sets ResourceFinder's
+                               * default location to <Temp>'s concrete location when
+                               * the engine left it NULL. It applied cleanly on device
+                               * and settings STILL did not save, so it has no proven
+                               * benefit -- and it changes where EVERY unqualified
+                               * resource resolves, which is too broad a change to
+                               * impose for nothing. Kept because the disassembly and
+                               * the RESLOC log lines are worth having.             */
     int  sim_probes;          /* 1 = install the Scene::UpdateScenes /
                                * ScriptManager::Update / ChoreInst::UpdateChoreInstances
                                * timing probes (logging builds only; they need the
