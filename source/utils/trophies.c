@@ -129,6 +129,32 @@ static McsmTrophyUnlockState g_unlocked;
  * dialog. Long enough that a user reading the dialog is never cut short, short
  * enough that a dialog which never completes cannot silently disable trophies. */
 #define TROPHY_SETUP_WAIT_MAX_MS (60u * 1000u)
+
+/* ★ 2026-08-06 — THE ERROR THAT PROVES THE SET IS NOT REGISTERED.
+ *
+ * Device log (r147, 17-minute session):
+ *     TROPHY: unlock-state probe says not present (rc=0x80551612 count=0)
+ *     TROPHY: set already installed (ur0:.../MCSM00001_00 exists) — skipping setup
+ *     TROPHY: unlock id=6 FAILED rc=0x80551612
+ *
+ * The comment above the directory check argues the probe is untrustworthy because
+ * it returns this same code on a system where the set IS fully registered, so the
+ * presence of `conf/<COMMID>_00` was made a second way to answer "already there".
+ * On this device that reasoning inverts the truth: the folder exists, setup is
+ * skipped, and then the ACTUAL UNLOCK fails with the very same code. A stale conf
+ * folder with no matching registration in the system store is exactly the state
+ * [[mcsm-trophy-reset-method]] describes after a failed trophy reset.
+ *
+ * A failed probe is ambiguous and a present folder is ambiguous, but a failed
+ * UNLOCK is not: if the system refuses to record a trophy, the set is not usable,
+ * whatever the filesystem says. So treat that specific failure as the trigger to
+ * run setup once and retry, instead of failing silently for the whole session --
+ * which is the "achievements do not pop at all" report. */
+#define TROPHY_ERR_NOT_REGISTERED 0x80551612u
+/* One automatic recovery per launch. If setup runs and the unlock still fails,
+ * something else is wrong (no NoTrpDrm, corrupt store) and retrying forever would
+ * just reopen the dialog on a loop. */
+#define TROPHY_SETUP_RECOVERY_MAX 1u
 static SceUID g_req_sema = -1;
 static SceUID g_queue_mutex = -1;
 static uint8_t g_queue[TROPHY_QUEUE_CAP];
@@ -137,6 +163,13 @@ static unsigned g_queue_tail = 0;
 static unsigned g_queue_count = 0;
 static atomic_uint_least32_t g_queued_bits[4];
 static atomic_uint_least32_t g_deferred_bits[4];
+
+/* Set by the worker when an unlock proves the set is not registered; consumed on
+ * the GL thread by mcsm_trophies_setup_poll(), which is where a common dialog can
+ * safely be opened and pumped. */
+static atomic_int g_setup_request = ATOMIC_VAR_INIT(0);
+static unsigned g_setup_recoveries = 0;
+static char g_setup_marker_path[128];
 
 /* name -> id map, loaded once from ux0:data/mcsm/settings/trophies.txt */
 #define TROPHY_MAP_MAX 128
@@ -234,7 +267,34 @@ static int trophy_worker(SceSize args, void *argp) {
         int platinum = -1;
         if (sceNpTrophyCreateHandle(&handle) >= 0) {
             const int rc = sceNpTrophyUnlockTrophy(g_ctx, handle, id, &platinum);
-            if (rc < 0) l_warn("TROPHY: unlock id=%d FAILED rc=0x%08X", id, (unsigned)rc);
+            if (rc < 0) {
+                l_warn("TROPHY: unlock id=%d FAILED rc=0x%08X", id, (unsigned)rc);
+                if ((unsigned)rc == TROPHY_ERR_NOT_REGISTERED &&
+                    g_setup_recoveries < TROPHY_SETUP_RECOVERY_MAX) {
+                    /* The set is not actually registered, whatever the conf folder
+                     * said at init. Ask the GL thread to run setup, and put this id
+                     * back so it is retried once the dialog completes -- otherwise
+                     * the story beat that earned it never fires again this session. */
+                    g_setup_recoveries++;
+                    atomic_fetch_or_explicit(&g_deferred_bits[id >> 5],
+                                             1u << (id & 31), memory_order_release);
+                    atomic_store_explicit(&g_setup_request, 1, memory_order_release);
+                    l_warn("TROPHY: set is not registered — requesting setup dialog, "
+                           "id=%d requeued for retry", id);
+                    sceNpTrophyDestroyHandle(handle);
+                    /* Wait for the GL thread to actually pick the request up before
+                     * re-arming, or the retry would be dequeued and fail again while
+                     * g_setup_pending is still 0 and the one recovery is spent. */
+                    for (unsigned waited = 0;
+                         atomic_load_explicit(&g_setup_request, memory_order_acquire) &&
+                         waited < 5000u;
+                         waited += 50u) {
+                        sceKernelDelayThread(50u * 1000u);
+                    }
+                    sceKernelSignalSema(g_req_sema, 1);
+                    continue;   /* keep the queued bit: the retry is already pending */
+                }
+            }
             else {
                 __atomic_fetch_or(&g_unlocked.bits[id >> 5],
                                   1u << (id & 31), __ATOMIC_RELEASE);
@@ -319,10 +379,39 @@ int mcsm_trophies_setup_active(void) {
 #endif
 }
 
+/* Open the registration dialog. Must run on the GL thread: a common dialog only
+ * advances while frames are presented, and gl_swap is what pumps it. */
+static int trophy_open_setup_dialog(const char *why) {
+    McsmTrophySetupParam setup;
+    sceClibMemset(&setup, 0, sizeof(setup));
+    _sceCommonDialogSetMagicNumber(&setup.commonParam);
+    setup.sdkVersion = PSP2_SDK_VERSION;
+    setup.options = 0;
+    setup.context = g_ctx;
+    const int drc = sceNpTrophySetupDialogInit(&setup);
+    if (drc >= 0) {
+        if (g_setup_marker_path[0]) remember_marker_path(g_setup_marker_path);
+        atomic_store_explicit(&g_setup_pending, 1, memory_order_release);
+        l_info("TROPHY: setup dialog opened (%s), running alongside the game", why);
+        return 1;
+    }
+    l_warn("TROPHY: setup dialog would not open (rc=0x%08X, %s) — trophies stay "
+           "unavailable this session; next boot retries", (unsigned)drc, why);
+    return 0;
+}
+
 int mcsm_trophies_setup_poll(void) {
 #if !MCSM_HAVE_TROPHY_PACK
     return 0;
 #else
+    /* Recovery path: the worker proved the set is unregistered by having an unlock
+     * rejected. Open the dialog here, where it can actually be pumped. */
+    if (atomic_exchange_explicit(&g_setup_request, 0, memory_order_acq_rel)) {
+        if (!atomic_load_explicit(&g_setup_pending, memory_order_acquire)) {
+            (void)trophy_open_setup_dialog("unlock reported set not registered");
+        }
+    }
+
     if (!atomic_load_explicit(&g_setup_pending, memory_order_acquire)) return 0;
     const SceCommonDialogStatus st = sceNpTrophySetupDialogGetStatus();
     if (st == SCE_COMMON_DIALOG_STATUS_RUNNING) return 1;
@@ -497,8 +586,10 @@ int mcsm_trophies_init(void) {
         l_info("TROPHY: set already installed (%s exists) — skipping setup", trophy_dir);
     }
 
-    char marker[128];
-    sceClibSnprintf(marker, sizeof(marker), DATA_PATH "trophy_registered_%s.txt", g_comm_id);
+    /* Published so the recovery path can open the dialog later with the same
+     * marker path, without recomputing it off a stack buffer that is long gone. */
+    sceClibSnprintf(g_setup_marker_path, sizeof(g_setup_marker_path),
+                    DATA_PATH "trophy_registered_%s.txt", g_comm_id);
 
     if (!registered) {
         /* ★★ START THE DIALOG, DO NOT SIT ON IT (2026-08-01).
@@ -512,21 +603,7 @@ int mcsm_trophies_init(void) {
          * the dialog composites over it, and mcsm_trophies_setup_poll() finishes the job
          * when the system says it is done. No stall, and no arbitrary frame budget that
          * can expire mid-registration. */
-        McsmTrophySetupParam setup;
-        sceClibMemset(&setup, 0, sizeof(setup));
-        _sceCommonDialogSetMagicNumber(&setup.commonParam);
-        setup.sdkVersion = PSP2_SDK_VERSION;
-        setup.options = 0;
-        setup.context = g_ctx;
-        const int drc = sceNpTrophySetupDialogInit(&setup);
-        if (drc >= 0) {
-            remember_marker_path(marker);
-            atomic_store_explicit(&g_setup_pending, 1, memory_order_release);
-            l_info("TROPHY: first boot — setup dialog opened, running alongside the load");
-        } else {
-            l_warn("TROPHY: setup dialog would not open (rc=0x%08X) — trophies will be "
-                   "unavailable this session; next boot retries", (unsigned)drc);
-        }
+        (void)trophy_open_setup_dialog("not registered at boot");
     }
 
     l_info("TROPHY: context ready (commId=%s, %u trophies in pack, %s)",

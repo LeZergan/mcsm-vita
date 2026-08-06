@@ -46,6 +46,9 @@ const GLubyte *glGetString_soloader(GLenum name);
 
 void glActiveTexture_soloader(GLenum texture);
 void glBindTexture_soloader(GLenum target, GLuint texture);
+/* Clears the loader's per-texture-NAME state (POT / wrap intent / downsample
+ * mark) before the real delete, so a recycled GL id cannot inherit it. */
+void glDeleteTextures_soloader(GLsizei n, const GLuint *textures);
 /* Wraps glDeleteBuffers ONLY to invalidate the loader's per-buffer size cache before
  * the name is recycled by GL. See mcsm_vb_forget_gl_buffer() in patch.c. */
 void glDeleteBuffers_soloader(GLsizei n, const GLuint *buffers);

@@ -2920,20 +2920,34 @@ static GLuint gl_currently_bound_texture_2d(void) {
  * textures, which GXM needs. Power-of-two textures tile fine on GXM, so let
  * them keep GL_REPEAT — otherwise every tiling world surface in gameplay gets
  * stretched/garbled. */
+/* ★ 2026-08-06 — TRACK S AND T SEPARATELY (bit 0 = S, bit 1 = T).
+ *
+ * This used to be one flag per texture, set by EITHER axis and cleared by
+ * EITHER axis, while force_complete_filter_ex re-forced REPEAT on BOTH. So a
+ * texture the engine set up as WRAP_S=REPEAT + WRAP_T=CLAMP_TO_EDGE -- the
+ * normal setup for a strip/atlas that tiles horizontally only -- ended up with
+ * REPEAT on T as well, and the final state depended on which axis the engine
+ * happened to set last. Wrapping an atlas on an axis it never asked to wrap
+ * samples the neighbouring cell at the seam, which is the dark line along cell
+ * boundaries and the smeared/tiled look on character art. */
+#define TEX_WANT_REPEAT_S 0x1u
+#define TEX_WANT_REPEAT_T 0x2u
+
 static GLint clamp_repeat_wrap(GLenum pname, GLint param) {
     if (pname == 0x2802 /*WRAP_S*/ || pname == 0x2803 /*WRAP_T*/) {
+        const uint8_t axis = (pname == 0x2802) ? TEX_WANT_REPEAT_S : TEX_WANT_REPEAT_T;
         GLuint wid = gl_currently_bound_texture_2d();
         if (param == 0x2901 /*GL_REPEAT*/) {
-            if (wid && wid < GL_TEX_POT_CAP) g_tex_want_repeat[wid] = 1u;
+            if (wid && wid < GL_TEX_POT_CAP) g_tex_want_repeat[wid] |= axis;
             if (gl_tex_is_known_pot(wid)) {
                 return param; /* POT: tiling is safe, keep REPEAT */
             }
             return 0x812F; /*GL_CLAMP_TO_EDGE*/
         }
-        /* Engine explicitly set a NON-REPEAT wrap (e.g. CLAMP_TO_EDGE): clear the
-         * "wants repeat" flag so force_complete_filter's elongation-fix does NOT
-         * later re-force REPEAT and override the engine's explicit CLAMP. */
-        if (wid && wid < GL_TEX_POT_CAP) g_tex_want_repeat[wid] = 0u;
+        /* Engine explicitly set a NON-REPEAT wrap (e.g. CLAMP_TO_EDGE) on THIS
+         * axis: clear only this axis, so force_complete_filter's elongation fix
+         * cannot later re-force REPEAT over the engine's explicit CLAMP. */
+        if (wid && wid < GL_TEX_POT_CAP) g_tex_want_repeat[wid] &= (uint8_t)~axis;
     }
     return param;
 }
@@ -3026,8 +3040,22 @@ static inline void force_complete_filter_ex(GLenum target, int allow_nearest) {
      * upload (POT unknown then -> clamp_repeat_wrap forced CLAMP = stretched
      * tiling), restore REPEAT now that the upload has proved the texture POT. */
     if (bt && bt < GL_TEX_POT_CAP && g_tex_want_repeat[bt] && g_tex_pot[bt] == 1u) {
-        glTexParameteri(target, 0x2802 /*WRAP_S*/, 0x2901 /*GL_REPEAT*/);
-        glTexParameteri(target, 0x2803 /*WRAP_T*/, 0x2901 /*GL_REPEAT*/);
+        /* Restore REPEAT only on the axes the engine actually asked to tile. */
+        if (g_tex_want_repeat[bt] & TEX_WANT_REPEAT_S)
+            glTexParameteri(target, 0x2802 /*WRAP_S*/, 0x2901 /*GL_REPEAT*/);
+        if (g_tex_want_repeat[bt] & TEX_WANT_REPEAT_T)
+            glTexParameteri(target, 0x2803 /*WRAP_T*/, 0x2901 /*GL_REPEAT*/);
+#ifdef DEBUG_SOLOADER
+        static unsigned s_repeat_logged = 0;
+        if (s_repeat_logged < 24U) {
+            s_repeat_logged++;
+            l_info("TEXWRAP: re-forced REPEAT tex=%u axes=%s%s (POT) — if character or "
+                   "face art appears tiled/seamed, this is the texture to suspect",
+                   (unsigned)bt,
+                   (g_tex_want_repeat[bt] & TEX_WANT_REPEAT_S) ? "S" : "",
+                   (g_tex_want_repeat[bt] & TEX_WANT_REPEAT_T) ? "T" : "");
+        }
+#endif
     }
     (void)drain_gl_errors_limited();
 }
@@ -3190,12 +3218,61 @@ static int dsamp_is(GLuint id) {
  * early-return since 2026-07-29 and the other call is in the PVR branch -- hence
  * MCSM_DIAG_HELPER. It is defined rather than deleted so the PVR backend links
  * and so re-enabling reclaim does not silently reintroduce stale name state. */
-MCSM_DIAG_HELPER static void texture_name_forget(GLuint id) {
+static void texture_name_forget(GLuint id) {
     if (!id || id >= GL_TEX_POT_CAP) return;
     g_tex_pot[id] = 0u;
     g_tex_want_repeat[id] = 0u;
     g_tex_dsamp[id] = 0u;
     texlru_forget(id);
+}
+
+/* ★ 2026-08-06 — THE MISSING glDeleteTextures WRAPPER.
+ *
+ * dynlib.c bound "glDeleteTextures" straight to vitaGL, so the loader never
+ * learned that a texture name had been freed. Three per-NAME tables are indexed
+ * by the GL id and were therefore never cleared:
+ *
+ *   g_tex_pot[id]          - is this texture power-of-two
+ *   g_tex_want_repeat[id]  - the engine asked for WRAP=REPEAT on it
+ *   g_tex_dsamp[id]        - its level 0 was downsampled, so glTexSubImage2D
+ *                            must halve incoming sub-rectangles
+ *
+ * GL recycles names aggressively: the id freed by one texture is handed straight
+ * back by the next glGenTextures. The new texture then inherits the previous
+ * one's flags. The damaging one is want_repeat, because force_complete_filter_ex
+ * re-forces GL_REPEAT on both axes after an upload whenever
+ * `g_tex_want_repeat[id] && g_tex_pot[id] == 1`. A character/face ATLAS that
+ * lands on a name previously used by a tiling world texture is therefore given
+ * REPEAT: UVs at the atlas cell edges wrap onto the neighbouring cell, which
+ * tiles parts of the sheet across the model and puts dark seams along every cell
+ * boundary. That is the repeated-props-smeared-over-a-character screenshot, and
+ * the "black lines on faces when zoomed out" report -- and it gets worse with
+ * more NPCs on screen, because more texture churn means more name recycling.
+ *
+ * A stale g_tex_dsamp is the second hazard the tables' own comment warns about:
+ * it makes glTexSubImage2D halve sub-data into full-resolution storage.
+ *
+ * The reset function for exactly this already existed and was documented as
+ * being for "the public glDeleteTextures wrapper" -- the wrapper was simply
+ * never written. This is it. */
+void glDeleteTextures_soloader(GLsizei n, const GLuint *textures) {
+    if (textures && n > 0) {
+        for (GLsizei i = 0; i < n; ++i) {
+            texture_name_forget(textures[i]);
+        }
+#ifdef DEBUG_SOLOADER
+        static unsigned s_deleted = 0;
+        static unsigned s_logged = 0;
+        s_deleted += (unsigned)n;
+        if (s_logged < 16U || (s_logged % 256U) == 0U) {
+            s_logged++;
+            l_info("TEXNAME: glDeleteTextures n=%d first=%u (total freed=%u) — "
+                   "per-name POT/wrap/downsample state cleared",
+                   (int)n, textures[0], s_deleted);
+        }
+#endif
+    }
+    glDeleteTextures(n, textures);
 }
 
 /* ---- Depth-stencil render-target shim (2026-06-23) ------------------------

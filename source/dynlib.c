@@ -730,7 +730,7 @@ so_default_dynlib default_dynlib[] = {
         { "glDeleteRenderbuffersOES", (uintptr_t)&glDeleteRenderbuffers },
         { "glDeleteShader", (uintptr_t)&glDeleteShader },
         { "glDeleteSync", (uintptr_t)&glDeleteSync_soloader },
-        { "glDeleteTextures", (uintptr_t)&glDeleteTextures },
+        { "glDeleteTextures", (uintptr_t)&glDeleteTextures_soloader },
         { "glDeleteVertexArrays", (uintptr_t)&glDeleteVertexArrays },
         { "glDeleteVertexArraysOES", (uintptr_t)&glDeleteVertexArraysOES_soloader },
         { "glDepthFunc", (uintptr_t)&glDepthFunc },
