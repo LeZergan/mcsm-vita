@@ -2043,6 +2043,34 @@ static void patch_saveprefs_path(void) {
     if (applied) return;
     applied = 1;
 
+    /* ☠ DISPROVED ON DEVICE 2026-08-06, SAME DAY IT WAS WRITTEN. DEFAULT OFF.
+     *
+     * The patch applies cleanly -- the log confirms
+     *     PREFSPATH: GameEngine::SavePrefs now writes 'logical:<Temp>/prefs.prop'
+     * -- and prefs.prop STILL never appears in any file operation afterwards. The
+     * diagnosis behind it was incomplete.
+     *
+     * Disassembling the callee shows why. Before touching a file, the save does:
+     *     Symbol(name); ResourceFinder::LocateResource(symbol)
+     *     cmp r0,#0 ; beq <exit>            (0x00cb0844)
+     * It can only SAVE a property set it can first LOCATE as an already-registered
+     * resource. prefs.prop is not one, so the function returns before any I/O
+     * regardless of what the name string says. Rewriting the name cannot fix a
+     * lookup that fails because the resource does not exist.
+     *
+     * Worse, the two spellings are SEPARATE entries in the engine's resource-name
+     * map (the bare name and the "logical:<Temp>/name" qualified form), so swapping
+     * one for the other can only ever move which missing entry is asked for.
+     *
+     * Left in, off by default, because the disassembly is worth keeping and the
+     * switch makes it reproducible. Do NOT enable it expecting settings to persist:
+     * the real fix has to make the resource EXIST in the resource system (see
+     * luaResourceLocationInjectIntoResourceSystem @0x00c4ae08), which is a create/
+     * inject operation, not a string rewrite. */
+    if (!mcsm_cfg()->prefs_path_patch) {
+        return;
+    }
+
     /* Must stay resident for the life of the process: the engine re-reads this
      * literal on every SavePrefs call. */
     static const char k_prefs_path[] = "logical:<Temp>/prefs.prop";

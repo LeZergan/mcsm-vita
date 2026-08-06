@@ -244,6 +244,12 @@ typedef struct {
                                * every frame, and that has not been shown to make
                                * animation better on a real device. Off unless a
                                * measurement says otherwise.                        */
+    int  prefs_path_patch;    /* ☠ DISPROVED, DEFAULT 0. Rewrites the filename literal
+                               * GameEngine::SavePrefs builds. It applies, and settings
+                               * still do not persist: the save bails at
+                               * ResourceFinder::LocateResource() == NULL (0x00cb0844)
+                               * before any I/O, so the name it would have used is
+                               * irrelevant. Kept only to reproduce the experiment.   */
     int  sim_probes;          /* 1 = install the Scene::UpdateScenes /
                                * ScriptManager::Update / ChoreInst::UpdateChoreInstances
                                * timing probes (logging builds only; they need the
