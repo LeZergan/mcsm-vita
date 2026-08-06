@@ -1785,7 +1785,15 @@ void gl_swap() {
      * query only runs on the same throttled tick as the log above. */
     {
         static unsigned s_vram_warn_level = 0;   /* 0 none, 1 <16MB, 2 <4MB */
-        if ((s_swap_counter & 0x3ffU) == 0U) {
+        /* ★ 2026-08-06 — SAMPLED EVERY 64 SWAPS, WAS 1024.
+         * A device log that ended in this exact hang fired this warning EXACTLY
+         * ONCE, at frame 1024 with 4MB already gone, and the next sample would
+         * not have been due until frame 2048 -- roughly 51 seconds later at the
+         * 20fps those scenes actually run. The pools went from 80MB/38MB to
+         * 277KB/1762KB and froze in between two samples, so the one signal for
+         * this failure mode observed almost none of it. One vglMemFree per 64
+         * presents is nothing next to missing the event entirely. */
+        if ((s_swap_counter & 0x3fU) == 0U) {
             const unsigned free_kb = (unsigned)(vglMemFree(VGL_MEM_VRAM) / 1024u);
             unsigned level = (free_kb < 4096u) ? 2u : (free_kb < 16384u) ? 1u : 0u;
             if (level > s_vram_warn_level) {
@@ -3518,14 +3526,28 @@ void glTexImage2D_soloader(GLenum target, GLint level, GLint internalformat,
      * CDRAM (pool grown to ~48MB via ram_reserve_mb=48 to further cut black faces).
      * Only truly huge 2048²+ art (16MB each) is still halved. Tunable via
      * downsample_min.txt — set 1024 to restore old behavior if a scene regresses. */
-    static int dsamp_min_dim = -1;   /* RAISED back to 2048 (2026-07-17): the deep-dive
-        * proved heavy scenes are DRAW/geometry-bound (~900 draws/438k verts), NOT
-        * VRAM- or texture-bandwidth-bound — the log shows 35MB+ free VRAM and the RAM
-        * fallback pool essentially never used. So downsampling to 1024 was paying a
-        * REAL sharpness cost (blurry 3D) for ZERO fps gain. 2048 keeps all <=1024 art
-        * full-res and only halves truly huge 2048²+ textures. Now CACHED (read once,
-        * not fopen'd on every one of ~2900 uploads per scene load). Tunable via
-        * downsample_min.txt (512/1024=lower res, 4096=nothing halved). */
+    static int dsamp_min_dim = -1;   /* ★ DEFAULT LOWERED 2048 -> 1024 (2026-08-06).
+        *
+        * The 2048 default rested on one stated observation: "the log shows 35MB+ free
+        * VRAM and the RAM fallback pool essentially never used", from which it
+        * concluded heavy scenes are draw-bound rather than VRAM-bound and that
+        * downsampling bought nothing.
+        *
+        * A device log that ENDED IN A HANG falsifies both halves. Across that session
+        * the vitaGL pools ran from 80MB/38MB free down to a minimum of 277KB VRAM and
+        * 1762KB RAM -- the fallback pool was not "essentially never used", it was
+        * drained -- and the renderer then stopped advancing (frames stuck, presents
+        * stopped, engine and input piling up behind it). With this libvitaGL built
+        * NO_DEBUG there is no error path for a failed allocation, so exhaustion
+        * presents as a freeze rather than a message.
+        *
+        * At 2048 almost nothing is halved: MCSM art is mostly 512-1024, so the lever
+        * was effectively disabled. 1024 quarters the memory of every 1024-and-larger
+        * texture, which is where the VRAM actually goes. It costs sharpness on those
+        * textures; running out of texture memory costs the session.
+        *
+        * Tunable via graphics.txt `downsample_min` (512 = save more, 4096 = halve
+        * nothing). Read once and cached, not per upload. */
     if (dsamp_min_dim < 0) dsamp_min_dim = mcsm_cfg()->downsample_min;
     uint8_t *downsampled = NULL;
     /* RENDER-TARGET-SAFE downsample (2026-07-16): ONLY halve textures that arrive

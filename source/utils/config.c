@@ -113,7 +113,10 @@ static void apply_profile(McsmCfg *c, int prof) {
      * compatibility/diagnostic levers, not part of the quality presets. */
     c->mipmaps        = 0;      /* mipmaps.txt was opt-in            */
     c->mipmap_min     = 1024;   /* mipmap_min.txt default (VRAM-tight) */
-    c->downsample_min = 2048;   /* downsample_min.txt default        */
+    c->downsample_min = 1024;   /* was 2048; device log ended in a hang with the
+                                 * vitaGL pools at 277KB VRAM / 1762KB RAM. At 2048
+                                 * almost no MCSM art qualified, so the lever was
+                                 * effectively off. See glutil.c dsamp_min_dim. */
     c->vram_reserve   = 48;     /* vram_reserve.txt default (MB)     */
     c->gxm_tune       = 1;      /* no_gxm_tune.txt absent = tuned    */
     c->render_hooks   = 1;      /* no_render_hooks.txt absent = on   */
