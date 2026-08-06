@@ -926,16 +926,30 @@ static void force_native_render_dimensions(const char *phase) {
         before_gh != rh;
 #endif
 
-    if (g_render_gate_diag.device_width) {
+    /* ★ 2026-08-06 — CORRECT DRIFT, DO NOT REWRITE AGREEMENT.
+     *
+     * These four were stored unconditionally on every call. Device log over a
+     * 25-minute session: 480,909 calls, FIVE of which changed anything -- one at
+     * init, one 544x408->720x408, and three fixing a 3-pixel 720x405 drift the
+     * engine re-introduces. Everything else rewrote a value that already matched.
+     *
+     * That is not free. It runs 4-5 times per frame on the sim thread, and each
+     * store is a cross-thread write to an engine global the render thread reads --
+     * the same "stomping a global from another thread while the engine reads it"
+     * hazard the animation flags are documented for. Comparing first keeps every
+     * correction (there are several calls per frame, so real drift is still fixed
+     * within the same frame) while leaving the engine alone whenever it already
+     * agrees, which is essentially always. */
+    if (g_render_gate_diag.device_width && *g_render_gate_diag.device_width != rw) {
         *g_render_gate_diag.device_width = rw;
     }
-    if (g_render_gate_diag.device_height) {
+    if (g_render_gate_diag.device_height && *g_render_gate_diag.device_height != rh) {
         *g_render_gate_diag.device_height = rh;
     }
-    if (g_render_gate_diag.game_width) {
+    if (g_render_gate_diag.game_width && *g_render_gate_diag.game_width != rw) {
         *g_render_gate_diag.game_width = rw;
     }
-    if (g_render_gate_diag.game_height) {
+    if (g_render_gate_diag.game_height && *g_render_gate_diag.game_height != rh) {
         *g_render_gate_diag.game_height = rh;
     }
 
@@ -990,10 +1004,16 @@ static void force_application_active(const char *phase) {
     (void)phase;
 #endif
 
-    if (g_render_gate_diag.app_wait_for_messages) {
+    /* Same rule as force_native_render_dimensions: compare, then write only on a
+     * real mismatch. Device log: these changed EXACTLY ONCE in 25 minutes
+     * (`AppState force[loop-pre] wait=0->0 active=0->1`, at boot) -- nothing on
+     * this platform ever sets msbApplicationActive, so that one write matters and
+     * the force stays. Every other frame was rewriting values that already agreed,
+     * from the sim thread, into globals the engine reads elsewhere. */
+    if (g_render_gate_diag.app_wait_for_messages && *g_render_gate_diag.app_wait_for_messages != 0) {
         *g_render_gate_diag.app_wait_for_messages = 0;
     }
-    if (g_render_gate_diag.app_active) {
+    if (g_render_gate_diag.app_active && *g_render_gate_diag.app_active != 1) {
         *g_render_gate_diag.app_active = 1;
     }
 
