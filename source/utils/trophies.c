@@ -299,6 +299,16 @@ static int trophy_worker(SceSize args, void *argp) {
                 }
             }
             else {
+                /* ★ A SUCCESSFUL UNLOCK PROVES THE SET IS USABLE, so give the
+                 * recovery budget back. Without this the cap is one-per-session
+                 * outright: register once, and if the store is later rejected again
+                 * -- a suspend/resume, an account switch, the system dropping the
+                 * context -- every remaining achievement of that session is lost
+                 * silently, which is exactly the "most of them never unlock"
+                 * complaint. Resetting only on SUCCESS cannot loop: repeated
+                 * registration failures never reach here, so the cap still bites
+                 * when the set is genuinely broken. */
+                g_setup_recoveries = 0;
                 __atomic_fetch_or(&g_unlocked.bits[id >> 5],
                                   1u << (id & 31), __ATOMIC_RELEASE);
                 if (platinum >= 0 && platinum < 128)
@@ -649,12 +659,38 @@ int mcsm_trophies_already_unlocked(uint32_t id) {
 }
 
 void mcsm_trophies_unlock(uint32_t id) {
-    if (!g_available) return;
+    if (!g_available) {
+        /* ★ SAY IT ONCE. This was a bare `return`: with trophies unavailable --
+         * no pack, no NoTrpDrm, context creation refused -- EVERY achievement the
+         * game ever awards was dropped here in complete silence, and the log gave
+         * no hint at the point of loss. The init failure is logged far earlier, at
+         * boot, where it is easy to miss in a long capture. */
+        static int s_said = 0;
+        if (!s_said) {
+            s_said = 1;
+            l_warn("TROPHY: achievement id=%u DROPPED — the trophy backend is "
+                   "unavailable (see the TROPHY lines at boot). Every achievement "
+                   "this session will be lost the same way.", (unsigned)id);
+        }
+        return;
+    }
     if (id >= 128u) { l_warn("TROPHY: id %u out of range", (unsigned)id); return; }
     /* Local bitmap check first: this is what keeps a story beat that re-fires from
      * queueing a redundant blocking unlock every time it plays. The bitmap is seeded
      * at init from the SYSTEM's store, so trophies earned in past sessions count. */
-    if (mcsm_trophies_already_unlocked(id)) return;
+    if (mcsm_trophies_already_unlocked(id)) {
+        /* Normally correct and very common -- a story beat replays and the trophy is
+         * genuinely already held -- so it stays quiet after the first few. But it is
+         * ALSO the exact path that swallows an achievement if g_unlocked is ever
+         * populated wrongly (it is overwritten wholesale from
+         * sceNpTrophyGetTrophyUnlockState after a registration), and until now that
+         * case was indistinguishable from "nothing happened". */
+        static unsigned s_skipped = 0;
+        if (s_skipped++ < 24u)
+            l_info("TROPHY: id=%u already held per the system bitmap — not re-unlocking "
+                   "(skip #%u)", (unsigned)id, s_skipped);
+        return;
+    }
 
     const unsigned word = id >> 5;
     const uint32_t mask = 1u << (id & 31u);
