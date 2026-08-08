@@ -264,13 +264,6 @@ typedef struct {
                                * failing instruction is known (LocateResource == NULL
                                * at 0x00cb0844) and this registers the thing it looks
                                * for. Set to 0 if it misbehaves.                     */
-    int  trophy_recovery;     /* 1 = when an unlock is rejected with
-                               * SCE_NP_TROPHY not-registered, open the setup dialog
-                               * and retry. DEFAULT 0: it works (device-confirmed) but
-                               * fires every session here, opening a common dialog
-                               * mid-gameplay and refreshing the unlock bitmap from the
-                               * system each time -- neither of which happened before
-                               * it existed, and achievements regressed after it did. */
     int  sim_probes;          /* 1 = install the Scene::UpdateScenes /
                                * ScriptManager::Update / ChoreInst::UpdateChoreInstances
                                * timing probes (logging builds only; they need the
