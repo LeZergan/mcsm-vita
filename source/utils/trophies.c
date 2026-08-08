@@ -263,7 +263,18 @@ static int trophy_worker(SceSize args, void *argp) {
             const int rc = sceNpTrophyUnlockTrophy(g_ctx, handle, id, &platinum);
             if (rc < 0) {
                 l_warn("TROPHY: unlock id=%d FAILED rc=0x%08X", id, (unsigned)rc);
-                if ((unsigned)rc == TROPHY_ERR_NOT_REGISTERED &&
+                /* ☠ OPT-IN (2026-08-06). This recovery is MINE and it fires EVERY
+                 * session, because the unlock-state probe fails on this device every
+                 * boot -- so every playthrough now opens a trophy common dialog
+                 * mid-gameplay and then refreshes g_unlocked from the system. Neither
+                 * happened before I added it. Achievements are reported as having
+                 * worked before and as broken after, so the default is off and the
+                 * old behaviour is restored. `trophy_recovery = on` in graphics.txt
+                 * re-enables it (it does genuinely register an unregistered set --
+                 * device-confirmed -- it is just not worth the side effects unless
+                 * trophies are actually dead). */
+                if (mcsm_cfg()->trophy_recovery &&
+                    (unsigned)rc == TROPHY_ERR_NOT_REGISTERED &&
                     g_setup_recoveries < TROPHY_SETUP_RECOVERY_MAX) {
                     /* The set is not actually registered, whatever the conf folder
                      * said at init. Ask the GL thread to run setup, and put this id
