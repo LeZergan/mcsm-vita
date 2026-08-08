@@ -1,267 +1,142 @@
+> [!CAUTION]
+> ## 🤖 THIS IS AI SLOP — READ THIS FIRST 🤖
+> **This entire project is vibecoded slop made with [Claude 5](https://claude.ai/code) and ChatGPT 5.6 sol.**
+> The Vita loader, the Windows builder, and these docs were written by AI, not by a human engineer.
+> It is held together with hope. Expect bugs, freezes, and things that make no sense.
+> **Use it at your own risk.**
+
 # Minecraft: Story Mode — PS Vita
 
 Unofficial PS Vita loader for the Android PowerVR build of *Minecraft: Story Mode*.
 
 > [!WARNING]
-> **MCSM 1.10 is a public prerelease for testing.** Bugs, freezes, and performance problems are still possible. The release does not yet include a complete progcache, so new scenes will stutter while shaders compile. Replaying cached scenes should be smoother.
+> **1.10 is a public prerelease.** The shipped VPK is `MCSM-1.10-logging.vpk`, a **logging build** — it runs slower than normal, so don't judge performance on it. It writes `ux0:data/mcsm/loader.log` so problems can be traced instead of guessed at. See [Send a log](#send-a-log).
+>
+> The progcache is incomplete, so new scenes stutter while shaders compile.
 
-> [!IMPORTANT]
-> **The release VPK is currently `MCSM-1.10-logging.vpk`, a logging build.** It writes `ux0:data/mcsm/loader.log` so freezes and graphics faults can be traced from real evidence. It runs slower than a normal build — please do not judge performance on it. See [Send a log](#send-a-log-important-for-this-prerelease).
+[Download](../../releases/tag/v1.10) · [Report a problem](../../issues/new?template=bug-report.yml) · [Discord](https://discord.gg/EYYTxeXCq)
 
-[Download prerelease](../../releases/tag/v1.10) · [Report a game problem](../../issues/new?template=bug-report.yml) · [Join Discord](https://discord.gg/EYYTxeXCq)
-
-| Component | Current version |
+| | |
 | --- | --- |
 | Vita loader | MCSM 1.10 prerelease |
-| Windows data builder | v1.9 |
+| Data builder | v1.9 |
 | Supported Android set | PowerVR v1.37 (`40137`) |
-| Final data path | `ux0:data/mcsm` |
+| Data path | `ux0:data/mcsm` |
 
-## Download
+**No Android game files are included.** You must supply your own APK, main OBB, patch OBB, and any episode files.
 
-The [MCSM 1.10 prerelease](../../releases/tag/v1.10) contains:
+## Setup
 
-- **`MCSM-1.10-logging.vpk`** — the Vita loader, LiveArea artwork, and trophy resources. This is a **logging build** — see [Send a log](#send-a-log-important-for-this-prerelease).
-- **`MCSM-Vita-Data-Builder-v1.9.exe`** — prepares the Vita data folder from files you legally own.
-
-Android game files are not included. You must supply your own supported APK, main OBB, patch OBB, and optional episode files.
-
-## Quick setup
-
-### 1. Prepare the Vita
-
-Install or enable:
+**1. Prepare the Vita.** Install:
 
 - [VitaShell](https://github.com/TheOfficialFloW/VitaShell/releases)
 - [kubridge](https://github.com/TheOfficialFloW/kubridge/releases/tag/v0.1) under `*KERNEL`
-- [FdFix](https://github.com/TheOfficialFloW/FdFix/releases/tag/v1.0) under `*KERNEL` — do not use it alongside rePatch
-- `libshacccg.suprx` in `ur0:data/` — [ShaRKBR33D](https://github.com/Rinnegatamante/ShaRKBR33D/releases) can install it
+- [FdFix](https://github.com/TheOfficialFloW/FdFix/releases/tag/v1.0) under `*KERNEL` — not alongside rePatch
+- `libshacccg.suprx` in `ur0:data/` — [ShaRKBR33D](https://github.com/Rinnegatamante/ShaRKBR33D/releases) installs it
 
-[NoTrpDrm](https://github.com/Rinnegatamante/NoTrpDrm/releases/tag/v.1.1) is **not required to play**. It is required only if you want trophy support.
+**2. Install `MCSM-1.10-logging.vpk`** with VitaShell.
 
-### 2. Install the loader
+**3. Build the data folder.** Run `MCSM-Vita-Data-Builder-v1.9.exe` on Windows → **Scan folder** → select the folder holding your Android files → confirm the APK/OBBs verify as PowerVR v1.37 → **Build Data Folder**. Copy the finished `mcsm` folder into `ux0:data/`.
 
-Install `MCSM-1.10-logging.vpk` with VitaShell.
+You should end up with `ux0:data/mcsm/assets` and `ux0:data/mcsm/settings`.
 
-### 3. Build the data folder
+**Adding episodes later:** pick **Add episodes only** in the builder, add the chapter files, **Build Chapter Pack**, then merge the small `mcsm` folder into `ux0:data/`. No rebuild needed — it won't touch your saves or settings.
 
-1. Open `MCSM-Vita-Data-Builder-v1.9.exe` on Windows.
-2. Leave the mode on **Full setup**.
-3. Press **Scan folder** and select the folder containing your Android files.
-4. Confirm that the APK, main OBB, and patch OBB are marked as verified PowerVR v1.37 files.
-5. Leave **Balanced — recommended** selected unless you want another profile.
-6. Add any owned Episodes 2–8 now, or add them later.
-7. Press **Build Data Folder**.
-8. Copy the finished `mcsm` folder into `ux0:data/` on the Vita.
+## Send a log
 
-The final layout must contain `ux0:data/mcsm/assets` and `ux0:data/mcsm/settings`.
+Attaching a log to a report is the single most useful thing you can do right now.
 
-### Add episodes later
+1. Play until the problem happens.
+2. **Close the game** (PS button → close from LiveArea).
+3. **Do not relaunch yet** — the log is wiped at every launch, which destroys what you just captured.
+4. Copy `ux0:data/mcsm/loader.log` off the Vita (VitaShell **SELECT** starts an FTP server).
+5. Attach it to a [bug report](../../issues/new?template=bug-report.yml) or post it in [Discord](https://discord.gg/EYYTxeXCq).
 
-You do not need to rebuild the base data:
-
-1. Select **Add episodes only** in the builder.
-2. Add chapter folders, PowerVR chapter OBBs, ZIPs, or full nested bundles.
-3. Press **Build Chapter Pack**.
-4. Copy the small resulting `mcsm` folder into `ux0:data/` and choose Merge/Replace in VitaShell.
-
-The chapter pack contains only selected chapter assets and copy instructions. It does not contain the APK libraries, rebuilt base data, settings, saves, or preferences.
-
-## Help complete the progcache
-
-The prerelease builds shader programs while you play. A new program can cause a visible stutter the first time it appears. We need community caches from all eight episodes so a later release can start with broader coverage.
-
-To contribute:
-
-1. Play an episode through as much content as possible.
-2. Close the game.
-3. Copy the complete `ux0:data/mcsm_progcache` folder to your PC.
-4. ZIP that folder.
-5. Upload it to the matching episode issue and mention your graphics profile.
-
-| Episode | Progcache upload issue |
-| --- | --- |
-| 1 — The Order of the Stone | [Upload for Episode 1](../../issues/3) |
-| 2 — Assembly Required | [Upload for Episode 2](../../issues/4) |
-| 3 — The Last Place You Look | [Upload for Episode 3](../../issues/5) |
-| 4 — A Block and a Hard Place | [Upload for Episode 4](../../issues/6) |
-| 5 — Order Up! | [Upload for Episode 5](../../issues/7) |
-| 6 — A Portal to Mystery | [Upload for Episode 6](../../issues/8) |
-| 7 — Access Denied | [Upload for Episode 7](../../issues/9) |
-| 8 — A Journey's End? | [Upload for Episode 8](../../issues/10) |
-
-Upload **only** the zipped `mcsm_progcache` folder. Do not include `ux0:data/mcsm`, assets, saves, APKs, OBBs, logs, or other game data. You can also share the ZIP in the [MCSM Vita Discord](https://discord.gg/EYYTxeXCq).
+Send the whole file, zipped if large — not a screenshot of part of it. To turn logging off without changing builds, put `logging = off` in `ux0:data/mcsm/settings/game.txt`.
 
 ## Report problems
 
-Please report any issue you have with the game—not only crashes. This includes freezes, dead stops, input problems, missing choices, saves not loading, settings not saving, language problems, audio delay, broken graphics, or severe performance drops.
+Report **any** problem, not just crashes — freezes, input, missing choices, saves or settings not persisting, audio, broken graphics, bad performance.
 
-Use the [game bug report form](../../issues/new?template=bug-report.yml) or post in the [Discord](https://discord.gg/EYYTxeXCq). Include:
+Include: episode and scene, what happened vs. what you expected, whether it repeats, your graphics profile, and installed plugins (especially CapUnlocker or overclock tools).
 
-- episode and exact scene/checkpoint
-- what happened and what you expected
-- whether it happens every time
-- graphics profile and resolution
-- installed plugins, especially CapUnlocker or overclock tools
-- a screenshot or short video when useful
+Never upload game assets, APKs, OBBs, or saves containing private information.
 
-Never upload proprietary game assets, APKs, OBBs, or saves containing private information.
+## Help complete the progcache
 
-## Send a log (important for this prerelease)
+The build compiles shaders as you play, which is what causes first-time stutter. Community caches let a later release ship with broader coverage.
 
-**The release VPK is currently `MCSM-1.10-logging.vpk`, a logging build.** It writes a diagnostic log
-while you play, which is what lets a freeze or a graphics fault actually be
-traced instead of guessed at. Attaching one to your report is the single most
-useful thing you can do right now.
+Play an episode, close the game, zip `ux0:data/mcsm_progcache`, and upload it to the matching issue with your graphics profile:
 
-The log file is:
+[Ep 1](../../issues/3) · [Ep 2](../../issues/4) · [Ep 3](../../issues/5) · [Ep 4](../../issues/6) · [Ep 5](../../issues/7) · [Ep 6](../../issues/8) · [Ep 7](../../issues/9) · [Ep 8](../../issues/10)
 
-```
-ux0:data/mcsm/loader.log
-```
-
-### How to get it off the Vita
-
-1. Play until the problem happens.
-2. **Close the game.** If it is frozen, press PS, then close it from the LiveArea.
-3. **Do not launch the game again yet** — the log is wiped at the start of every
-   launch, so relaunching destroys the evidence you just captured.
-4. Copy `ux0:data/mcsm/loader.log` off the Vita. Either:
-   - open VitaShell, press **SELECT** to start the FTP server, and copy the file
-     from a PC, or
-   - copy it to a USB drive / SD card with VitaShell's file browser.
-5. Attach it to your [bug report](../../issues/new?template=bug-report.yml) or
-   post it in the [Discord](https://discord.gg/EYYTxeXCq).
-
-If the log is very large, zip it first. Please send the whole file rather than a
-screenshot of part of it — the useful part is usually the last few hundred lines
-before the failure, but the earlier lines say which settings and chapters were
-loaded.
-
-### Two things worth knowing
-
-- **This build runs slower than a normal one.** Writing the log costs frame time,
-  so please do not judge performance on it, and say in your report that you were
-  on the logging build.
-- **To turn logging off** without changing builds, add `logging = off` to
-  `ux0:data/mcsm/settings/game.txt`. Set it back to `on` (or delete the line) to
-  re-enable it.
+Upload **only** the zipped progcache — no assets, saves, APKs, OBBs, or logs.
 
 ## Settings
 
-There are exactly **two** settings files, both in `ux0:data/mcsm/settings/`:
+Exactly **two** files, both in `ux0:data/mcsm/settings/`:
 
 | File | Holds |
 | --- | --- |
 | `graphics.txt` | `profile` (quality / balanced / performance / battery / custom) and every performance and visual lever |
-| `game.txt` | language, which episodes are listed, logging, audio gain, and trophy options |
+| `game.txt` | language, episode list, logging, audio gain, trophy options |
 
-Anything not listed in a file keeps its default, so both files can be as short as
-one line. Older builds scattered these across ~20 single-purpose files
-(`nolog.txt`, `mipmaps.txt`, `vram_reserve.txt`, `keep_resident.txt` and so on);
-those are gone and are ignored if present. The equivalent keys now live in the
-two files above — for example `mipmaps = on`, `vram_reserve = 48`,
-`keep_resident = on` in `graphics.txt`, and `logging = off`, `audio_gain = 125`
-in `game.txt`.
+Anything missing keeps its default, so either file can be one line. Older builds used ~20 single-purpose files (`nolog.txt`, `mipmaps.txt`, …) — those are gone and ignored if present.
 
-Two worth knowing about:
+Two worth knowing:
 
-- `outlines = off` in `graphics.txt` — skips the per-mesh toon-outline pass. It is
-  the single biggest draw-count saving available, so it is the first thing to try
-  if crowded scenes run badly.
+- `outlines = off` in `graphics.txt` — skips the toon-outline pass. Biggest single draw-count saving; try it first if crowded scenes run badly.
 - `logging = off` in `game.txt` — see above.
 
-## Builder and game features
+## Trophies
 
-- Exact APK version and PowerVR renderer verification; Mali, Adreno, altered, and older builds are rejected.
-- Main and patch OBBs are PC-side extraction inputs only. OBB clones are removed from the finished Vita folder.
-- Balanced, Performance, Quality, Battery, and editable Easy/Advanced Custom graphics profiles.
-- Advanced uncapped, 60, 30, 20, and 15 FPS options.
-- English, French, German, Spanish, Portuguese, Russian, and Chinese text selection. Voices remain English.
-- Persistent font-size/preferences synchronization.
-- Vita on-screen keyboard support for save-slot title renaming.
-- Personal choices and offline crowd-choice percentages.
-- Physical L/R input is delivered as both L1/L2 and R1/R2 without duplicate presses.
-- Built-in controller prompts and optional experimental data add-ons/mods.
+Trophies need [NoTrpDrm](https://github.com/Rinnegatamante/NoTrpDrm/releases/tag/v.1.1) under `*KERNEL`. The game itself does not.
 
-More builder details are in [data-builder/README.md](data-builder/README.md).
+If an older test build left a broken registration: install [Trophy Manager v1.03](https://github.com/ONElua/TrophyManager/releases/tag/1.03), disable Wi-Fi, delete only the MCSM trophy set, open the Vita Trophies app once, reboot, then reinstall the VPK. Do not hand-delete files from `ur0:user/.../trophy` — it corrupts the trophy database.
 
-## Optional performance plugins
+## Optional plugins
 
-[CapUnlocker v1.4](https://github.com/GrapheneCt/CapUnlocker/releases/tag/v1.4) exposes the reserved fourth core. The loader still runs without it and falls back to the normal three user cores.
+[CapUnlocker v1.4](https://github.com/GrapheneCt/CapUnlocker/releases/tag/v1.4) exposes the reserved fourth core; the loader runs fine without it.
 
-Use at most one overclock menu:
+Use at most **one** overclock menu: [PSVshellPlus](https://github.com/GrapheneCt/PSVshellPlus/releases/tag/v1.4), [PSV-VSH-Menu](https://github.com/joel16/PSV-VSH-Menu/releases/tag/3.40), or [LOLIcon](https://github.com/dots-tb/LOLIcon/releases/tag/1.0.1).
 
-- [PSVshellPlus](https://github.com/GrapheneCt/PSVshellPlus/releases/tag/v1.4)
-- [PSV-VSH-Menu](https://github.com/joel16/PSV-VSH-Menu/releases/tag/3.40)
-- [LOLIcon](https://github.com/dots-tb/LOLIcon/releases/tag/1.0.1)
+## Known limitations
 
-## Trophy support and repair
-
-Trophies require [NoTrpDrm](https://github.com/Rinnegatamante/NoTrpDrm/releases/tag/v.1.1) under `*KERNEL`. The game itself does not.
-
-If an older test build left a broken trophy registration:
-
-1. Install [Trophy Manager v1.03](https://github.com/ONElua/TrophyManager/releases/tag/1.03).
-2. Disable Wi-Fi and delete only the Minecraft: Story Mode trophy set through Trophy Manager.
-3. Open the normal Vita Trophies app once, then reboot.
-4. Reinstall the latest VPK with NoTrpDrm enabled.
-
-Do not manually delete random files from `ur0:user/.../trophy`; that can leave the trophy database inconsistent.
-
-## Known prerelease limitations
-
-- New scenes can stutter while missing progcache entries compile. This is expected in the current prerelease.
-- Crowded scenes may still fall to around 20 FPS even when the target is 30 or 60 FPS.
-- First boot can remain black for roughly 30 seconds while caches are created. An indefinite black screen is not normal—please report it.
-- Experimental mods/data add-ons are not yet validated on Vita hardware.
-- All features still need broader real-hardware coverage across Episodes 1–8.
+- New scenes stutter while missing progcache entries compile.
+- Crowded scenes can fall to ~20 FPS even at a 30 or 60 FPS target.
+- First boot can be black for ~30 seconds while caches build. An *indefinite* black screen is not normal — please report it.
+- Settings and choices do not reliably persist across restarts yet. Known, being worked on.
+- Everything still needs broader real-hardware coverage across Episodes 1–8.
 
 ## Videos
 
-1. [First build — menus](https://youtu.be/q_X8j8XZ-NU)
-2. [Gameplay](https://youtu.be/TzjYkUHpF6k)
-3. [Full trial chapter — fixed animations + audio](https://youtu.be/BltUYWmdRq8)
-4. [Gameplay & chapter presentation](https://youtu.be/QsmPfikGh0A)
-5. [Texture fixes](https://youtu.be/BrGuSMM_j5U)
-6. [Stutter fix & optimisation — shader caching](https://youtu.be/IK8h5NXLh2k)
-7. [Performance improvements & fixes](https://youtu.be/4aSJUfWHK3w)
+[Full trial chapter](https://youtu.be/BltUYWmdRq8) · [Texture fixes](https://youtu.be/BrGuSMM_j5U) · [Shader caching](https://youtu.be/IK8h5NXLh2k) · [Performance pass](https://youtu.be/4aSJUfWHK3w)
 
 ## Build from source
 
-The loader requires the **softfp** VitaSDK with vitaGL, vitaShaRK, mathneon, and kubridge. The build rejects a hard-float SDK.
+Requires the **softfp** VitaSDK with vitaGL, vitaShaRK, mathneon, and kubridge. A hard-float SDK is rejected.
 
 ```powershell
 $env:VITASDK = "C:\path\to\vitasdk-softfp"
 .\build_vpk.ps1
 ```
 
-Build the Windows data preparer with:
-
-```powershell
-.\data-builder\build.ps1
-```
-
-The loader output is `build_local/MCSM-1.10.vpk`. VPKs, extracted game data, and proprietary Android files are intentionally excluded from source control.
+Output is `build_local/MCSM-1.10.vpk`. The builder: `.\data-builder\build.ps1` ([details](data-builder/README.md)).
 
 ## Legal
 
-No Android executable, native library, OBB, episode, or gameplay archive is included or linked. This is an unofficial fan project and is not affiliated with Mojang, Microsoft, Telltale/LCG, Skybound, or Netflix. Trademarks belong to their owners.
+No Android executable, library, OBB, episode, or gameplay archive is included or linked. Unofficial fan project, not affiliated with Mojang, Microsoft, Telltale/LCG, Skybound, or Netflix. Trademarks belong to their owners.
 
 ## Credits
 
-- **Andy "TheFloW" Nguyen** — `.so` loader, so_util, fios, libc_bridge, kubridge.
-- **Rinnegatamante** — vitaGL, vitaShaRK, mathneon.
-- **Volodymyr Atamanenko** — soloader-boilerplate, FalsoJNI.
-- **bythos14** — kubridge fork. **Brad Conte** — SHA-1. miniz authors. VitaSDK team.
-- **Telltale / Mojang / Microsoft** — game and IP; not affiliated.
+- **Andy "TheFloW" Nguyen** — `.so` loader, so_util, fios, libc_bridge, kubridge
+- **Rinnegatamante** — vitaGL, vitaShaRK, mathneon
+- **Volodymyr Atamanenko** — soloader-boilerplate, FalsoJNI
+- **bythos14** — kubridge fork · **Brad Conte** — SHA-1 · miniz authors · VitaSDK team
+- **Telltale / Mojang / Microsoft** — game and IP; not affiliated
 
 Full attributions: [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md).
 
-This whole thing is vibecoded slop made with **Claude 5** and **ChatGPT 5.6 sol**.
-
 ## License
 
-Copyright © 2026 LeZergan.
-
-Licensed under the [GNU General Public License v3.0](LICENSE). Inherited and third-party components retain their own notices; see [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md) and `LICENSES/`.
+Copyright © 2026 LeZergan. [GNU GPL v3.0](LICENSE). Third-party components retain their own notices.
