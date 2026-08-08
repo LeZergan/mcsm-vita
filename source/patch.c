@@ -4511,6 +4511,69 @@ static int hook_lua_set_download_completed_cb(void *L) {
 /* Keep this hook in production: SavePrefs is synchronous, so immediately after
  * it returns we can reconcile its native bare-resource output with the Lua-facing
  * <Temp> copy. Diagnostics remain conditional. */
+/* ★ 2026-08-06 — CREATE prefs.prop SO IT CAN BE SAVED.
+ *
+ * Settings never persist, and the failing instruction is known exactly.
+ * GameEngine::SavePrefs (0x00cb0dec) builds Symbol("prefs.prop") and calls the
+ * property-set save, which begins:
+ *     bl  ResourceFinder::LocateResource(const Symbol&)
+ *     cmp r0,#0 ; beq <exit>                            (0x00cb0844)
+ * A resource the finder cannot LOCATE is silently unsaveable, and prefs.prop
+ * cannot be located because it has never existed. Device logs show it in neither
+ * direction: no read, no write, not even a failed open.
+ *
+ * Rewriting the name did not help (the qualified spelling is a different missing
+ * entry), and neither did giving ResourceFinder a default location. The resource
+ * has to actually EXIST in the resource system.
+ *
+ * luaCreate (0x00c45b50) is the engine's own way to make one: it takes a name at
+ * stack index 1, builds a ResourceAddressString, checks ObjCacheMgr::ExistObject,
+ * and picks the class from the ".prop" extension. Calling it once for
+ * logical:<Temp>/prefs.prop registers the resource, after which LocateResource
+ * succeeds and the engine's own SavePrefs writes normally -- no loader-side
+ * serialisation, no path rewriting.
+ *
+ * Stack safety, both halves verified by disassembly rather than assumed:
+ *   - luaCreate reads index 1 and calls lua_settop(L,0) itself, so it needs a
+ *     clean frame and leaves one behind.
+ *   - luaSavePrefs (0x00c41830) is `lua_gettop; SavePrefs(); lua_pushboolean;
+ *     lua_gettop` -- it discards the gettop result and reads NO arguments. So
+ *     clearing the stack before it runs cannot affect it.
+ * Done once, before the first SO_CONTINUE, so that save and every later one see
+ * a registered resource.
+ *
+ * Only prefs.prop. choice.prop deliberately excluded: it EXISTS (114665 bytes of
+ * shipped crowd data) and creating over it would destroy that. */
+static void prefs_create_resource_once(void *L) {
+    static int done = 0;
+    if (done || !L || !mcsm_cfg()->prefs_create) return;
+    done = 1;
+
+    typedef int  (*LuaGetTopFn)(void *);
+    typedef void (*LuaSetTopFn)(void *, int);
+    typedef const char *(*LuaPushStringFn)(void *, const char *);
+    typedef int  (*LuaCFn)(void *);
+
+    LuaGetTopFn     gettop = (LuaGetTopFn)so_symbol(&so_mod_gameengine, "lua_gettop");
+    LuaSetTopFn     settop = (LuaSetTopFn)so_symbol(&so_mod_gameengine, "lua_settop");
+    LuaPushStringFn pushs  = (LuaPushStringFn)so_symbol(&so_mod_gameengine, "lua_pushstring");
+    LuaCFn          create = (LuaCFn)so_symbol(&so_mod_gameengine, "_Z9luaCreateP9lua_State");
+    if (!gettop || !settop || !pushs || !create) {
+        l_warn("PREFSCREATE: lua_gettop/settop/pushstring/luaCreate not all resolved "
+               "— cannot register prefs.prop; settings will not persist");
+        return;
+    }
+
+    const int before = gettop(L);
+    settop(L, 0);
+    pushs(L, "logical:<Temp>/prefs.prop");
+    (void)create(L);
+    settop(L, 0);
+    l_info("PREFSCREATE: created 'logical:<Temp>/prefs.prop' (stack was %d, cleared "
+           "— luaSavePrefs reads no arguments). If settings now persist, this was the "
+           "missing registration LocateResource needed.", before);
+}
+
 static so_hook g_hook_lua_save_prefs;
 static int hook_lua_save_prefs(void *L) {
 #ifdef DEBUG_SOLOADER
@@ -4518,6 +4581,7 @@ static int hook_lua_save_prefs(void *L) {
     count++;
     l_info("SAVETRACE: SavePrefs ENTER #%u", count);
 #endif
+    prefs_create_resource_once(L);
     int ret = SO_CONTINUE(int, g_hook_lua_save_prefs, L);
 #ifdef DEBUG_SOLOADER
     l_info("SAVETRACE: SavePrefs RETURN #%u", count);

@@ -258,6 +258,12 @@ typedef struct {
                                * resource resolves, which is too broad a change to
                                * impose for nothing. Kept because the disassembly and
                                * the RESLOC log lines are worth having.             */
+    int  prefs_create;        /* 1 = call luaCreate once for
+                               * logical:<Temp>/prefs.prop so the resource EXISTS and
+                               * GameEngine::SavePrefs can locate it. Default ON: the
+                               * failing instruction is known (LocateResource == NULL
+                               * at 0x00cb0844) and this registers the thing it looks
+                               * for. Set to 0 if it misbehaves.                     */
     int  sim_probes;          /* 1 = install the Scene::UpdateScenes /
                                * ScriptManager::Update / ChoreInst::UpdateChoreInstances
                                * timing probes (logging builds only; they need the
