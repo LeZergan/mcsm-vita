@@ -6068,6 +6068,28 @@ static int hook_lua_input_supports_touch(void *L) {
         l_info("CONNECT-TRACE: " #fn " RETURN #%u ret=%d", c, r);               \
         return r;                                                              \
     }
+/* ★ ACHIEVEMENT-FLOW TRACE (2026-08-06).
+ *
+ * A 57-minute device session unlocked exactly ONE achievement, and the trophy
+ * backend was not at fault: the recovery fired, the set registered, and id 9
+ * unlocked correctly. Platform_Android::UnlockAchievement -- which the loader
+ * hooks and which is the bottom of the unlock chain -- was simply only CALLED
+ * once, and luaUpdateAchievementsAndWait was never called at all. So the game
+ * is not asking for the other unlocks, and nothing on the trophy side can fix
+ * that.
+ *
+ * Why it stops asking is a decision inside packed .ttarch2 Lua, which cannot be
+ * read offline. These four are the whole Lua-visible achievement surface, so
+ * tracing them shows the decision from the outside: whether the game queries
+ * what is already unlocked (and what we answer), whether it writes progress
+ * without ever unlocking, and whether it asks once and gives up.
+ *
+ * Logging-build only, and all four are cold script-thread entry points, so
+ * SO_CONTINUE on them is safe. */
+CONNECT_TRACE_HOOK(luaPlatformUnlockAchievement)
+CONNECT_TRACE_HOOK(luaPlatformGetAchievements)
+CONNECT_TRACE_HOOK(luaGetAchievements)
+CONNECT_TRACE_HOOK(luaWriteAchievement)
 CONNECT_TRACE_HOOK(luaUpdateProfileAndWait)
 CONNECT_TRACE_HOOK(luaUpdateStatsAndWait)
 CONNECT_TRACE_HOOK(luaUpdateAchievementsAndWait)
@@ -6978,6 +7000,11 @@ static void patch_dlc_fast_path_hooks(void) {
     #define REG_CONNECT_TRACE(fn, mangled)                                      \
         (void)hook_symbol_checked(&so_mod_gameengine, mangled, #fn,             \
                                   (uintptr_t)&hook_##fn, &g_hook_##fn)
+    /* Achievement flow -- see the note above CONNECT_TRACE_HOOK. */
+    REG_CONNECT_TRACE(luaPlatformUnlockAchievement, "_Z28luaPlatformUnlockAchievementP9lua_State");
+    REG_CONNECT_TRACE(luaPlatformGetAchievements,   "_Z26luaPlatformGetAchievementsP9lua_State");
+    REG_CONNECT_TRACE(luaGetAchievements,           "_Z18luaGetAchievementsP9lua_State");
+    REG_CONNECT_TRACE(luaWriteAchievement,          "_Z19luaWriteAchievementP9lua_State");
     REG_CONNECT_TRACE(luaUpdateProfileAndWait,        "_Z23luaUpdateProfileAndWaitP9lua_State");
     REG_CONNECT_TRACE(luaUpdateStatsAndWait,          "_Z21luaUpdateStatsAndWaitP9lua_State");
     REG_CONNECT_TRACE(luaUpdateAchievementsAndWait,   "_Z28luaUpdateAchievementsAndWaitP9lua_State");
