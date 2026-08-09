@@ -11,7 +11,7 @@
 
 Unofficial PS Vita loader for the Android PowerVR build of *Minecraft: Story Mode*.
 
-[Download](../../releases/tag/v1.10) — [Report a problem](../../issues/new?template=bug-report.yml) — [Discord](https://discord.gg/EYYTxeXCq)
+[Download](../../releases/tag/v1.10) — [Report a problem](../../issues/new?template=bug-report.yml) — [Discord](https://discord.gg/spjFgQUGmE)
 
 | | |
 | :-- | :-- |
@@ -83,7 +83,7 @@ Attaching a log to a report is the single most useful thing you can do for this 
 2. Close the game. Press PS, then close it from the LiveArea.
 3. Do not launch the game again yet. The log is wiped at the start of every launch, so relaunching destroys the evidence you just captured.
 4. Copy `ux0:data/mcsm/loader.log` off the Vita. Either open VitaShell and press SELECT to start its FTP server, or copy the file with VitaShell's file browser.
-5. Attach it to a [bug report](../../issues/new?template=bug-report.yml) or post it in [Discord](https://discord.gg/EYYTxeXCq).
+5. Attach it to a [bug report](../../issues/new?template=bug-report.yml) or post it in [Discord](https://discord.gg/spjFgQUGmE).
 
 Send the whole file rather than a screenshot of part of it, and zip it first if it is large. The useful part is usually the last few hundred lines before the failure, but the earlier lines record which settings and chapters were loaded.
 
@@ -93,7 +93,7 @@ To disable logging without changing builds, add `logging = off` to `ux0:data/mcs
 
 Please report any problem, not only crashes. That includes freezes, dead stops, input problems, missing choices, saves or settings not persisting, language problems, audio delay, broken graphics, and severe performance drops.
 
-Use the [bug report form](../../issues/new?template=bug-report.yml) or post in [Discord](https://discord.gg/EYYTxeXCq). Include:
+Use the [bug report form](../../issues/new?template=bug-report.yml) or post in [Discord](https://discord.gg/spjFgQUGmE). Include:
 
 - the episode and the exact scene or checkpoint
 - what happened, and what you expected instead
