@@ -1623,14 +1623,50 @@ void gl_swap() {
          * vblank, but the following frame immediately targets the configured cadence
          * again. This preserves natural 30/60 recovery without catch-up bursts. */
 
-        if (remaining > 1) {
-            sceDisplayWaitVblankStartMulti((unsigned int)(remaining - 1));
+        /* ★★ 2026-08-11 — HARD FLOOR ON THE GAP BETWEEN PRESENTS.
+         *
+         * The schedule above is a target, and a LATE frame was allowed through with no
+         * wait at all (`remaining <= 0` -> `remaining = 0`). That is how the display
+         * exceeded the cap: after a slow frame the next one could present just ONE
+         * vblank later, and the device histogram shows exactly that --
+         *     vblanks 1:12 2:446 3:110 5:31
+         * Twelve frames per six hundred displayed for 16.7ms on a 30fps cap. A cap
+         * that is only a schedule is not a cap.
+         *
+         * So gate on the LAST ACTUAL PRESENT rather than on the schedule. The next
+         * present may never happen fewer than `vb` vblanks after the previous one, no
+         * matter how far behind the target is. A slow frame can still take LONGER --
+         * that is a genuine drop and nothing can undo it -- but nothing can now make
+         * the display run faster than the cap, which is what "hardcore lock" means.
+         *
+         * Debt still cannot accumulate: the floor is measured from the last present,
+         * not from an ideal timeline, so a late frame resets the reference instead of
+         * owing anything back. */
+        static unsigned s_last_present_vc = 0;
+        static int      s_have_last_present = 0;
+
+        int wait = (remaining > 1) ? (remaining - 1) : 0;
+        if (s_have_last_present) {
+            /* Vblanks elapsed since the previous present, signed so wraparound is safe. */
+            const int since = (int)(vc - s_last_present_vc);
+            /* The swap itself consumes one vblank, so presenting now lands at vc+1. */
+            const int floor_wait = vb - since - 1;
+            if (floor_wait > wait) {
+                wait = floor_wait;
+            }
         }
-        /* Schedule the next slot. Late frames present at vc+1 (the swap's own wait), so
-         * the next slot is measured from there rather than from a target we already
-         * missed -- that is what stops debt accumulating. */
-        g_present_next_vc = (remaining > 0 ? g_present_next_vc : vc + 1u) +
-                            (unsigned)g_present_vb_whole;
+        if (wait > 0) {
+            sceDisplayWaitVblankStartMulti((unsigned int)wait);
+        }
+
+        /* Where this frame actually lands: the vblanks we waited, plus the one the
+         * swap consumes. Recorded as the reference for the next frame's floor. */
+        s_last_present_vc = vc + (unsigned)wait + 1u;
+        s_have_last_present = 1;
+
+        /* Schedule the next slot from the real present, so the target and the floor
+         * agree instead of drifting apart. */
+        g_present_next_vc = s_last_present_vc + (unsigned)g_present_vb_whole;
     } else if (g_present_period_us > 0) {
         /* FRACTIONAL cap (24, 40, ...): no single vblank count expresses it, so keep the
          * exact microsecond timeline with its remainder carry. Reachable only by hand

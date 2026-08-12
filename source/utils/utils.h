@@ -139,6 +139,23 @@ bool file_mkpath(const char * path, mode_t mode);
 bool file_save(const char * path, const uint8_t * buffer, size_t size);
 
 /**
+ * Save buffer contents into a file, committing by rename.
+ *
+ * Unlike file_save(), an interrupted call cannot leave the destination truncated:
+ * the data is staged in a `<path>.new` sidecar, its size verified on the card, and
+ * only then renamed into place. Use this for anything the player would notice
+ * losing -- save bundles, event logs, property sets.
+ *
+ * @param[in] path   Full path of the target file.
+ * @param[in] buffer Buffer containing data to save.
+ * @param[in] size   Size of the buffer (in bytes).
+ *
+ * @return `true` on success, `false` otherwise. On `false` the previous contents of
+ *         `path` are left untouched wherever the filesystem allowed it.
+ */
+bool file_save_atomic(const char * path, const uint8_t * buffer, size_t size);
+
+/**
  * Check whether specified path is a directory.
  *
  * @param[in] path Target path.

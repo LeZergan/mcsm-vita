@@ -42,7 +42,7 @@ if ($LASTEXITCODE -ne 0) { throw "CMake configure failed (exit $LASTEXITCODE)" }
 cmake --build $buildDir --parallel
 if ($LASTEXITCODE -ne 0) { throw "CMake build failed (exit $LASTEXITCODE)" }
 
-$releaseVpk = Join-Path $buildDir 'MCSM-1.10.vpk'
+$releaseVpk = Join-Path $buildDir 'MCSM-1.11.vpk'
 if (-not (Test-Path -LiteralPath $releaseVpk -PathType Leaf)) {
     throw "Expected release VPK was not created: $releaseVpk"
 }

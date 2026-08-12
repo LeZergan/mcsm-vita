@@ -264,6 +264,39 @@ typedef struct {
                                * failing instruction is known (LocateResource == NULL
                                * at 0x00cb0844) and this registers the thing it looks
                                * for. Set to 0 if it misbehaves.                     */
+    int  prefs_reload;        /* ★ 1 = re-run GameEngine::OpenUserPrefs once, from
+                               * luaGetPrefsLoaded, after luaCreate has made
+                               * prefs.prop locatable. The boot-time load in
+                               * Initialize2 runs before any lua_State exists, so the
+                               * resource it needs cannot be registered yet: device
+                               * logs show prefs.prop written (valid 64-byte MSV5) and
+                               * never once opened for reading. Default ON. Set to 0 to
+                               * go back to load-once-at-boot.                       */
+    int  user_space_repair;   /* ★ 1 = build the <User> resource space the platform
+                               * layer never builds, from inside GameEngine::
+                               * OpenUserSpace, so the engine's own OpenUserPrefs can
+                               * LOAD prefs.prop on the very next instruction.
+                               *
+                               * This is the READ half of settings persistence, and it
+                               * had no implementation at all. prefs_create fixed the
+                               * write; GameEngine::OpenUserPrefs (0xcb1870) opens with
+                               *     Symbol("<User>/");
+                               *     ResourceConcreteLocation::Find(sym)
+                               *     cmp r0,#0 ; beq <exit>          (0xcb18a8)
+                               * and nothing on this port ever creates a concrete
+                               * location by that name -- OpenUserSpace asks the
+                               * platform for one through TTPlatform vtable+0x110,
+                               * which returns NULL here, so ResourceFinder::
+                               * InitializeUser is never reached. Preferences have
+                               * therefore never been read back, which is why the
+                               * chosen Jesse and the current save slot revert.
+                               *
+                               * Default ON: the current behaviour is provably broken
+                               * rather than merely unverified, every step is checked
+                               * before the next, and any failure leaves the engine
+                               * exactly as it was. `user_space_repair = off` in
+                               * graphics.txt reverts to the old behaviour; the
+                               * USERSPACE log lines say precisely what happened.    */
     int  sim_probes;          /* 1 = install the Scene::UpdateScenes /
                                * ScriptManager::Update / ChoreInst::UpdateChoreInstances
                                * timing probes (logging builds only; they need the

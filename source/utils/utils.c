@@ -21,6 +21,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/time.h>
+#include <unistd.h>
 
 #include <sha1/sha1.h>
 
@@ -66,6 +67,26 @@ static int make_dir_if_missing(const char *path, mode_t mode, int *mkdir_errno) 
     return sce_rc;
 }
 
+/* ★ 2026-08-11 — file_copy IS A SAVE-DATA PATH, SO IT HAD TO STOP BEING DESTRUCTIVE.
+ *
+ * This function is not a convenience any more. It mirrors prefs.prop after every
+ * SavePrefs and it restores save files from backup at boot, so its failure modes are
+ * the player's failure modes. It had three, all of which end in a destroyed file
+ * rather than a failed copy:
+ *
+ *   1. file_save() truncated the destination and THEN wrote. Interrupt it -- and this
+ *      port is interrupted constantly, because players force-quit from the LiveArea
+ *      whenever a scene load looks like a hang -- and the destination is left
+ *      truncated. The good copy is gone and the new one was never finished.
+ *   2. Neither fwrite nor fclose was checked, so a short write on a full or flaky
+ *      memory card returned `true`. A truncated .prop that reports success is exactly
+ *      "my choices came back corrupted".
+ *   3. file_load did not check fread either, so a partial read produced a full-size
+ *      buffer with an uninitialised tail, which was then written out as if it were
+ *      the file.
+ *
+ * Now: read verified, write verified, and committed by rename so the destination is
+ * only ever the old file or the whole new one. */
 bool file_copy(const char * path, const char * destination) {
     if (!file_exists(path)) {
         l_error("file_copy: Specified source path \"%s\" "
@@ -88,7 +109,7 @@ bool file_copy(const char * path, const char * destination) {
         return false;
     }
 
-    if (!file_save(destination, buffer, size)) {
+    if (!file_save_atomic(destination, buffer, size)) {
         l_error("file_copy: Failed to write data to the specified "
                 "destination path \"%s\".", destination);
         free(buffer);   /* the failure path leaked the whole source file */
@@ -97,6 +118,65 @@ bool file_copy(const char * path, const char * destination) {
 
     free(buffer);
     return true;
+}
+
+/* Commit-by-rename. The destination is never observed half-written: either the
+ * previous contents are intact or the complete new contents are in place.
+ *
+ * The rename is attempted BEFORE any remove(), so the window in which the
+ * destination does not exist at all is entered only on a filesystem that refuses to
+ * rename over an existing name -- and even then the finished data is already sitting
+ * in the sidecar, so the boot-time recovery pass can still find it. */
+bool file_save_atomic(const char * path, const uint8_t * buffer, size_t size) {
+    if (!path || (!buffer && size > 0)) {
+        l_error("file_save_atomic: Invalid argument(s).");
+        return false;
+    }
+
+    char tmp[512];
+    if ((size_t)snprintf(tmp, sizeof(tmp), "%s.new", path) >= sizeof(tmp)) {
+        /* Path too long for a sidecar: a direct write is worse than no write for a
+         * save file, but refusing outright would silently drop the data. Say so. */
+        l_warn("file_save_atomic: \"%s\" is too long for a .new sidecar — writing "
+               "in place, which is NOT crash-safe", path);
+        return file_save(path, buffer, size);
+    }
+
+    remove(tmp);
+    if (!file_save(tmp, buffer, size)) {
+        l_error("file_save_atomic: could not stage \"%s\".", tmp);
+        remove(tmp);
+        return false;
+    }
+
+    /* Verify the staged copy on the card rather than trusting the write calls: this
+     * is the last point at which a short write can still be caught for free. */
+    const long long staged = file_size(tmp);
+    if (staged != (long long)size) {
+        l_error("file_save_atomic: staged \"%s\" is %lld bytes, expected %u — "
+                "discarding rather than committing a truncated file",
+                tmp, staged, (unsigned)size);
+        remove(tmp);
+        return false;
+    }
+
+    if (rename(tmp, path) == 0) {
+        return true;
+    }
+
+    /* Vita's rename refuses an existing destination. Take the old file out of the
+     * way and retry; the complete data is already staged, so this is the only step
+     * that can be interrupted and it leaves .new behind to recover from. */
+    remove(path);
+    if (rename(tmp, path) == 0) {
+        return true;
+    }
+
+    l_warn("file_save_atomic: rename(%s -> %s) failed errno=%d — falling back to a "
+           "direct write", tmp, path, errno);
+    const bool ok = file_save(path, buffer, size);
+    remove(tmp);
+    return ok;
 }
 
 bool file_exists(const char * path) {
@@ -206,12 +286,25 @@ bool file_load(const char * path, uint8_t ** buffer, size_t * size) {
     }
 
 #ifdef USE_SCELIBC_IO
-    sceLibcBridge_fread(*buffer, 1, *size, f);
+    const size_t got = sceLibcBridge_fread(*buffer, 1, *size, f);
     sceLibcBridge_fclose(f);
 #else
-    fread(*buffer, 1, *size, f);
+    const size_t got = fread(*buffer, 1, *size, f);
     fclose(f);
 #endif
+
+    /* A short read used to pass silently: the buffer stayed *size bytes long with an
+     * uninitialised tail, and file_copy would then write that tail out as if it were
+     * file content. Refuse the load instead -- a caller that gets `false` keeps the
+     * destination it already had. */
+    if (got != *size) {
+        l_error("file_load: short read on \"%s\" (%u of %u bytes) — refusing to "
+                "hand back a partially filled buffer", path, (unsigned)got, (unsigned)*size);
+        free(*buffer);
+        *buffer = NULL;
+        *size = 0;
+        return false;
+    }
 
     return true;
 }
@@ -331,13 +424,29 @@ bool file_save(const char * path, const uint8_t * buffer, size_t size) {
         return false;
     }
 
+    /* fwrite(buffer, size, 1, f) counts ITEMS, so a partial write of a single big
+     * item returns 0 and the old code discarded that. Write byte-wise so a short
+     * write is a number we can compare, and check fclose too -- the buffered tail is
+     * flushed there, so a card that fills up fails at fclose and nowhere else. */
+    const size_t want = size;
 #ifdef USE_SCELIBC_IO
-    sceLibcBridge_fwrite(buffer, size, 1, f);
-    sceLibcBridge_fclose(f);
+    const size_t put = want ? sceLibcBridge_fwrite(buffer, 1, want, f) : 0;
+    const int close_rc = sceLibcBridge_fclose(f);
 #else
-    fwrite(buffer, size, 1, f);
-    fclose(f);
+    const size_t put = want ? fwrite(buffer, 1, want, f) : 0;
+    /* Durability barrier before the handle goes away: this port is force-quit
+     * routinely, and an unflushed memory-card write does not survive that. */
+    fflush(f);
+    fsync(fileno(f));
+    const int close_rc = fclose(f);
 #endif
+
+    if (put != want || close_rc != 0) {
+        l_error("file_save: short write on \"%s\" (%u of %u bytes, fclose=%d) — the "
+                "file on the card is incomplete",
+                path, (unsigned)put, (unsigned)want, close_rc);
+        return false;
+    }
 
     return true;
 }

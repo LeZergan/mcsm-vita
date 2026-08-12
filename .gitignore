@@ -41,6 +41,7 @@ libSDL2.so
 # working VPK); a local build may overwrite them with the real thing, and that
 # must never be pushed. Same for TROPHY.TRP, whose icons are game art.
 extras/livearea_placeholder_bak/
+extras/livearea_v1.10_bak/
 extras/trophy/
 # proprietary PowerVR driver (Imagination Technologies — "Strictly Confidential",
 # NOT redistributable). The shipping build is vitaGL; these are never used or published.

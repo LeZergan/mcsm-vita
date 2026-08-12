@@ -91,6 +91,10 @@ static struct {
     volatile int      thread_exited;
     volatile int      in_mixer;      /* 1 while inside readfrommixer, lock not held */
     unsigned          ring_capacity; /* frames the allocation can hold          */
+    /* ★ 2026-08-11 — SLOT ROTATION. See the crunch note in drain_thread(): the
+     * mixer must never write into the grain the hardware is currently streaming. */
+    unsigned          slots;         /* grain-sized buffers available (>= 2)    */
+    unsigned          slot;          /* which one the next mix goes into        */
     SceUID            lock;          /* serialises mixer access vs teardown     */
 } g_out;
 
@@ -146,11 +150,47 @@ static int drain_thread(SceSize args, void *argp) {
          * give them to the hardware. Same relationship as the old feed thread but
          * through FMOD's real API -- and still no fake OpenSL, no guessed sleep
          * (sceAudioOutOutput blocking is the clock), and no cursor negotiation. */
+        /* ★★ 2026-08-11 — THE CRUNCH: THE MIXER WAS OVERWRITING AUDIO THAT WAS
+         * STILL PLAYING.
+         *
+         * Every iteration mixed into g_out.ring and then handed g_out.ring to
+         * sceAudioOutOutput -- the same address, forever. But sceAudioOutOutput does
+         * not copy: it blocks until the PREVIOUS buffer has drained, queues this one,
+         * and returns while the hardware is still reading from it. So the very next
+         * readfrommixer() wrote new samples straight into the memory being streamed.
+         *
+         * With a light mixer the write finishes before the DMA reaches those samples
+         * and nothing is audible, which is why this survived so long. Load the mixer
+         * up -- a crowd of NPCs, many voices, a busy scene -- and the write races the
+         * read: the output tears mid-grain and you get exactly the reported "janky and
+         * crunchy when a lot of shit and NPCs are on screen". It is a classic
+         * single-buffer audio bug, and the buffer to fix it with was already
+         * allocated: out_init reserves `nbuf` grains (>= 2) and only slot 0 was ever
+         * used.
+         *
+         * Rotate. The hardware keeps reading the grain we just queued while the mixer
+         * fills a different one, so a slow mix can never corrupt audio in flight -- at
+         * worst it arrives late, which is a dropout the hardware handles cleanly
+         * rather than a torn buffer. */
         unsigned chunk = g_out.grain;
-        int16_t *src = g_out.ring;
+        /* ☠ THE SLOT COUNT IS A BOUNDS LIMIT, NOT A PREFERENCE. My first version read
+         * `(g_out.slots >= 2) ? g_out.slots : 2`, i.e. it rotated through TWO slots
+         * even when the ring only held ONE -- writing a whole grain past the end of
+         * the allocation, on the audio thread, every other iteration. That is a worse
+         * bug than the tearing it was meant to fix. Derive the limit from what is
+         * actually owned and never round it up. */
+        unsigned nslots = g_out.slots;
+        if (nslots == 0u) {
+            nslots = 1u;   /* not published yet — stay on slot 0 */
+        }
+        if (g_out.slot >= nslots) {
+            g_out.slot = 0u;   /* a re-init shrank the ring under us */
+        }
+        int16_t *src = g_out.ring + (size_t)g_out.slot * chunk * (unsigned)g_out.channels;
+        g_out.slot = (g_out.slot + 1u) % nslots;
         int pulled = 0;
         if (st->readfrommixer) {
-            int rrc = st->readfrommixer(st, g_out.ring, chunk);
+            int rrc = st->readfrommixer(st, src, chunk);
             if (rrc == FMOD_OK_T) {
 #ifdef DEBUG_SOLOADER
                 g_out.n_read++;
@@ -347,6 +387,18 @@ static FMOD_RESULT_T out_init(FMOD_OUTPUT_STATE_T *s, int driver, unsigned int f
         l_warn("FMODOUT: grain %u > ring %u after failed grow — clamping", g_out.grain, g_out.frames);
         g_out.grain = g_out.frames;
     }
+    /* How many whole grains the allocation actually holds. The drain loop rotates
+     * through these so the mixer never writes into the grain sceAudioOut is still
+     * streaming; two is the minimum that guarantees it, and FMOD normally asks for
+     * four. Recomputed here rather than trusted from nbuf, because a failed realloc
+     * above can leave us with fewer frames than were requested. */
+    g_out.slots = (g_out.grain > 0u) ? (g_out.frames / g_out.grain) : 1u;
+    if (g_out.slots < 2u) {
+        l_warn("FMODOUT: ring holds only %u grain(s) — audio will single-buffer and "
+               "may tear under mixer load", g_out.slots);
+        g_out.slots = 1u;
+    }
+    g_out.slot = 0u;
     memset(g_out.ring, 0, (size_t)g_out.frames * chans * sizeof(int16_t));
     g_out.play_cursor = 0;
 

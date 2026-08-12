@@ -127,24 +127,42 @@ static void apply_profile(McsmCfg *c, int prof) {
     c->gc_core3       = 1;      /* no_core3.txt absent = core 3 used */
     c->anim_nonskel   = -1;     /* -1 = follow skinning_full, as before */
     c->audio_rate     = 0;      /* 0 = engine default                */
-    c->anim_dt_repair = 0;      /* ☠ OFF. DEVICE-REPORTED TO BREAK GAMEPLAY ANIMATION.
+    c->anim_dt_repair = 1;      /* ★ 2026-08-11 — ON, with the thing that broke it
+                                 * REMOVED rather than the whole repair disabled.
                                  *
-                                 * This rewrites Metrics::mFrameTime (and
-                                 * mActualFrameTime) every frame to repair the
-                                 * engine's 0.1s clamp. The clamp is real and
-                                 * disassembled, and the repair still made gameplay
-                                 * animation visibly worse on hardware -- reported
-                                 * twice, unambiguously the second time.
+                                 * It was reported to make gameplay animation worse
+                                 * twice, and both reports were right about the effect
+                                 * while the cause sat one branch away: on any stall
+                                 * over 500ms the governor forced a 0.25s delta, so
+                                 * every scene transition ended with a single frame
+                                 * that advanced EVERY animated object by a quarter of
+                                 * a second at once. That is the lurch people saw, and
+                                 * it fires after each load -- far more visible than
+                                 * the drift the repair exists to fix.
                                  *
-                                 * The engine owns its animation clocks. With this at
-                                 * 0 the loader hooks Metrics::NewFrame not at all and
-                                 * writes none of them. Do not turn it back on as a
-                                 * default: the theory behind it has now lost to the
-                                 * device twice, and it was ON in v1.10, so "it is
-                                 * what shipped" is not an argument for it either. */
+                                 * A load is a pause, not lost time: the engine is
+                                 * blocked and so is audio, so there is nothing to
+                                 * catch up to. That branch now advances by nothing.
+                                 * The ceiling also dropped 0.25s -> 0.1s to match the
+                                 * engine's own clamp, so a repaired frame can restore
+                                 * a truncated hitch and can never exceed it.
+                                 *
+                                 * What remains is the case the repair was written for
+                                 * and which the device confirms is real: a 100-500ms
+                                 * hitch during which audio keeps playing while
+                                 * Metrics::NewFrame clamps mFrameTime at 0.1s and
+                                 * throws the difference away. Accumulated over a
+                                 * session that is animation running progressively
+                                 * behind the soundtrack -- "animations play at
+                                 * slightly different times".
+                                 *
+                                 * `anim_dt_repair = off` in graphics.txt restores the
+                                 * engine's untouched clocks. */
     c->prefs_path_patch = 0;    /* disproved on device, see config.h */
     c->resloc_repair    = 0;    /* unverified; did not fix saving   */
     c->prefs_create   = 1;      /* register prefs.prop so it can save */
+    c->user_space_repair = 1;   /* build <User> so prefs can be READ  */
+    c->prefs_reload   = 1;      /* re-read prefs once the resource exists */
     c->sim_probes     = 0;      /* chore/scene/script probes off     */
     c->dump_shaders   = 0;      /* diagnostic, off                   */
     c->anim_diag      = 0;      /* diagnostic, off                   */
@@ -312,7 +330,7 @@ static void load_cfg(void) {
     char mips[16] = "", mipmin[16] = "", dsmin[16] = "", vramres[16] = "", gxmt[16] = "";
     char rhooks[16] = "", keepres[16] = "", core3[16] = "", anonskel[16] = "";
     char arate_hz[16] = "", dumpsh[16] = "", adiag[16] = "", adtrep[16] = "", simprb[16] = "";
-    char prefpp[16] = "", reslocr[16] = "", prefcr[16] = "";
+    char prefpp[16] = "", reslocr[16] = "", prefcr[16] = "", uspace[16] = "", prefrl[16] = "";
 
     FILE *f = mcsm_open_setting("graphics.txt", "r");
     if (f) {
@@ -380,6 +398,8 @@ static void load_cfg(void) {
             else if (!strcmp(k, "prefs_path_patch")) cfg_set(prefpp, sizeof(prefpp), v);
             else if (!strcmp(k, "resloc_repair"))   cfg_set(reslocr, sizeof(reslocr), v);
             else if (!strcmp(k, "prefs_create"))   cfg_set(prefcr, sizeof(prefcr), v);
+            else if (!strcmp(k, "user_space_repair")) cfg_set(uspace, sizeof(uspace), v);
+            else if (!strcmp(k, "prefs_reload"))   cfg_set(prefrl, sizeof(prefrl), v);
             else if (!strcmp(k, "sim_probes"))     cfg_set(simprb, sizeof(simprb), v);
             else if (!strcmp(k, "dump_shaders"))   cfg_set(dumpsh, sizeof(dumpsh), v);
             else if (!strcmp(k, "anim_diag"))      cfg_set(adiag, sizeof(adiag), v);
@@ -530,6 +550,8 @@ static void load_cfg(void) {
         if (prefpp[0])   g_cfg.prefs_path_patch = parse_bool(prefpp, g_cfg.prefs_path_patch);
         if (reslocr[0])  g_cfg.resloc_repair    = parse_bool(reslocr, g_cfg.resloc_repair);
         if (prefcr[0])   g_cfg.prefs_create   = parse_bool(prefcr, g_cfg.prefs_create);
+        if (uspace[0])   g_cfg.user_space_repair = parse_bool(uspace, g_cfg.user_space_repair);
+        if (prefrl[0])   g_cfg.prefs_reload   = parse_bool(prefrl, g_cfg.prefs_reload);
         if (simprb[0])   g_cfg.sim_probes     = parse_bool(simprb, g_cfg.sim_probes);
         if (dumpsh[0])   g_cfg.dump_shaders  = parse_bool(dumpsh, g_cfg.dump_shaders);
         if (adiag[0])    g_cfg.anim_diag     = parse_bool(adiag, g_cfg.anim_diag);

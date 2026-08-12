@@ -62,8 +62,48 @@ typedef struct SaveDataFd {
     char path[1024];
 } SaveDataFd;
 
-static SaveDataFd g_savedata_fds[16];
+/* ★ 2026-08-11 — THIS TABLE DECIDES WHICH WRITES GET AN FSYNC, SO ITS LIMITS ARE
+ * DURABILITY LIMITS.
+ *
+ * Three things were wrong with the 16-entry version:
+ *
+ *   - It was silently lossy. Past 16 concurrently-open save files an fd was simply
+ *     not recorded, and an unrecorded fd is never fsynced on close. The failure is
+ *     invisible and it lands on whichever save happens to be open at the time.
+ *   - It was unsynchronised. The engine opens and closes files from several threads
+ *     (save thread, script thread, streaming); a plain `count++` and a swap-remove
+ *     racing each other can drop a live entry or resurrect a dead one, and a dropped
+ *     entry means, again, no fsync.
+ *   - Its path filter missed the event log. The player's in-game choices live in
+ *     `.estore` / `.epage` files, which matched only by accident, through the
+ *     substring "saveslot" in the current naming. A slot naming change -- or the
+ *     session log, which is not slot-named at all -- and the one file that holds the
+ *     choices stops being flushed.
+ *
+ * 64 entries, a real lock, extension matching, and a loud warning if it ever fills. */
+#define SAVEDATA_FD_MAX 64
+
+static SaveDataFd g_savedata_fds[SAVEDATA_FD_MAX];
 static int g_savedata_fd_count = 0;
+static atomic_flag g_savedata_lock = ATOMIC_FLAG_INIT;
+static int g_savedata_overflow_warned = 0;
+
+static void savedata_lock(void) {
+    while (atomic_flag_test_and_set_explicit(&g_savedata_lock, memory_order_acquire)) {
+        /* The critical sections are a handful of comparisons; never spin a core. */
+        sceKernelDelayThread(50);
+    }
+}
+
+static void savedata_unlock(void) {
+    atomic_flag_clear_explicit(&g_savedata_lock, memory_order_release);
+}
+
+static int path_has_extension(const char *path, const char *ext) {
+    const size_t plen = strlen(path);
+    const size_t elen = strlen(ext);
+    return plen >= elen && strcmp(path + plen - elen, ext) == 0;
+}
 
 static int path_is_savedata_bundle(const char *path) {
     if (!path) {
@@ -81,10 +121,17 @@ static int path_is_savedata_bundle(const char *path) {
             * writes were invisible in the log, which is why "SavePrefs ran but
             * nothing was written" took a full session to spot. */
            strstr(path, "choice.prop") ||
-           strstr(path, "choicestats.prop");
+           strstr(path, "choicestats.prop") ||
+           /* By EXTENSION, not by slot name. These are the event log -- the record
+            * of what the player actually chose -- and matching them on the substring
+            * "saveslot" only worked because of how slots happen to be named today. */
+           path_has_extension(path, ".estore") ||
+           path_has_extension(path, ".epage") ||
+           path_has_extension(path, ".bundle");
 }
 
-static int savedata_find_fd(int fd) {
+/* Callers below hold the lock. */
+static int savedata_find_fd_locked(int fd) {
     for (int i = 0; i < g_savedata_fd_count; ++i) {
         if (g_savedata_fds[i].fd == fd) {
             return i;
@@ -97,36 +144,61 @@ static void savedata_track_fd(const char *path, int fd, int flags) {
     if (fd < 0 || !path_is_savedata_bundle(path)) {
         return;
     }
-    int existing = savedata_find_fd(fd);
+
+    savedata_lock();
+    const int existing = savedata_find_fd_locked(fd);
     if (existing >= 0) {
         g_savedata_fds[existing].wrote = 0;
         sceClibSnprintf(g_savedata_fds[existing].path, sizeof(g_savedata_fds[existing].path), "%s", path);
+        savedata_unlock();
         l_info("SAVEIO open existing fd=%d flags=0x%X path=%s", fd, flags, path);
         return;
     }
-    if (g_savedata_fd_count < (int)(sizeof(g_savedata_fds) / sizeof(g_savedata_fds[0]))) {
+
+    int overflowed = 0;
+    if (g_savedata_fd_count < SAVEDATA_FD_MAX) {
         SaveDataFd *slot = &g_savedata_fds[g_savedata_fd_count++];
         slot->fd = fd;
         slot->wrote = 0;
         sceClibSnprintf(slot->path, sizeof(slot->path), "%s", path);
+    } else if (!g_savedata_overflow_warned) {
+        g_savedata_overflow_warned = 1;
+        overflowed = 1;
+    }
+    savedata_unlock();
+
+    if (overflowed) {
+        /* Never let this be silent again: from here on some save writes close
+         * without a durability barrier, and that is exactly the shape of "my
+         * choices survive a few reboots and then vanish". */
+        l_warn("SAVEIO: save-fd table FULL at %d entries — '%s' will close WITHOUT "
+               "an fsync. Save writes from here on may not survive a force-quit.",
+               SAVEDATA_FD_MAX, path);
     }
     l_info("SAVEIO open fd=%d flags=0x%X path=%s", fd, flags, path);
 }
 
 static int savedata_is_fd(int fd) {
-    return savedata_find_fd(fd) >= 0;
+    savedata_lock();
+    const int found = savedata_find_fd_locked(fd) >= 0;
+    savedata_unlock();
+    return found;
 }
 
 static void savedata_note_write_fd(int fd) {
-    int idx = savedata_find_fd(fd);
+    savedata_lock();
+    const int idx = savedata_find_fd_locked(fd);
     if (idx >= 0) {
         g_savedata_fds[idx].wrote = 1;
     }
+    savedata_unlock();
 }
 
 static int savedata_snapshot_fd(int fd, char *path, size_t path_size, int *did_write) {
-    int idx = savedata_find_fd(fd);
+    savedata_lock();
+    const int idx = savedata_find_fd_locked(fd);
     if (idx < 0) {
+        savedata_unlock();
         return 0;
     }
     if (path && path_size > 0) {
@@ -135,18 +207,21 @@ static int savedata_snapshot_fd(int fd, char *path, size_t path_size, int *did_w
     if (did_write) {
         *did_write = g_savedata_fds[idx].wrote;
     }
+    savedata_unlock();
     return 1;
 }
 
 static void savedata_untrack_fd(int fd) {
+    savedata_lock();
     for (int i = 0; i < g_savedata_fd_count; ++i) {
         if (g_savedata_fds[i].fd != fd) {
             continue;
         }
         g_savedata_fds[i] = g_savedata_fds[g_savedata_fd_count - 1];
         g_savedata_fd_count--;
-        return;
+        break;
     }
+    savedata_unlock();
 }
 
 /* is_opensl_library_path() and stat_virtual_opensl_library() lived here to make

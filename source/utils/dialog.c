@@ -96,6 +96,22 @@ int init_ime_dialog(const char *title, const char *initial_text) {
     utf8_to_utf16_bounded(title, ime_title_utf16, SCE_IME_DIALOG_MAX_TITLE_LENGTH);
     utf8_to_utf16_bounded(initial_text, ime_initial_text_utf16, SCE_IME_DIALOG_MAX_TEXT_LENGTH);
 
+    /* ☠ CLEAR THE WORKING BUFFER. inputTextBuffer is the IME's own edit buffer and it
+     * was handed over untouched -- so it still held the PREVIOUS dialog's UTF-16, and
+     * whatever the IME did not overwrite stayed visible as leftover glyphs on the
+     * keyboard. Static storage made the first use look clean and every use after it
+     * inherit the last one, which is exactly the "random corrupted letters on top of
+     * the keyboard" shape: not random at all, just stale units past the new text.
+     *
+     * Sony zeroes its param struct in sceImeDialogParamInit for the same reason; the
+     * caller owns this buffer and has to do the same. Cheap: 4KB once per dialog. */
+    memset(ime_input_text_utf16, 0, sizeof(ime_input_text_utf16));
+    /* Seed it with the text the dialog opens on, so the buffer and initialText agree
+     * from the first frame instead of during whatever the IME does on its own. */
+    for (int i = 0; i < SCE_IME_DIALOG_MAX_TEXT_LENGTH && ime_initial_text_utf16[i]; i++) {
+        ime_input_text_utf16[i] = ime_initial_text_utf16[i];
+    }
+
     SceImeDialogParam param;
     sceImeDialogParamInit(&param);
 

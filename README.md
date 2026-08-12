@@ -11,11 +11,11 @@
 
 Unofficial PS Vita loader for the Android PowerVR build of *Minecraft: Story Mode*.
 
-[Download](../../releases/tag/v1.10) — [Report a problem](../../issues/new?template=bug-report.yml) — [Discord](https://discord.gg/spjFgQUGmE)
+[Download](../../releases/tag/v1.11) — [Report a problem](../../issues/new?template=bug-report.yml) — [Discord](https://discord.gg/spjFgQUGmE)
 
 | | |
 | :-- | :-- |
-| Loader | MCSM 1.10 prerelease |
+| Loader | MCSM 1.11 prerelease |
 | Data builder | v1.9 |
 | Supported Android set | PowerVR v1.37 (`40137`) |
 | Data path | `ux0:data/mcsm` |
@@ -25,10 +25,11 @@ No Android game files are included. You must supply your own APK, main OBB, patc
 
 ## Current release status
 
-1.10 is a public prerelease. Two things to know before installing:
+1.11 is a public prerelease. Two things to know before installing:
 
-- **The shipped VPK is `MCSM-1.10-logging.vpk`, a logging build.** It runs slower than a normal build, so performance measured on it is not representative. It writes `ux0:data/mcsm/loader.log`, which is what allows a fault to be traced instead of guessed at. See [Sending a log](#sending-a-log).
+- **The shipped VPK is `MCSM-1.11-logging.vpk`, a logging build.** It runs slower than a normal build, so performance measured on it is not representative. It writes `ux0:data/mcsm/loader.log`, which is what allows a fault to be traced instead of guessed at. See [Sending a log](#sending-a-log).
 - **The progcache is incomplete.** The build compiles shader programs as you play, so a scene you have not reached before will stutter the first time.
+- **This is a fix pass, not a confirmed-working pass.** [CHANGES_2026-08-11.md](CHANGES_2026-08-11.md) describes what was found and changed for the save/preference path, the event log, audio, controller input, frame pacing, and animation timing — all traced from code, disassembly, or a device log, none of it confirmed by a full playthrough yet. If a problem in that list persists, a log from the logging build is what moves it forward.
 
 ## Requirements
 
@@ -47,7 +48,7 @@ Install the following on the Vita before the loader:
 
 ### 1. Install the loader
 
-Install `MCSM-1.10-logging.vpk` with VitaShell.
+Install `MCSM-1.11-logging.vpk` with VitaShell.
 
 ### 2. Build the data folder
 
@@ -188,7 +189,7 @@ $env:VITASDK = "C:\path\to\vitasdk-softfp"
 .\build_vpk.ps1
 ```
 
-The output is `build_local/MCSM-1.10.vpk`. Build the Windows data preparer with `.\data-builder\build.ps1`; further detail is in [data-builder/README.md](data-builder/README.md).
+The output is `build_local/MCSM-1.11.vpk`. Build the Windows data preparer with `.\data-builder\build.ps1`; further detail is in [data-builder/README.md](data-builder/README.md).
 
 VPKs, extracted game data, and proprietary Android files are excluded from source control.
 

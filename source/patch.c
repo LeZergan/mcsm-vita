@@ -1240,7 +1240,13 @@ static int playback_dt_is_usable(float value);
  * the engine would have clamped get repaired, and genuine multi-second stalls
  * still clamp so a scene load cannot fling the pose across the room. */
 #define ANIM_DT_MIN_SECONDS   (1.0f / 240.0f)
-#define ANIM_DT_MAX_SECONDS   (1.0f / 4.0f)
+/* ★ 2026-08-11 — 0.25s -> 0.1s. The ceiling only ever applies to a frame the engine
+ * ALREADY clamped at 0.1s (Metrics::NewFrame's own limit, device-confirmed), so any
+ * ceiling above that is pure overshoot: it hands animation MORE time than the engine
+ * believes passed, on exactly the frames that are already the roughest. Matching the
+ * engine's clamp means the repair can restore a truncated hitch and can never
+ * manufacture motion beyond it. */
+#define ANIM_DT_MAX_SECONDS   (1.0f / 10.0f)
 #define ANIM_STALL_RESET_US   500000ULL
 
 static float clamp_animation_dt(float value) {
@@ -1280,11 +1286,30 @@ static float animation_governor_update(float engine_frame_time,
     if (elapsed_us >= 4000ULL && elapsed_us <= ANIM_STALL_RESET_US) {
         target = clamp_animation_dt((float)elapsed_us / 1000000.0f);
     } else if (elapsed_us > ANIM_STALL_RESET_US) {
-        /* Never feed a multi-second load pause straight into simulation, but do
-         * account for a useful slice of it. Reusing the previous small dt dropped
-         * the whole pause while audio kept playing, which is what permanently
-         * moved mouths and animation behind the soundtrack. */
-        target = ANIM_DT_MAX_SECONDS;
+        /* ★ 2026-08-11 — A LOAD IS A PAUSE, NOT LOST TIME. THIS IS THE LURCH.
+         *
+         * This used to force ANIM_DT_MAX (0.25s) after any stall over half a second,
+         * on the reasoning that dropping the pause entirely is what put mouths behind
+         * the soundtrack. That reasoning conflates two different events:
+         *
+         *   - a HITCH (100-500ms): the game kept running, audio kept playing, and the
+         *     engine's own 0.1s clamp threw away the difference. Real time genuinely
+         *     elapsed and animation must catch up. The branch above does exactly that.
+         *   - a LOAD (multi-second): the whole engine was blocked. Audio is blocked
+         *     with it -- there is no soundtrack running ahead to catch up TO. Feeding
+         *     0.25s here does not fix a desync, it invents a quarter-second of motion
+         *     nobody asked for, applied to every animated object at once, on the first
+         *     frame after every scene transition. That single frame is the visible
+         *     lurch, and it is why this whole repair was switched off as "breaks
+         *     gameplay animation" rather than being narrowed to the case it fixes.
+         *
+         * Advance by nothing across a load: hand back the engine's own value so this
+         * frame is a no-op and the pose resumes exactly where it paused. */
+        if (playback_dt_is_usable(engine_frame_time)) {
+            target = clamp_animation_dt(engine_frame_time);
+        } else {
+            target = ANIM_DT_MIN_SECONDS;
+        }
     } else if (playback_dt_is_usable(engine_frame_time)) {
         target = clamp_animation_dt(engine_frame_time);
     } else if (playback_dt_is_usable(engine_actual_frame_time)) {
@@ -2181,6 +2206,229 @@ static void repair_resource_locations(void) {
     }
 }
 
+/* ★★ 2026-08-11 — THE <User> RESOURCE SPACE, AND WHY PREFERENCES ARE NEVER READ.
+ *
+ * `prefs_create` (2026-08-08) fixed the WRITE half of settings persistence. This is
+ * the READ half, and it had no implementation at all -- which is why the chosen
+ * Jesse and the current save slot still revert even when prefs.prop is written
+ * correctly. The write was landing in a file nothing ever opened.
+ *
+ * GameEngine::Initialize2 (0xcb2548) runs, in this order:
+ *     GameEngine::OpenUserSpace()      0xcafdd0
+ *     GameEngine::OpenTempSpace()      0xcaffd8
+ *     GameEngine::OpenUserPrefs()      0xcb1870
+ *     GameEngine::OpenProjectPrefs()   0xcb1d94
+ *
+ * OpenUserPrefs is the preference LOAD, and it opens with:
+ *     Symbol("<User>/");
+ *     ResourceConcreteLocation::Find(sym)
+ *     cmp r0,#0 ; beq <exit>                                     (0xcb18a8)
+ * -- a CONCRETE location literally named "<User>/". It then looks up the LOGICAL
+ * location "<User>", asks it for "prefs.prop", opens a DataStream and deserialises
+ * through MetaStream::Attach. All four steps depend on the first.
+ *
+ * Neither location exists on this port. OpenUserSpace builds them by asking the
+ * platform layer through TTPlatform vtable+0x110 for a user directory; that returns
+ * NULL here (there is no Android per-app user dir), so the NULL check at 0xcafe50
+ * skips straight past ResourceFinder::InitializeUser and nothing is ever registered.
+ * OpenTempSpace is the identical function against vtable+0x11c, and THAT one
+ * succeeds -- which is exactly why <Temp> works and every save path in this file is
+ * redirected into it.
+ *
+ * So the repair is to finish the job OpenUserSpace started, in OpenUserSpace itself,
+ * one call before the prefs load needs it:
+ *
+ *   1. ResourceLocationFactory::CreateDirectory(Symbol("<User>/"), String(dir), false)
+ *      -- the engine's own factory, and the same call its Lua binding
+ *      luaResourceCreateConcreteDirectoryLocation (0xc49f78) makes. It gives us a
+ *      concrete location under the name OpenUserPrefs looks for.
+ *   2. ResourceFinder::InitializeUser(loc) -- the engine's own registration, the one
+ *      OpenUserSpace skipped. Disassembly (0xb63eac) shows it creates the logical
+ *      location "<User>", maps our concrete location into it, and adds the set to
+ *      the master locator at priority 10000.
+ *
+ * The directory is <Temp>'s, deliberately: it is the one location on this port known
+ * to be writable (every save bundle lands there) and it is where every
+ * logical:<User>/ path in this file is already redirected, so read and write resolve
+ * to the same bytes rather than to two directories that have to be kept in step.
+ *
+ * ☠ WHY THIS IS NOT THE `resloc_repair` EXPERIMENT AGAIN. That one calls
+ * InitializeUser with <Temp>'s CONCRETE location, whose name symbol is "<Temp>/" --
+ * so ResourceConcreteLocation::Find("<User>/") still returns NULL and OpenUserPrefs
+ * still exits at the first branch. It also runs from GameEngine::Start, which is
+ * after Initialize2, so the prefs load is long over by the time it applies. It could
+ * not have fixed the read no matter what it did.
+ *
+ * Object sizes are read off the frames rather than assumed: Symbol is 8 bytes
+ * (sp+16..23 in a 24-byte frame), String and Ptr<> are 4 (sp+0 / sp+4 / sp+12 in the
+ * same frame). Every step is checked before the next, and if any of them fails the
+ * engine is left exactly as it was. */
+#define MCSM_USER_SPACE_NAME "<User>/"
+#define MCSM_USER_SPACE_DIR  DATA_PATH "Temp/"
+
+typedef void (*SymbolCtorFn)(void *self, const char *s);
+typedef void (*StringCtorFn)(void *self, const char *s);
+typedef void (*RclFindFn)(void *out_ptr, const void *sym);
+typedef void (*RclModRefFn)(void *obj, int delta);
+typedef void (*RlfCreateDirFn)(void *out_ptr, const void *sym, const void *str, int flag);
+
+/* Returns the raw ResourceConcreteLocation registered under `name`, or NULL.
+ * Find() returns a Ptr<> that has already addref'd, so the reference is dropped
+ * again here -- the caller only ever uses the result as a yes/no, exactly as
+ * luaResourceCreateConcreteDirectoryLocation does with the same call. */
+static void *resource_concrete_location_find(const char *name) {
+    static SymbolCtorFn s_symctor;
+    static RclFindFn    s_find;
+    static RclModRefFn  s_modref;
+    if (!s_symctor) s_symctor = (SymbolCtorFn)so_symbol(&so_mod_gameengine, "_ZN6SymbolC1EPKc");
+    if (!s_find)    s_find    = (RclFindFn)so_symbol(&so_mod_gameengine,
+                                    "_ZN24ResourceConcreteLocation4FindERK6Symbol");
+    if (!s_modref)  s_modref  = (RclModRefFn)so_symbol(&so_mod_gameengine,
+                                    "_Z17PtrModifyRefCountP24ResourceConcreteLocationi");
+    if (!s_symctor || !s_find) {
+        return NULL;
+    }
+
+    uint64_t sym = 0;               /* Symbol is 8 bytes */
+    s_symctor(&sym, name);
+    void *out = NULL;               /* Ptr<ResourceConcreteLocation> is 4 bytes */
+    s_find(&out, &sym);
+    if (out && s_modref) {
+        s_modref(out, -1);
+    }
+    return out;
+}
+
+static void ensure_user_space_location(void) {
+    static int done = 0;
+    if (done) return;
+    done = 1;
+
+    if (!mcsm_cfg()->user_space_repair) {
+        l_info("USERSPACE: repair disabled (user_space_repair=off) — <User> stays "
+               "unregistered, so GameEngine::OpenUserPrefs will exit at its first "
+               "branch and preferences will not be read back this boot");
+        return;
+    }
+
+    if (resource_concrete_location_find(MCSM_USER_SPACE_NAME)) {
+        l_info("USERSPACE: the platform registered '%s' itself — nothing to repair",
+               MCSM_USER_SPACE_NAME);
+        g_user_location_registered = 1;
+        return;
+    }
+
+    SymbolCtorFn   symctor = (SymbolCtorFn)so_symbol(&so_mod_gameengine, "_ZN6SymbolC1EPKc");
+    StringCtorFn   strctor = (StringCtorFn)so_symbol(&so_mod_gameengine, "_ZN6StringC1EPKc");
+    RlfCreateDirFn mkdirfn = (RlfCreateDirFn)so_symbol(&so_mod_gameengine,
+        "_ZN23ResourceLocationFactory15CreateDirectoryERK6SymbolRK6Stringb");
+    RfInitUserFn   inituser = (RfInitUserFn)so_symbol(&so_mod_gameengine,
+        "_ZN14ResourceFinder14InitializeUserE3PtrI24ResourceConcreteLocationE");
+    if (!symctor || !strctor || !mkdirfn || !inituser) {
+        l_warn("USERSPACE: Symbol/String/ResourceLocationFactory::CreateDirectory/"
+               "ResourceFinder::InitializeUser not all resolved — cannot build <User>; "
+               "preferences will not be read back");
+        return;
+    }
+
+    uint64_t sym = 0;
+    symctor(&sym, MCSM_USER_SPACE_NAME);
+    void *dir = NULL;               /* String is a 4-byte refcounted pointer */
+    strctor(&dir, MCSM_USER_SPACE_DIR);
+
+    void *loc = NULL;
+    mkdirfn(&loc, &sym, &dir, 0);
+    if (!loc) {
+        l_warn("USERSPACE: ResourceLocationFactory::CreateDirectory('%s', '%s') "
+               "returned NULL — leaving the engine's resource state untouched",
+               MCSM_USER_SPACE_NAME, MCSM_USER_SPACE_DIR);
+        return;
+    }
+
+    /* Hand it to the engine's own registration, which is what OpenUserSpace would
+     * have called had the platform produced a location: it creates the LOGICAL
+     * "<User>", maps this concrete location into it, and adds the set to the master
+     * locator. Both halves of OpenUserPrefs's lookup are satisfied by this one call. */
+    inituser(&loc);
+    g_user_location_registered = 1;
+
+    if (resource_concrete_location_find(MCSM_USER_SPACE_NAME)) {
+        l_info("USERSPACE: ★ built the <User> space the platform never provided — "
+               "concrete '%s' -> %s, logical <User> registered via "
+               "ResourceFinder::InitializeUser. GameEngine::OpenUserPrefs runs next "
+               "and can now LOAD prefs.prop, which is the half of settings "
+               "persistence that has never worked.",
+               MCSM_USER_SPACE_NAME, MCSM_USER_SPACE_DIR);
+    } else {
+        l_warn("USERSPACE: created '%s' but ResourceConcreteLocation::Find still "
+               "does not see it — OpenUserPrefs will exit at 0xcb18a8 as before",
+               MCSM_USER_SPACE_NAME);
+    }
+}
+
+/* Runs once, at boot, on the main thread, with no float arguments — the conditions
+ * SO_CONTINUE needs. The engine is allowed to try first; the repair only fills in
+ * what it left undone. */
+static so_hook g_hook_ge_open_user_space;
+static int hook_ge_open_user_space(void *self) {
+    int ret = SO_CONTINUE(int, g_hook_ge_open_user_space, self);
+    ensure_user_space_location();
+    return ret;
+}
+
+/* ★ 2026-08-11 — TRACE THE PREFERENCE **LOAD**, BECAUSE THE WRITE IS FINE.
+ *
+ * The device settled the write side: SavePrefs produces a valid 64-byte MSV5
+ * property set at ux0:data/mcsm/Temp/prefs.prop. Settings still do not persist,
+ * so what fails is reading it back — and the same log shows prefs.prop is never
+ * opened for READING at any point in a session, including boot.
+ *
+ * It also killed the theory this file was carrying: `USERSPACE: the platform
+ * registered '<User>/' itself` and `RESLOC: InitializeUser(concrete=0x842792a0)`.
+ * The engine DOES build <User> on this device, so "OpenUserSpace's platform call
+ * returns NULL here" was wrong. ensure_user_space_location() correctly did nothing.
+ *
+ * Which leaves the actual question unanswered: OpenUserPrefs (0xcb1870) has four
+ * sequential ways to give up before it opens a file, and the log cannot tell them
+ * apart. Rather than guess a fifth time, report which stage it reaches. Both Finds
+ * are replicated here read-only — no engine state is touched, and the real call runs
+ * immediately after regardless of what this observes. */
+static void *g_game_engine_self = NULL;
+static so_hook g_hook_ge_open_user_prefs;
+static int hook_ge_open_user_prefs(void *self) {
+    /* Captured so the preference load can be re-run later, once the resource it
+     * needs actually exists. See prefs_reload_once() below. */
+    g_game_engine_self = self;
+#ifdef DEBUG_SOLOADER
+    void *concrete = resource_concrete_location_find(MCSM_USER_SPACE_NAME);
+    void *logical = NULL;
+    {
+        typedef void (*RllFindFn)(void *out, const void *sym);
+        SymbolCtorFn symctor = (SymbolCtorFn)so_symbol(&so_mod_gameengine, "_ZN6SymbolC1EPKc");
+        RllFindFn    llfind  = (RllFindFn)so_symbol(&so_mod_gameengine,
+                                   "_ZN23ResourceLogicalLocation4FindERK6Symbol");
+        if (symctor && llfind) {
+            uint64_t sym = 0;
+            symctor(&sym, "<User>");
+            llfind(&logical, &sym);
+        }
+    }
+    l_info("PREFSLOAD: OpenUserPrefs ENTER — concrete '<User>/'=%p logical '<User>'=%p. "
+           "The engine exits at 0xcb18a8 if the concrete is NULL, and cannot reach "
+           "MetaStream::Attach without the logical. A 'SAVEIO open ... prefs.prop' "
+           "with flags=0x0 after this line is the load actually happening; no such "
+           "line means it gave up before touching the file.",
+           concrete, logical);
+#endif
+    int ret = SO_CONTINUE(int, g_hook_ge_open_user_prefs, self);
+#ifdef DEBUG_SOLOADER
+    l_info("PREFSLOAD: OpenUserPrefs RETURN ret=%d (root prefs.prop=%lld bytes, "
+           "Temp/prefs.prop=%lld bytes at this moment)",
+           ret, file_size(DATA_PATH "prefs.prop"), file_size(DATA_PATH "Temp/prefs.prop"));
+#endif
+    return ret;
+}
+
 static void patch_resource_default_location(void) {
     (void)hook_symbol_checked(&so_mod_gameengine,
                               "_ZN14ResourceFinder14InitializeTempE3PtrI24ResourceConcreteLocationE",
@@ -2192,6 +2440,16 @@ static void patch_resource_default_location(void) {
                               "ResourceFinder::InitializeUser",
                               (uintptr_t)&hook_rf_initialize_user,
                               &g_hook_rf_init_user);
+    (void)hook_symbol_checked(&so_mod_gameengine,
+                              "_ZN10GameEngine13OpenUserSpaceEv",
+                              "GameEngine::OpenUserSpace",
+                              (uintptr_t)&hook_ge_open_user_space,
+                              &g_hook_ge_open_user_space);
+    (void)hook_symbol_checked(&so_mod_gameengine,
+                              "_ZN10GameEngine13OpenUserPrefsEv",
+                              "GameEngine::OpenUserPrefs",
+                              (uintptr_t)&hook_ge_open_user_prefs,
+                              &g_hook_ge_open_user_prefs);
 }
 
 static void patch_saveprefs_path(void) {
@@ -2873,18 +3131,30 @@ static void *hook_platform_android_get_base_user_directory(void *out_str, void *
         if (chars_ptr && chars_ptr < 0x90000000u) {
             length = *(uint32_t *)(uintptr_t)(chars_ptr - 4);
             const char *chars = (const char *)(uintptr_t)chars_ptr;
-            uint32_t n = length < 160U ? length : 160U;
+            /* ☠ DO NOT TRUST THE LENGTH FIELD. It has now been misread twice: once
+             * as 1935895855 (obvious garbage, correctly disbelieved) and once as 1,
+             * which is NOT obviously garbage -- it printed a plausible-looking
+             * one-character directory "u" and sent a whole diagnosis chasing it. The
+             * string almost certainly starts "ux0:...", so a length of 1 truncates it
+             * at exactly the point where it still reads as a real answer.
+             *
+             * Walk to the NUL instead, bounded, and print BOTH so the disagreement is
+             * visible rather than silently resolved in favour of the header. */
             uint32_t i;
-            for (i = 0; i < n; ++i) {
+            for (i = 0; i < 160U; ++i) {
                 char c = chars[i];
+                if (c == '\0') break;
                 safe[i] = (c >= 32 && c < 127) ? c : '.';
             }
             safe[i] = '\0';
+            l_info("SAVETRACE: GetBaseUserDirectory this=%p out=%p chars_ptr=0x%08X "
+                   "header_length=%u actual_nul_terminated='%s' (trust the second one)",
+                   this_ptr, out_str, chars_ptr, length, safe);
         } else {
             safe[0] = '\0';
+            l_info("SAVETRACE: GetBaseUserDirectory this=%p out=%p chars_ptr=0x%08X "
+                   "— unreadable", this_ptr, out_str, chars_ptr);
         }
-        l_info("SAVETRACE: GetBaseUserDirectory this=%p out=%p chars_ptr=0x%08X length=%u chars='%s'",
-               this_ptr, out_str, chars_ptr, length, safe);
         /* 2026-07-02 (6th pass): REMOVED the forced override. SAVEREDIRECT2's
          * device log proved it was actively harmful: <Temp> is apparently
          * defined RELATIVE to this same base-directory string, so forcing it
@@ -4416,6 +4686,53 @@ REDIRECT_ARG1_HOOK(hook_lua_property_clearkeys,  g_hook_lua_property_clearkeys)
  * the log when the engine rolls it back to the loaded save point (if the anchor
  * event is not found, "delete everything after" can mean "delete all"). Both are
  * silent today. Log the whole lifecycle so one test session identifies which. */
+/* ★★ 2026-08-11 — THE ENGINE WIPES THE WHOLE EVENT LOG WHEN IT CANNOT FIND THE
+ * ANCHOR EVENT. This is "my in-game choices got corrupted", and it is a real
+ * unsigned-underflow landmine in the shipped engine, not a porting artifact.
+ *
+ * SaveLoad_Load calls EventLog_TruncateAtSave(serial) on EVERY load, which is
+ *     DeleteAllEventsAfterEvent(<log>.estore, "Save Serial", serial)
+ * -- three arguments. luaDeleteAllEventsAfterEvent (0xcbc8bc) then:
+ *
+ *     cmp r4,#3 ; ble 0xcbcc50      ; <=3 args -> the 4th (bool) is forced to 0
+ *     ... walk EventStorage looking for the "Save Serial" event with that value ...
+ *     found     -> r4 = index of the anchor
+ *     NOT found -> 0xcbcc88: mvn r4,#0        ; ★ r4 = 0xFFFFFFFF
+ *     ...
+ *     0xcbcc78: add r1, r4, #1     ; ★ 0xFFFFFFFF + 1 WRAPS TO 0
+ *     0xcbcc7c: mvn r2, #0         ;   to = 0xFFFFFFFF
+ *     0xcbcc80: bl EventStorage::DeleteEvents(0, 0xFFFFFFFF)   ; DELETE EVERYTHING
+ *
+ * "Delete everything after an event that isn't there" evaluates to "delete
+ * everything". On Android the anchor is always present so it never fires. Here it
+ * fires whenever the log the game opened is not the log that save was recorded in --
+ * which, until the <User> repair above, was every single launch, because
+ * EventLog_GetLogName derives the log name from GetPreferences()["Saved Game Bundle"]
+ * and preferences were never read back. Each load wiped the lot, then the next
+ * session's choices went into a log that would be wiped again.
+ *
+ * The guard is exact rather than heuristic. EventStorage::DeleteEvents has exactly
+ * two callers in the whole binary, both inside this one function, and from the
+ * three-argument Lua form the `from` operand is always `anchorIndex + 1` -- so
+ * from == 0 is unreachable for ANY found anchor (index 0 yields 1) and can only be
+ * the underflow. Refusing that single case turns "wipe the log" back into the
+ * correct answer for a missing anchor, which is "there is nothing after it to
+ * delete". Nothing else about the function changes. */
+static volatile int g_eventlog_truncate_active = 0;
+
+static so_hook g_hook_eventstorage_delete_events;
+static void hook_eventstorage_delete_events(void *self, uint32_t from, uint32_t to) {
+    if (g_eventlog_truncate_active && from == 0u && to == 0xFFFFFFFFu) {
+        l_warn("EVENTLOG: ★ REFUSED a full event-log wipe. "
+               "DeleteAllEventsAfterEvent could not find its anchor event, and the "
+               "engine's 'delete after index -1' underflowed to 'delete events "
+               "0..end' — every choice in this log. Nothing after a missing anchor "
+               "means nothing to delete, so the log is left intact.");
+        return;
+    }
+    SO_CONTINUE_VOID(g_hook_eventstorage_delete_events, self, from, to);
+}
+
 static so_hook g_hook_lua_delete_all_events_after;
 static int hook_lua_delete_all_events_after(void *L) {
 #ifdef DEBUG_SOLOADER
@@ -4428,21 +4745,94 @@ static int hook_lua_delete_all_events_after(void *L) {
     }
 #endif
     redirect_logical_user_to_temp(L, 1);
-    return SO_CONTINUE(int, g_hook_lua_delete_all_events_after, L);
+
+    /* Arm the guard only for the three-argument form the game actually uses -- that
+     * is the one whose `from` operand is anchorIndex + 1 and can therefore underflow
+     * to 0. A four-argument caller passes the index unmodified, where 0 is a
+     * legitimate "delete from the very first event", and is left alone. */
+    if (!g_lua_gettop_fast) {
+        g_lua_gettop_fast = (LuaGetTopFn)so_symbol(&so_mod_gameengine, "lua_gettop");
+    }
+    /* If lua_gettop cannot be resolved, assume the three-argument form: that is what
+     * the shipped scripts pass, and arming the guard is the safe default -- the only
+     * call it can block is the underflow. */
+    const int argc = g_lua_gettop_fast ? g_lua_gettop_fast(L) : 3;
+    const int arm = (argc <= 3);
+    if (arm) {
+        g_eventlog_truncate_active++;
+    }
+    int ret = SO_CONTINUE(int, g_hook_lua_delete_all_events_after, L);
+    if (arm) {
+        g_eventlog_truncate_active--;
+    }
+    return ret;
+}
+
+/* ★★ 2026-08-11 — THE EVENT LOG'S NAME COMES FROM PREFERENCES, SO IT INHERITS EVERY
+ * PREFERENCE BUG.
+ *
+ * EventLog.lua: `logName = string.sub(GetPreferences()["Saved Game Bundle"], 1, -8)
+ * .. "_id"`, then `resourceName = "logical:<User>/" .. logName .. ".estore"`. So the
+ * file the player's choices are written into is derived from prefs.prop -- the same
+ * property set that, until the prefs_reload fix above, was written and never read
+ * back. With that key missing the name degenerates (nil or a bare "_id"), and every
+ * choice for the session goes into a log that does not correspond to the save.
+ *
+ * SaveLoad_GetSlot() and ChoiceStats' BundleGetResource(SaveLoad_GetSlot(), ...) read
+ * the SAME key, which is why "choices" and "settings" have always failed together and
+ * why fixing the preference load is most of fixing choices.
+ *
+ * This is the belt to that braces: a name that did not survive the preference lookup
+ * is repaired from the save slot, which is knowable without prefs -- slot 1 is what
+ * every path in this port uses, and the file it names is on the card. A degenerate
+ * name is REFUSED rather than bound, because binding it creates a second event log
+ * that silently competes with the real one. */
+static int event_log_name_is_degenerate(const char *s) {
+    if (!s || !*s) return 1;
+    /* The real form is "<slot>_id" — anything shorter than that never carried a slot. */
+    if (strcmp(s, "_id") == 0) return 1;
+    if (!strstr(s, "saveslot") && !strstr(s, "saveSlot")) return 1;
+    return 0;
 }
 
 static so_hook g_hook_lua_event_log_create;
 static int hook_lua_event_log_create(void *L) {
-#ifdef DEBUG_SOLOADER
-    static uint32_t count = 0;
     const char *name = trace_arg_str(L, 1);
     const char *res  = trace_arg_str(L, 3);
+#ifdef DEBUG_SOLOADER
+    static uint32_t count = 0;
     if (++count <= 24U) {
         l_info("EVENTLOG: EventLogCreate #%u name='%s' resource='%s'",
                count, name ? name : "(?)", res ? res : "(?)");
     }
 #endif
-    redirect_logical_user_to_temp(L, 3); /* the backing-resource path arg */
+
+    if (event_log_name_is_degenerate(name) || event_log_name_is_degenerate(res)) {
+        /* Repair both arguments to the slot the rest of this port already uses, so
+         * the choices land in the log the save actually references. */
+        typedef const char *(*LuaPushStringFn3)(void *, const char *);
+        typedef void (*LuaReplaceFn3)(void *, int);
+        LuaPushStringFn3 pushs = (LuaPushStringFn3)so_symbol(&so_mod_gameengine, "lua_pushstring");
+        LuaReplaceFn3    repl  = (LuaReplaceFn3)so_symbol(&so_mod_gameengine, "lua_replace");
+        if (pushs && repl) {
+            pushs(L, "_saveslot1_id");            repl(L, 1);
+            pushs(L, "logical:<Temp>/_saveslot1_id.estore"); repl(L, 3);
+            l_warn("EVENTLOG: ★ EventLogCreate was given a name the preference lookup "
+                   "did not survive (name='%s' resource='%s') — rebuilt as "
+                   "'_saveslot1_id' / 'logical:<Temp>/_saveslot1_id.estore'. Choices "
+                   "made this session would otherwise have gone into a log the save "
+                   "does not reference.",
+                   name ? name : "(nil)", res ? res : "(nil)");
+        } else {
+            l_warn("EVENTLOG: EventLogCreate name is degenerate (name='%s') and "
+                   "lua_pushstring/lua_replace are unavailable — choices this session "
+                   "will not be recorded against the save",
+                   name ? name : "(nil)");
+        }
+    } else {
+        redirect_logical_user_to_temp(L, 3); /* the backing-resource path arg */
+    }
+
     int ret = SO_CONTINUE(int, g_hook_lua_event_log_create, L);
 #ifdef DEBUG_SOLOADER
     if (count <= 24U) {
@@ -4574,6 +4964,93 @@ static void prefs_create_resource_once(void *L) {
            "missing registration LocateResource needed.", before);
 }
 
+/* ★★ 2026-08-11 — THE PREFERENCE LOAD RUNS BEFORE THE RESOURCE IT NEEDS EXISTS.
+ *
+ * Device-proven, not inferred. The write side works: SavePrefs produces a valid
+ * 64-byte MSV5 property set at Temp/prefs.prop. In the same 3375-line session
+ * prefs.prop is NEVER opened for reading — so the settings are on the card and
+ * nothing loads them, which is exactly "settings do not save" from the player's side.
+ *
+ * The reason is an ordering problem, and it is the same LocateResource wall that
+ * `prefs_create` was written for. GameEngine::Initialize2 runs:
+ *     OpenUserSpace -> OpenTempSpace -> OpenUserPrefs -> ... -> SetupPreferences
+ * and OpenUserPrefs is where prefs are read. But the only thing that makes
+ * prefs.prop locatable on this port is the luaCreate() call in
+ * prefs_create_resource_once(), which cannot run until there is a lua_State — and
+ * there is none until long after Initialize2. So the load asks for a resource that
+ * will not exist for another several seconds, gives up before touching a file, and
+ * the first SavePrefs then registers it and writes happily into the void.
+ *
+ * The repair is to run the load a second time, at the first moment the resource is
+ * registered AND the engine has not yet consumed its preferences:
+ * luaGetPrefsLoaded (0xc6618c) is the game asking "are the prefs in yet?", which is
+ * precisely that moment. Register, re-open, then answer the question honestly.
+ *
+ * Deliberately narrow:
+ *   - once per launch;
+ *   - only when a prefs file with real content is actually on the card, so an empty
+ *     or missing file can never be loaded over the engine's live defaults;
+ *   - only with the GameEngine instance the engine itself passed to OpenUserPrefs,
+ *     never a guessed pointer;
+ *   - `prefs_reload = off` in graphics.txt disables it.
+ * If any of those is not satisfied it does nothing at all, which is today's
+ * behaviour. */
+static void prefs_reload_once(void *L) {
+    static int done = 0;
+    if (done) return;
+
+    if (!mcsm_cfg()->prefs_reload) {
+        done = 1;
+        l_info("PREFSLOAD: reload disabled (prefs_reload=off) — preferences stay as "
+               "the boot-time load left them");
+        return;
+    }
+    if (!g_game_engine_self) {
+        return;  /* OpenUserPrefs has not run yet; try again on the next call */
+    }
+
+    const long long temp_sz = file_size(DATA_PATH "Temp/prefs.prop");
+    const long long root_sz = file_size(DATA_PATH "prefs.prop");
+    if (temp_sz <= 0 && root_sz <= 0) {
+        /* Nothing saved yet — a first-ever launch. Loading here would replace the
+         * engine's defaults with nothing. */
+        done = 1;
+        l_info("PREFSLOAD: no saved preferences on the card yet (Temp=%lld root=%lld) "
+               "— nothing to reload; this launch's first save creates them",
+               temp_sz, root_sz);
+        return;
+    }
+
+    done = 1;
+
+    /* Make the resource exist before asking for it again. This is the same one-shot
+     * registration the first SavePrefs used to perform; doing it here simply moves it
+     * ahead of the read instead of behind it. */
+    prefs_create_resource_once(L);
+
+    typedef int (*OpenUserPrefsFn)(void *self);
+    OpenUserPrefsFn open_prefs = (OpenUserPrefsFn)so_symbol(&so_mod_gameengine,
+        "_ZN10GameEngine13OpenUserPrefsEv");
+    if (!open_prefs) {
+        l_warn("PREFSLOAD: GameEngine::OpenUserPrefs not resolved — cannot re-read "
+               "preferences; settings will not persist");
+        return;
+    }
+
+    const int rc = open_prefs(g_game_engine_self);
+    l_info("PREFSLOAD: ★ re-ran GameEngine::OpenUserPrefs after registering the "
+           "resource (rc=%d, Temp/prefs.prop=%lld bytes, root=%lld). The boot-time "
+           "load ran before luaCreate could make prefs.prop locatable, which is why "
+           "settings were written and never read back.",
+           rc, temp_sz, root_sz);
+}
+
+static so_hook g_hook_lua_get_prefs_loaded;
+static int hook_lua_get_prefs_loaded(void *L) {
+    prefs_reload_once(L);
+    return SO_CONTINUE(int, g_hook_lua_get_prefs_loaded, L);
+}
+
 static so_hook g_hook_lua_save_prefs;
 static int hook_lua_save_prefs(void *L) {
 #ifdef DEBUG_SOLOADER
@@ -4582,6 +5059,10 @@ static int hook_lua_save_prefs(void *L) {
     l_info("SAVETRACE: SavePrefs ENTER #%u", count);
 #endif
     prefs_create_resource_once(L);
+    /* Stamp both copies BEFORE the save so the mirror can tell which one the engine
+     * wrote instead of assuming. Assuming is what froze the preferences at their
+     * first-ever contents — see the PREFSYNC comment block in init.c. */
+    mcsm_prefs_snapshot_before_save();
     int ret = SO_CONTINUE(int, g_hook_lua_save_prefs, L);
 #ifdef DEBUG_SOLOADER
     l_info("SAVETRACE: SavePrefs RETURN #%u", count);
@@ -4649,6 +5130,22 @@ static int hook_lua_load(void *L) {
      * on every resource load to produce a value nothing could read. The redirect is
      * the entire job of this hook. */
     redirect_logical_user_to_temp(L, 1);
+    /* ★ 2026-08-11 — SECOND, GUARANTEED TRIGGER FOR THE PREFERENCE RELOAD.
+     *
+     * prefs_reload_once() was hung off luaGetPrefsLoaded alone, on the reasoning that
+     * it is "the game asking whether preferences are in yet". That is the right MOMENT
+     * but the wrong guarantee: nothing establishes that the shipped scripts ever call
+     * it, and if they do not, the reload never runs and settings still do not persist
+     * -- which is what the device reported against a build containing that fix.
+     *
+     * luaLoad runs constantly and very early, so hanging the same once-only call here
+     * as well means the reload cannot be missed. It is a single already-done check
+     * after the first invocation, and every safety condition still lives inside
+     * prefs_reload_once (once per launch, only with a real saved file, only with the
+     * engine pointer the engine itself handed us). Lua does not exist until after
+     * Initialize2 has finished, so this is still safely after the engine's own
+     * SetupPreferences. */
+    prefs_reload_once(L);
     return SO_CONTINUE(int, g_hook_lua_load, L);
 }
 #ifdef DEBUG_SOLOADER
@@ -6919,6 +7416,14 @@ static void patch_dlc_fast_path_hooks(void) {
                               "luaDeleteAllEventsAfterEvent",
                               (uintptr_t)&hook_lua_delete_all_events_after,
                               &g_hook_lua_delete_all_events_after);
+    /* Cold path (save load / episode boundary only) and no float arguments, so it
+     * meets the conditions SO_CONTINUE needs. See the comment on the hook: this is
+     * what stops a missing anchor event from deleting every choice in the log. */
+    (void)hook_symbol_checked(&so_mod_gameengine,
+                              "_ZN12EventStorage12DeleteEventsEjj",
+                              "EventStorage::DeleteEvents",
+                              (uintptr_t)&hook_eventstorage_delete_events,
+                              &g_hook_eventstorage_delete_events);
     (void)hook_symbol_checked(&so_mod_gameengine,
                               "_Z17luaEventLogCreateP9lua_State",
                               "luaEventLogCreate",
@@ -6939,6 +7444,14 @@ static void patch_dlc_fast_path_hooks(void) {
                               "luaSavePrefs",
                               (uintptr_t)&hook_lua_save_prefs,
                               &g_hook_lua_save_prefs);
+    /* The game asking "are preferences loaded?" is the last moment before it starts
+     * consuming them, and the first at which the resource can be registered. That is
+     * where the boot-time load gets its second, working attempt. */
+    (void)hook_symbol_checked(&so_mod_gameengine,
+                              "_Z17luaGetPrefsLoadedP9lua_State",
+                              "luaGetPrefsLoaded",
+                              (uintptr_t)&hook_lua_get_prefs_loaded,
+                              &g_hook_lua_get_prefs_loaded);
 #ifdef DEBUG_SOLOADER
     (void)hook_symbol_checked(&so_mod_gameengine,
                               "_Z30luaDownloadDocumentsFromServerP9lua_State",

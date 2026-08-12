@@ -24,6 +24,8 @@
 #include <string.h>
 #include <errno.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <dirent.h>
 #include <sys/stat.h>
 
 #include <psp2/appmgr.h>
@@ -435,72 +437,241 @@ static void seed_empty_prefs_files(void) {
     }
 }
 
-/* Native SavePrefs locates a bare preference resource at the data root, while
- * the Lua save hooks resolve that same bare name through <Temp>. Independent
- * placeholders made a successful write invisible to the next reader. Mirror
- * the newest non-empty copy so existing installs are repaired without losing
- * either side's settings. */
-static void sync_prefs_files(int native_save_completed) {
-    static const char *const k_names[] = {
-        "prefs.prop",
-        "user.prop",
-        "game_prefs.prop",
-    };
+/* The engine's preference set lives under one bare name that has to be readable
+ * from two places: the native side locates it at the data root, the Lua save hooks
+ * resolve the same bare name through <Temp>. Independent copies made a successful
+ * write invisible to the next reader, so the two are mirrored.
+ *
+ * ★ 2026-08-11 — THE MIRROR WAS DESTROYING EVERY SAVE AFTER THE FIRST.
+ *
+ * The post-save rule was `if (native_save_completed && have_root) copy root -> temp`,
+ * unconditionally, on the stated assumption that SavePrefs writes the root copy. But
+ * `prefs_create` (default on since 2026-08-08) registers the resource as
+ * `logical:<Temp>/prefs.prop`, which is what makes SavePrefs writeable at all -- so
+ * the engine writes the TEMP copy. The sequence is then:
+ *
+ *   save #1  engine writes Temp (real data); root is still the 0-byte seed, so
+ *            have_root is false and the temp -> root branch runs. Both sides good.
+ *   save #2  engine writes Temp (NEW data); have_root is now true, so root -> temp
+ *            runs and copies save #1 back over save #2.
+ *   save #3+ identical. The preferences are frozen at their first-ever contents.
+ *
+ * prefs.prop is where the chosen Jesse and the current save-slot pointer live, which
+ * is exactly the reported symptom: the selection sticks for one session and then
+ * reverts for good, while the save bundles -- which never go through this mirror --
+ * keep working.
+ *
+ * The repair is to stop guessing which side the engine wrote. Stamp both files
+ * before the native save and compare after: the one that actually changed is the
+ * authoritative copy, whichever it turns out to be. That is correct no matter which
+ * way `prefs_create` or a future engine change routes the write, and when NEITHER
+ * side changed it says so instead of mirroring something at random. */
+typedef struct {
+    int       present;
+    long long size;
+    time_t    mtime;
+} PrefsStamp;
 
-    for (int i = 0; i < (int)(sizeof(k_names) / sizeof(k_names[0])); ++i) {
-        char root[256];
-        char temp[256];
-        struct stat root_st;
-        struct stat temp_st;
-        sceClibSnprintf(root, sizeof(root), DATA_PATH "%s", k_names[i]);
-        sceClibSnprintf(temp, sizeof(temp), DATA_PATH "Temp/%s", k_names[i]);
+static const char *const k_prefs_names[] = {
+    "prefs.prop",
+    "user.prop",
+    "game_prefs.prop",
+};
+#define PREFS_NAME_COUNT ((int)(sizeof(k_prefs_names) / sizeof(k_prefs_names[0])))
 
-        const int have_root = stat(root, &root_st) == 0 && root_st.st_size > 0;
-        const int have_temp = stat(temp, &temp_st) == 0 && temp_st.st_size > 0;
-        const char *src = NULL;
-        const char *dst = NULL;
+static PrefsStamp g_prefs_before[PREFS_NAME_COUNT][2]; /* [name][0 = root, 1 = Temp] */
+static int        g_prefs_before_valid = 0;
 
-        if (native_save_completed && have_root) {
-            /* SavePrefs is native and writes the bare resource discovered at the
-             * data root. Prefer it even when FAT's coarse timestamp and serialized
-             * size cannot reveal that its contents changed. */
-            src = root;
-            dst = temp;
-        } else if (have_root && !have_temp) {
-            src = root;
-            dst = temp;
-        } else if (have_temp && !have_root) {
-            src = temp;
-            dst = root;
-        } else if (have_root && have_temp) {
-            if (root_st.st_mtime > temp_st.st_mtime) {
-                src = root;
-                dst = temp;
-            } else if (temp_st.st_mtime > root_st.st_mtime) {
-                src = temp;
-                dst = root;
-            } else if (root_st.st_size != temp_st.st_size) {
-                /* FAT timestamps are coarse; preserve the larger serialized set
-                 * when two writes land in the same timestamp tick. */
-                src = (root_st.st_size > temp_st.st_size) ? root : temp;
-                dst = (src == root) ? temp : root;
-            }
+static void prefs_paths(int i, char *root, size_t root_sz, char *temp, size_t temp_sz) {
+    sceClibSnprintf(root, root_sz, DATA_PATH "%s", k_prefs_names[i]);
+    sceClibSnprintf(temp, temp_sz, DATA_PATH "Temp/%s", k_prefs_names[i]);
+}
+
+static PrefsStamp prefs_stamp(const char *path) {
+    PrefsStamp s = { 0, 0, 0 };
+    struct stat st;
+    if (stat(path, &st) == 0) {
+        s.present = 1;
+        s.size    = (long long)st.st_size;
+        s.mtime   = st.st_mtime;
+    }
+    return s;
+}
+
+static int prefs_stamp_changed(const PrefsStamp *a, const PrefsStamp *b) {
+    return a->present != b->present || a->size != b->size || a->mtime != b->mtime;
+}
+
+/* Byte comparison, so an identical mirror is skipped entirely. Rewriting a file with
+ * its own contents is not harmless here: it moves the mtime, and the mtime is the
+ * tie-breaker the boot-time reconciliation depends on. */
+static int files_identical(const char *a, const char *b) {
+    const long long sa = file_size(a);
+    const long long sb = file_size(b);
+    if (sa < 0 || sb < 0 || sa != sb) {
+        return 0;
+    }
+    if (sa == 0) {
+        return 1;
+    }
+
+    FILE *fa = fopen(a, "rb");
+    if (!fa) {
+        return 0;
+    }
+    FILE *fb = fopen(b, "rb");
+    if (!fb) {
+        fclose(fa);
+        return 0;
+    }
+
+    int same = 1;
+    char ba[4096];
+    char bb[4096];
+    for (;;) {
+        const size_t na = fread(ba, 1, sizeof(ba), fa);
+        const size_t nb = fread(bb, 1, sizeof(bb), fb);
+        if (na != nb || memcmp(ba, bb, na) != 0) {
+            same = 0;
+            break;
         }
-
-        if (src && file_copy(src, dst)) {
-            l_info("PREFSYNC: mirrored %s -> %s", src, dst);
-        } else if (src) {
-            l_warn("PREFSYNC: failed to mirror %s -> %s", src, dst);
+        if (na == 0) {
+            break;
         }
+    }
+    fclose(fb);
+    fclose(fa);
+    return same;
+}
+
+static void prefs_mirror(const char *src, const char *dst, const char *why) {
+    if (files_identical(src, dst)) {
+        return; /* already in sync — do not churn the mtime */
+    }
+    if (file_copy(src, dst)) {
+        l_info("PREFSYNC: mirrored %s -> %s (%s)", src, dst, why);
+    } else {
+        l_warn("PREFSYNC: FAILED to mirror %s -> %s (%s) — the two copies now "
+               "disagree and the next boot will pick the newer one", src, dst, why);
     }
 }
 
-void mcsm_sync_prefs_files(void) {
-    sync_prefs_files(0);
+/* Called immediately before the native SavePrefs runs. */
+void mcsm_prefs_snapshot_before_save(void) {
+    for (int i = 0; i < PREFS_NAME_COUNT; ++i) {
+        char root[256];
+        char temp[256];
+        prefs_paths(i, root, sizeof(root), temp, sizeof(temp));
+        g_prefs_before[i][0] = prefs_stamp(root);
+        g_prefs_before[i][1] = prefs_stamp(temp);
+    }
+    g_prefs_before_valid = 1;
 }
 
+/* Called immediately after the native SavePrefs returns. */
 void mcsm_sync_prefs_after_save(void) {
-    sync_prefs_files(1);
+    if (!g_prefs_before_valid) {
+        /* No stamp to compare against (a save we did not see the start of). Fall
+         * back to the boot rule, which is newest-wins rather than a fixed direction. */
+        mcsm_sync_prefs_files();
+        return;
+    }
+    g_prefs_before_valid = 0;
+
+    int any_changed = 0;
+
+    for (int i = 0; i < PREFS_NAME_COUNT; ++i) {
+        char root[256];
+        char temp[256];
+        prefs_paths(i, root, sizeof(root), temp, sizeof(temp));
+
+        const PrefsStamp root_after = prefs_stamp(root);
+        const PrefsStamp temp_after = prefs_stamp(temp);
+        const int root_changed = prefs_stamp_changed(&g_prefs_before[i][0], &root_after);
+        const int temp_changed = prefs_stamp_changed(&g_prefs_before[i][1], &temp_after);
+
+        if (!root_changed && !temp_changed) {
+            continue;
+        }
+        any_changed = 1;
+
+        if (root_changed && !temp_changed) {
+            if (root_after.size > 0) {
+                prefs_mirror(root, temp, "the engine wrote the data-root copy");
+            }
+        } else if (temp_changed && !root_changed) {
+            if (temp_after.size > 0) {
+                prefs_mirror(temp, root, "the engine wrote the <Temp> copy");
+            }
+        } else {
+            /* Both moved. Take the newer, then the larger; a serialized property set
+             * only grows as keys are added, so the larger one is the later state when
+             * FAT's two-second timestamp cannot tell them apart. */
+            const char *src = NULL;
+            if (root_after.mtime > temp_after.mtime)      src = root;
+            else if (temp_after.mtime > root_after.mtime) src = temp;
+            else if (root_after.size > temp_after.size)   src = root;
+            else if (temp_after.size > root_after.size)   src = temp;
+            if (src) {
+                prefs_mirror(src, src == root ? temp : root, "both copies changed");
+            }
+        }
+    }
+
+    if (!any_changed) {
+        /* ☠ THIS LINE USED TO ASSERT THAT THE SAVE HAD FAILED. IT WAS WRONG, AND IT
+         * COST A ROUND OF DEVICE TESTING.
+         *
+         * Device log 2026-08-11, inside SavePrefs #1:
+         *     SAVEIO open fd=4 flags=0x601 ux0:data/mcsm/Temp/prefs.prop
+         *     SAVEIO write fd=4 count=64 -> 64
+         *     SAVETRACE: SavePrefs RETURN #1
+         *     PREFSYNC: ...NO preference file changed...      <- said while it HAD
+         * and the file on the card is a valid 64-byte MSV5 property set. The write
+         * lands while the descriptor is still open, and stat() does not see the new
+         * size until close, so a stamp taken in this window legitimately reads
+         * "unchanged" for a save that worked perfectly.
+         *
+         * So this is now what it always was in truth: an observation that the mirror
+         * had nothing to do YET, not a diagnosis. The close (and the size it makes
+         * visible) happens after this hook returns; the next boot's reconciliation
+         * picks the copies up. Report it as information, and say what it does not
+         * mean, because the previous wording is exactly what made a working write
+         * look like the bug. */
+        l_info("PREFSYNC: no preference file had changed SIZE OR MTIME by the time "
+               "SavePrefs returned. This does NOT mean the save failed — the engine "
+               "writes through a descriptor that is still open here, and the card's "
+               "directory entry only updates on close. Check for a 'SAVEIO write' on "
+               "a prefs path just above this line before concluding anything.");
+    }
+}
+
+/* Boot-time reconciliation: no save just happened, so the only usable signal is
+ * which copy is newer. Never overwrites a newer file with an older one. */
+void mcsm_sync_prefs_files(void) {
+    for (int i = 0; i < PREFS_NAME_COUNT; ++i) {
+        char root[256];
+        char temp[256];
+        prefs_paths(i, root, sizeof(root), temp, sizeof(temp));
+
+        const PrefsStamp r = prefs_stamp(root);
+        const PrefsStamp t = prefs_stamp(temp);
+        const int have_root = r.present && r.size > 0;
+        const int have_temp = t.present && t.size > 0;
+        const char *src = NULL;
+
+        if (have_root && !have_temp)      src = root;
+        else if (have_temp && !have_root) src = temp;
+        else if (have_root && have_temp) {
+            if (r.mtime > t.mtime)      src = root;
+            else if (t.mtime > r.mtime) src = temp;
+            else if (r.size != t.size)  src = (r.size > t.size) ? root : temp;
+        }
+
+        if (src) {
+            prefs_mirror(src, src == root ? temp : root, "boot reconciliation");
+        }
+    }
 }
 
 /* ★ CROWD-CHOICE DATA IS READ FROM <Temp>, BUT SHIPS AT THE DATA ROOT.
@@ -555,6 +726,240 @@ static void mirror_crowd_choice_data(void) {
     } else {
         l_warn("CHOICEDATA: could not mirror %s -> %s", src, dst);
     }
+}
+
+/* ★ 2026-08-11 — SAVE-DATA INTEGRITY PASS.
+ *
+ * Everything above this point is about writes going to the right place. This is
+ * about the write that does not finish.
+ *
+ * The engine truncates a save file and then rewrites it. Interrupt that -- and this
+ * port is interrupted routinely, because players force-quit from the LiveArea
+ * whenever a scene load looks like a hang -- and what is left on the card is a
+ * zero-length or half-written save. The game cannot tell: luaIsSaveGameCorrupt is
+ * forced to `false` on this port (patch.c), which is necessary to stop a false
+ * corrupt-save dialog, but it also means the engine's own guard against loading
+ * rubbish is switched off. Nothing else was checking.
+ *
+ * So the loader keeps one generation back. At boot, for each save file:
+ *
+ *   - a file that is MISSING or ZERO-LENGTH while its backup has content is
+ *     restored from the backup, loudly;
+ *   - a file with content whose backup differs is copied forward, so the backup is
+ *     always the previous good state;
+ *   - a leftover `.new` sidecar from an interrupted file_save_atomic() is either
+ *     dropped (the real file survived) or promoted (the real file did not).
+ *
+ * Deliberately conservative. Only provably-broken files are replaced: "zero bytes"
+ * is the one corruption signal that cannot be mistaken for a legitimately small
+ * save, so a partially written but non-empty file is left alone rather than rolled
+ * back on a guess. One generation, no rotation -- restoring a save two sessions old
+ * would be its own kind of data loss. */
+static int save_name_is_backed_up(const char *name) {
+    if (!name || name[0] == '.') {
+        return 0;
+    }
+    const size_t n = strlen(name);
+    const struct { const char *ext; size_t len; } exts[] = {
+        { ".bundle", 7 }, { ".estore", 7 }, { ".epage", 6 }, { ".prop", 5 },
+    };
+    for (int i = 0; i < (int)(sizeof(exts) / sizeof(exts[0])); ++i) {
+        if (n > exts[i].len && strcmp(name + n - exts[i].len, exts[i].ext) == 0) {
+            /* choice.prop is the shipped read-only crowd dataset, not player data:
+             * 114KB duplicated every boot for a file the game never writes. */
+            return strcmp(name, "choice.prop") != 0;
+        }
+    }
+    return 0;
+}
+
+/* The smallest size a file of this kind can legitimately have. Only ".bundle" has a
+ * known floor: an EMPTY save bundle still serializes its 40-byte header, so anything
+ * shorter is a write that stopped partway rather than a small save. Everything else
+ * gets the one corruption signal that cannot be argued with, zero bytes. */
+static long long save_min_size(const char *name) {
+    const size_t n = strlen(name);
+    if (n > 7 && strcmp(name + n - 7, ".bundle") == 0) {
+        return 40;
+    }
+    return 1;
+}
+
+static void save_backup_one(const char *dir, const char *backup_dir, const char *name) {
+    const long long floor_sz = save_min_size(name);
+    char live[512];
+    char bak[512];
+    char sidecar[512];
+    sceClibSnprintf(live, sizeof(live), "%s%s", dir, name);
+    sceClibSnprintf(bak, sizeof(bak), "%s%s", backup_dir, name);
+    sceClibSnprintf(sidecar, sizeof(sidecar), "%s%s.new", dir, name);
+
+    long long live_sz = file_size(live);
+
+    /* An interrupted atomic write leaves the finished data in the sidecar. If the
+     * real file did not survive, that sidecar IS the save.
+     *
+     * ☠ PROMOTE BY RENAME, NEVER BY file_copy(). file_copy delegates to
+     * file_save_atomic(live, ...), which stages to live + ".new" -- byte-identical to
+     * `sidecar` -- and opens with remove(tmp). So the copy deletes its own source, and
+     * if the staging write then fails (card full, I/O error) the sidecar is gone, the
+     * live file is still truncated, and the in-memory buffer is discarded: a save that
+     * was fully recoverable a moment earlier is now unrecoverable. rename() moves the
+     * finished bytes without ever having two names for one file's contents. */
+    const long long side_sz = file_size(sidecar);
+    if (side_sz >= floor_sz && live_sz < floor_sz) {
+        remove(live);   /* Vita's rename refuses an existing destination */
+        if (rename(sidecar, live) == 0) {
+            live_sz = file_size(live);
+            l_info("SAVEGUARD: promoted interrupted write %s -> %s (%lld bytes) — "
+                   "the previous session was cut off mid-save", sidecar, live, side_sz);
+        } else {
+            l_warn("SAVEGUARD: could not promote %s -> %s (errno=%d) — leaving the "
+                   "sidecar in place so the next boot can try again",
+                   sidecar, live, errno);
+            return;   /* keep the sidecar: it is the only intact copy */
+        }
+    } else if (side_sz >= 0) {
+        /* The live file survived, so the sidecar is a leftover with nothing to add. */
+        remove(sidecar);
+    }
+
+    const long long bak_sz = file_size(bak);
+
+    if (live_sz < floor_sz && bak_sz >= floor_sz) {
+        if (file_copy(bak, live)) {
+            l_warn("SAVEGUARD: ★ RESTORED %s from backup (%lld bytes) — the live copy "
+                   "was %lld bytes, below the %lld-byte minimum for this file, so the "
+                   "last write to it never completed",
+                   name, bak_sz, live_sz, floor_sz);
+        } else {
+            l_warn("SAVEGUARD: %s is broken and the restore from %s FAILED", live, bak);
+        }
+        return;
+    }
+
+    /* Only a file that passes the floor is allowed to become the backup. Otherwise a
+     * truncated save would overwrite the last good copy of itself and there would be
+     * nothing left to restore from.
+     *
+     * The size/mtime pre-filter is not an optimisation detail: files_identical() reads
+     * BOTH files end to end, and this runs over the whole save set on every boot,
+     * before the engine starts. A player mid-playthrough has several bundles, the
+     * .estore index and a growing pile of .epage files, so the naive version read
+     * megabytes off the memory card every launch just to decide whether to copy.
+     * Different size means different content with no reads at all; same size AND same
+     * mtime means unchanged; only the ambiguous same-size, same-tick case is worth a
+     * byte comparison. */
+    if (live_sz < floor_sz) {
+        return;
+    }
+    struct stat live_st;
+    struct stat bak_st;
+    const int have_live_st = stat(live, &live_st) == 0;
+    const int have_bak_st  = stat(bak,  &bak_st)  == 0;
+    if (have_live_st && have_bak_st &&
+        live_st.st_size == bak_st.st_size &&
+        live_st.st_mtime == bak_st.st_mtime) {
+        return;   /* same size, same timestamp — no read needed */
+    }
+    if (have_live_st && have_bak_st &&
+        live_st.st_size == bak_st.st_size &&
+        files_identical(live, bak)) {
+        return;
+    }
+    if (!file_copy(live, bak)) {
+        l_warn("SAVEGUARD: could not refresh the backup of %s — the next "
+               "interrupted save has nothing to fall back to", name);
+    }
+}
+
+#define SAVE_NAME_MAX 128
+#define SAVE_SCAN_MAX 256
+
+void mcsm_save_backup_pass(void) {
+    static const char *const kDir    = DATA_PATH "Temp/";
+    static const char *const kBackup = DATA_PATH "Temp/backup/";
+
+    DIR *d = opendir(kDir);
+    if (!d) {
+        l_warn("SAVEGUARD: cannot open %s — no save-integrity pass this boot", kDir);
+        return;
+    }
+
+    if (!file_mkpath(DATA_PATH "Temp/backup/.keep", 0777)) {
+        l_warn("SAVEGUARD: could not create %s — saves have no backup", kBackup);
+        closedir(d);
+        return;
+    }
+
+    /* ☠ COLLECT FIRST, THEN ACT. save_backup_one() removes sidecars and renames files
+     * inside kDir, and mutating a directory while an readdir() traversal over it is
+     * still open is undefined -- on FAT it can skip or repeat entries. A skipped entry
+     * silently gets no backup that boot, and the "checked N" line below would report a
+     * count that omits it, so the gap would be invisible. */
+    char (*names)[SAVE_NAME_MAX] = malloc(sizeof(*names) * SAVE_SCAN_MAX);
+    if (!names) {
+        l_warn("SAVEGUARD: out of memory for the save-directory scan — skipping the "
+               "integrity pass this boot");
+        closedir(d);
+        return;
+    }
+
+    int considered = 0;
+    int truncated = 0;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        if (!save_name_is_backed_up(e->d_name)) {
+            continue;
+        }
+        if (strlen(e->d_name) >= SAVE_NAME_MAX) {
+            continue;
+        }
+        char probe[512];
+        sceClibSnprintf(probe, sizeof(probe), "%s%s", kDir, e->d_name);
+        if (is_dir(probe)) {
+            continue;
+        }
+        if (considered >= SAVE_SCAN_MAX) {
+            truncated = 1;
+            break;
+        }
+        sceClibSnprintf(names[considered], SAVE_NAME_MAX, "%s", e->d_name);
+        considered++;
+    }
+    closedir(d);
+
+    if (truncated) {
+        /* No silent caps: say which files were left unprotected rather than reporting
+         * a clean pass over a subset. */
+        l_warn("SAVEGUARD: more than %d save files in %s — only the first %d are "
+               "backed up this boot", SAVE_SCAN_MAX, kDir, SAVE_SCAN_MAX);
+    }
+
+    for (int i = 0; i < considered; ++i) {
+        save_backup_one(kDir, kBackup, names[i]);
+    }
+    free(names);
+
+    /* ☠ A MISSING FILE IS LEFT ALONE, IN BOTH DIRECTIONS.
+     *
+     * There was a second sweep here that restored any backup with no live counterpart.
+     * It could not tell a save that vanished mid-write from a save the PLAYER DELETED:
+     * deleting a slot in-game unlinks the bundle and its event log, and the next boot
+     * copied them straight back. Worse, restoration was per-file, so a slot could
+     * return as a bundle and an event log from different points in time.
+     *
+     * The obvious repair -- delete the orphaned backup instead -- is the same mistake
+     * inverted: it destroys the safety net for a file that was genuinely lost. Neither
+     * direction can be chosen correctly without knowing WHY the file is gone, and
+     * nothing here knows that.
+     *
+     * So a missing file is simply not this pass's business. That is not a gap: the
+     * engine truncates and rewrites in place, so an interrupted save leaves a SHORT
+     * file, which save_backup_one() above does restore. An orphaned backup just sits
+     * there costing a few KB, and if the slot is ever recreated under the same name it
+     * is refreshed on the next boot anyway. */
+    l_info("SAVEGUARD: checked %d save file(s) in %s against %s", considered, kDir, kBackup);
 }
 
 /* PRE-WARMED SHADER CACHE (2026-07-03) -------------------------------------
@@ -830,8 +1235,25 @@ void soloader_init_all() {
     ensure_minecraft102_descriptor();
     ensure_all_chapter_descriptors();   /* CH3-CH8: auto-detect any chapter whose archives are present */
     migrate_stranded_saves();
+    /* ☠ ORDER MATTERS, AND NOT THE WAY IT FIRST LOOKS.
+     *
+     * The prefs reconciliation runs BEFORE the backup pass. Putting the backup pass
+     * first loses settings: it restores Temp/prefs.prop from a copy that is one boot
+     * old and file_copy stamps it with the CURRENT time, so the reconciliation that
+     * follows sees the restored file as the newest of the pair and copies its stale
+     * contents over an intact, current data-root copy. Both sides end up a generation
+     * behind and the good one is gone -- the exact loss the mirror exists to prevent.
+     *
+     * Reconciling first means a truncated <Temp> copy is repaired from the data root
+     * (real, current data) before the backup pass ever considers restoring it, and by
+     * then the file is above its floor so no restore fires at all. The backup only
+     * gets to act when BOTH copies are broken, which is the case it is actually for.
+     *
+     * Integrity still precedes seed_empty_prefs_files(), or a zero-length prefs.prop
+     * would be indistinguishable from the empty seed. */
     mirror_crowd_choice_data();   /* MUST precede the empty seed — see there */
     mcsm_sync_prefs_files();      /* recover whichever side has real settings */
+    mcsm_save_backup_pass();
     seed_empty_prefs_files();
     seed_shader_cache();
 

@@ -151,10 +151,20 @@ static McsmTrophyUnlockState g_unlocked;
  * run setup once and retry, instead of failing silently for the whole session --
  * which is the "achievements do not pop at all" report. */
 #define TROPHY_ERR_NOT_REGISTERED 0x80551612u
-/* One automatic recovery per launch. If setup runs and the unlock still fails,
- * something else is wrong (no NoTrpDrm, corrupt store) and retrying forever would
- * just reopen the dialog on a loop. */
-#define TROPHY_SETUP_RECOVERY_MAX 1u
+/* ★ 2026-08-11 — CHARGED ON A FAILED REGISTRATION, NOT ON AN ATTEMPT.
+ *
+ * This was 1, and the counter was incremented the moment the dialog was REQUESTED.
+ * So a dialog that opened and did not register the set -- cancelled, or the stale
+ * conf-folder state described above -- spent the entire budget, and since the reset
+ * at the success branch is unreachable when nothing can unlock, every remaining
+ * achievement of that session was dropped with only a per-id warn. A whole
+ * playthrough's trophies, lost quietly.
+ *
+ * Now the budget is charged in mcsm_trophies_setup_poll(), and only when a dialog
+ * finished WITHOUT the system then reporting a usable set. A few attempts are
+ * allowed, and when they run out the loader says so once, loudly, instead of
+ * leaving the reader to infer it from repeated unlock failures. */
+#define TROPHY_SETUP_RECOVERY_MAX 3u
 static SceUID g_req_sema = -1;
 static SceUID g_queue_mutex = -1;
 static uint8_t g_queue[TROPHY_QUEUE_CAP];
@@ -176,6 +186,85 @@ static char g_setup_marker_path[128];
 /* ---- worker ------------------------------------------------------------------- */
 
 #if MCSM_HAVE_TROPHY_PACK
+/* ★ 2026-08-11 — ONE PLACE THAT ASKS THE SYSTEM, AND IT NEVER LIES BY OMISSION.
+ *
+ * Two call sites used to pass their live bitmap straight into
+ * sceNpTrophyGetTrophyUnlockState and then use the result whatever the call
+ * returned. Both were wrong in the same way, in opposite directions:
+ *
+ *   - init passed &g_unlocked directly, so anything the call wrote before failing
+ *     stayed in the bitmap. A bit set there makes mcsm_trophies_unlock() skip that
+ *     achievement for the whole session, silently.
+ *   - the post-registration refresh ignored the return entirely and published its
+ *     zero-initialised buffer, wiping every trophy unlocked earlier in the session
+ *     and then logging "registered — 0 trophies now known", which contradicts the
+ *     "set registered" line printed immediately above it.
+ *
+ * This queries into a LOCAL and reports success only when the system both answered
+ * and knows about at least one trophy. On failure the caller's bitmap is untouched,
+ * so the worst case is a redundant unlock attempt rather than a lost achievement.
+ *
+ * It is also the honest answer to "is the set registered?", which is why the
+ * caller-visible contract is a plain yes/no. */
+static int trophy_query_unlock_state(McsmTrophyUnlockState *out, uint32_t *count_out) {
+    McsmTrophyUnlockState local;
+    sceClibMemset(&local, 0, sizeof(local));
+    uint32_t cnt = 0;
+    int urc = -1;
+    int h = 0;
+
+    if (sceNpTrophyCreateHandle(&h) >= 0) {
+        urc = sceNpTrophyGetTrophyUnlockState(g_ctx, h, &local, &cnt);
+        sceNpTrophyDestroyHandle(h);
+    }
+    if (count_out) {
+        *count_out = cnt;
+    }
+    if (urc < 0 || cnt == 0u) {
+        return 0;   /* caller's bitmap deliberately left as it was */
+    }
+    if (out) {
+        for (unsigned i = 0; i < 4u; i++) {
+            __atomic_store_n(&out->bits[i], local.bits[i], __ATOMIC_RELEASE);
+        }
+    }
+    return 1;
+}
+
+/* A stale ur0:.../trophy/conf/<COMMID>_00 folder is indistinguishable from a real
+ * registration, and on the affected console it is the reason boot-time setup is
+ * skipped and nothing ever unlocks (see TROPHY_ERR_NOT_REGISTERED above). This file
+ * is how the previous session's evidence outlives the folder: the moment an unlock
+ * is refused for want of a registration, the next boot stops believing the folder
+ * and registers. A verified registration deletes it again, so a genuinely healthy
+ * install never sees the dialog twice. */
+static void trophy_needs_setup_path(char *out, size_t out_sz) {
+    sceClibSnprintf(out, out_sz, DATA_PATH "trophy_needs_setup_%s.txt", g_comm_id);
+}
+
+static void trophy_mark_needs_setup(void) {
+    char p[160];
+    trophy_needs_setup_path(p, sizeof(p));
+    FILE *f = fopen(p, "wb");
+    if (f) {
+        fputs("an unlock was refused for want of a registration; "
+              "ignore the conf folder and register on the next boot\n", f);
+        fclose(f);
+    }
+}
+
+static void trophy_clear_needs_setup(void) {
+    char p[160];
+    trophy_needs_setup_path(p, sizeof(p));
+    remove(p);
+}
+
+static int trophy_setup_was_requested_earlier(void) {
+    char p[160];
+    trophy_needs_setup_path(p, sizeof(p));
+    return file_exists(p);
+}
+
 static void trophy_queue_refill_locked(void) {
     for (unsigned word = 0; word < 4u; word++) {
         uint32_t bits = (uint32_t)atomic_exchange_explicit(
@@ -277,8 +366,15 @@ static int trophy_worker(SceSize args, void *argp) {
                     /* The set is not actually registered, whatever the conf folder
                      * said at init. Ask the GL thread to run setup, and put this id
                      * back so it is retried once the dialog completes -- otherwise
-                     * the story beat that earned it never fires again this session. */
-                    g_setup_recoveries++;
+                     * the story beat that earned it never fires again this session.
+                     *
+                     * ☠ The budget is NOT charged here. It used to be, which meant a
+                     * dialog that opened and failed to register spent the only
+                     * attempt; it is now charged by mcsm_trophies_setup_poll() when a
+                     * completed dialog leaves the set still unusable. Persist the
+                     * evidence too, so a stale conf folder cannot make the next boot
+                     * skip setup all over again. */
+                    trophy_mark_needs_setup();
                     atomic_fetch_or_explicit(&g_deferred_bits[id >> 5],
                                              1u << (id & 31), memory_order_release);
                     atomic_store_explicit(&g_setup_request, 1, memory_order_release);
@@ -296,6 +392,25 @@ static int trophy_worker(SceSize args, void *argp) {
                     }
                     sceKernelSignalSema(g_req_sema, 1);
                     continue;   /* keep the queued bit: the retry is already pending */
+                }
+                if ((unsigned)rc == TROPHY_ERR_NOT_REGISTERED) {
+                    /* ★ SAY IT ONCE, PLAINLY. Past this point every achievement of
+                     * the session is dropped, and the only trace used to be one
+                     * `unlock id=N FAILED` warn per beat -- a reader had to notice
+                     * that they never stopped. State the conclusion instead. */
+                    static int s_gave_up = 0;
+                    if (!s_gave_up) {
+                        s_gave_up = 1;
+                        l_warn("TROPHY: ☠ GIVING UP for this session. %u registration "
+                               "attempt(s) ran and the system still refuses to record a "
+                               "trophy, so NO achievement will unlock until the game is "
+                               "restarted. Most likely: NoTrpDrm is not installed, or "
+                               "the trophy set for %s is present in "
+                               "ur0:user/00/trophy/conf but broken in the system store. "
+                               "The next boot will run setup again rather than trusting "
+                               "that folder.",
+                               g_setup_recoveries, g_comm_id);
+                    }
                 }
             }
             else {
@@ -405,30 +520,46 @@ int mcsm_trophies_setup_poll(void) {
 
     sceNpTrophySetupDialogTerm();
 
-    FILE *mf = g_setup_marker[0] ? fopen(g_setup_marker, "wb") : NULL;
-    if (mf) {
-        fputs("trophy setup dialog completed for this comm id\n", mf);
-        fclose(mf);
-        l_info("TROPHY: setup finished — set registered (record: %s). Later boots skip "
-               "this on their own, because the system then reports it present.",
-               g_setup_marker);
-    } else {
-        l_warn("TROPHY: setup finished but could not write %s (errno=%d) — the dialog "
-               "will appear again next boot", g_setup_marker, errno);
-    }
+    /* ★ 2026-08-11 — "THE DIALOG CLOSED" IS NOT "THE SET IS REGISTERED".
+     *
+     * Every non-RUNNING status arrives here, including a dialog the player cancelled
+     * and one that errored. The old code wrote the completion marker and logged
+     * "set registered" for all of them, then published a bitmap from a query whose
+     * return value it discarded. On a console where that query fails -- documented
+     * above, device-verified -- that meant: claim success, wipe the record of every
+     * trophy unlocked so far this session, print "0 trophies now known" one line
+     * after "set registered", and release the worker to keep failing.
+     *
+     * Ask the system whether the set is actually usable now, and let the answer
+     * decide everything that follows. */
+    uint32_t cnt = 0;
+    const int usable = trophy_query_unlock_state(&g_unlocked, &cnt);
 
-    /* Registration is what fills the unlock bitmap in. Query into a private object,
-     * then publish whole words atomically: story callbacks can safely inspect the old
-     * snapshot while the common-dialog thread is refreshing it. */
-    { int h = 0; uint32_t cnt = 0; McsmTrophyUnlockState refreshed;
-      sceClibMemset(&refreshed, 0, sizeof(refreshed));
-      if (sceNpTrophyCreateHandle(&h) >= 0) {
-          sceNpTrophyGetTrophyUnlockState(g_ctx, h, &refreshed, &cnt);
-          sceNpTrophyDestroyHandle(h);
-      }
-      for (unsigned i = 0; i < 4u; i++)
-          __atomic_store_n(&g_unlocked.bits[i], refreshed.bits[i], __ATOMIC_RELEASE);
-      l_info("TROPHY: registered — %u trophies now known to the system", cnt); }
+    if (usable) {
+        g_setup_recoveries = 0;      /* a working set re-arms the recovery budget */
+        trophy_clear_needs_setup();  /* the conf folder can be believed again */
+
+        FILE *mf = g_setup_marker[0] ? fopen(g_setup_marker, "wb") : NULL;
+        if (mf) {
+            fputs("trophy setup dialog completed for this comm id\n", mf);
+            fclose(mf);
+        }
+        l_info("TROPHY: setup finished and the system now reports a usable set — "
+               "%u trophies known%s", cnt,
+               mf ? "" : " (the record file could not be written, which is cosmetic)");
+    } else {
+        /* Charge the budget HERE: a dialog ran to completion and the set is still not
+         * usable. That is the only evidence that justifies spending an attempt. */
+        if (g_setup_recoveries < TROPHY_SETUP_RECOVERY_MAX) {
+            g_setup_recoveries++;
+        }
+        trophy_mark_needs_setup();
+        l_warn("TROPHY: setup dialog closed but the system still does NOT report a "
+               "usable set (count=%u). Not recording a registration, and NOT touching "
+               "the unlock bitmap — publishing an empty one here is what used to "
+               "discard trophies already earned this session. Attempt %u of %u.",
+               cnt, g_setup_recoveries, (unsigned)TROPHY_SETUP_RECOVERY_MAX);
+    }
 
     /* Release the worker only after the bitmap refresh above is complete. */
     atomic_store_explicit(&g_setup_pending, 0, memory_order_release);
@@ -514,16 +645,14 @@ int mcsm_trophies_init(void) {
      * re-register forever or never register at all. */
     sceClibMemset(&g_unlocked, 0, sizeof(g_unlocked));
     uint32_t trophy_count = 0;
-    int registered = 0;
-    { int h = 0;
-      if (sceNpTrophyCreateHandle(&h) >= 0) {
-          const int urc = sceNpTrophyGetTrophyUnlockState(g_ctx, h, &g_unlocked, &trophy_count);
-          sceNpTrophyDestroyHandle(h);
-          registered = (urc >= 0 && trophy_count > 0);
-          if (!registered)
-              l_info("TROPHY: unlock-state probe says not present (rc=0x%08X count=%u)",
-                     (unsigned)urc, trophy_count);
-      } }
+    /* Queries into a local and only copies into g_unlocked on success. Passing
+     * &g_unlocked straight in meant a FAILING call's partial writes were kept, and a
+     * stray bit there makes mcsm_trophies_unlock() skip that achievement for the rest
+     * of the session with nothing but a throttled "already held" line. */
+    int registered = trophy_query_unlock_state(&g_unlocked, &trophy_count);
+    if (!registered) {
+        l_info("TROPHY: unlock-state probe says not present (count=%u)", trophy_count);
+    }
 
     /* ★★ THE SYSTEM IS THE SOURCE OF TRUTH, CHECKED EVERY BOOT (2026-08-01).
      *
@@ -561,12 +690,33 @@ int mcsm_trophies_init(void) {
      * The API probe is still run first and still believed when it says YES -- it also
      * fills the unlock bitmap, which the folder check cannot. This only adds a second
      * way to say "already there". */
+    /* ★ 2026-08-11 — THE FOLDER IS A HINT THAT A PREVIOUS SESSION CAN REVOKE.
+     *
+     * Making a present conf folder authoritative is what produced the device log
+     * quoted at TROPHY_ERR_NOT_REGISTERED: folder exists -> setup skipped -> every
+     * unlock refused with the same code the probe returned. A stale folder left by a
+     * failed trophy reset is indistinguishable from a real registration, so the
+     * folder alone cannot be trusted -- but ignoring it entirely reopens the
+     * registration dialog on every single boot, which is the complaint it was added
+     * to fix.
+     *
+     * Both are avoidable. The folder is believed UNLESS a previous session recorded
+     * that an unlock was actually refused; that record is written the moment the
+     * worker sees TROPHY_ERR_NOT_REGISTERED and deleted as soon as a registration is
+     * verified. So a healthy install never sees the dialog twice, and a stale folder
+     * costs at most one session instead of every session forever. */
     char trophy_dir[160];
     sceClibSnprintf(trophy_dir, sizeof(trophy_dir),
                     "ur0:user/00/trophy/conf/%s_00", g_comm_id);
     if (!registered && is_dir(trophy_dir)) {
-        registered = 1;
-        l_info("TROPHY: set already installed (%s exists) — skipping setup", trophy_dir);
+        if (trophy_setup_was_requested_earlier()) {
+            l_warn("TROPHY: %s exists but a previous session had an unlock REFUSED for "
+                   "want of a registration — treating the folder as stale and running "
+                   "setup rather than trusting it again", trophy_dir);
+        } else {
+            registered = 1;
+            l_info("TROPHY: set already installed (%s exists) — skipping setup", trophy_dir);
+        }
     }
 
     /* Published so the recovery path can open the dialog later with the same
@@ -762,6 +912,13 @@ static int trophy_id_from_name(const char *name) {
         v = v * 10 + (*q - '0');
         if (v > 127) return -1;
     }
+    /* Trophy 000 is the PLATINUM (pid -1 in TROPCONF, see above). The system awards
+     * it when its conditions are met; forcing it directly is exactly the "unlocking a
+     * random trophy" this function's digit check exists to prevent, and 0 was the one
+     * value that slipped through. The shipped data only ever emits achievement_01..32,
+     * so nothing reaches this today -- but the guard was being upheld by the game's
+     * data rather than by the code, and a game.txt trophy_map typo would reach it. */
+    if (v == 0) return -1;
     return v;
 }
 

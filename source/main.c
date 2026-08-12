@@ -992,6 +992,11 @@ typedef void (*SdlNativeTouchFn)(JNIEnv *env,
                                  jfloat pressure);
 typedef void (*SdlNativeJoyFn)(JNIEnv *env, jclass cls, jint device_id, jint axis, jfloat value);
 /* Bundled SDL Android: nativeAddJoystick(device_id,name,desc,is_accel,nbuttons,naxes,nhats,nballs). */
+/* Cheap presence query, used to decide whether the virtual pad needs re-adding.
+ * Real SDL export (verified with nm against the shipped libSDL2.so), not a JNI
+ * bridge entry point, so it takes no JNIEnv. */
+typedef int (*SdlNumJoysticksFn)(void);
+
 typedef jint (*SdlAddJoystickFn)(JNIEnv *env, jclass cls, jint device_id, jobject name, jobject desc,
                                  jboolean is_accel, jint nbuttons, jint naxes, jint nhats, jint nballs);
 typedef void *(*SdlGetWindowFn)(void);
@@ -1709,12 +1714,77 @@ static int is_android_sdl_pad_keycode(int32_t keycode) {
 
 /* Register a normal SDL joystick so Telltale's SDL/GameController path sees
  * Vita as one pad with real buttons and stick axes. */
+/* ★★ 2026-08-11 — THIS IS "THE STICKS STOP WORKING AND ONLY TOUCH IS LEFT".
+ *
+ * The registration below was a ONE-SHOT latch: `if (s_registered) return;`. Buttons
+ * and sticks do not share a path — buttons are delivered as Android KEY events
+ * (onNativeKeyDown/Up), sticks as joystick AXIS events (onNativeJoy) addressed to a
+ * device id SDL must still know about. So if SDL ever drops that virtual joystick,
+ * the axes go nowhere while every button keeps working perfectly. That asymmetry is
+ * the reported symptom exactly, and it is why touch remained the only way to play.
+ *
+ * SDL removes joysticks on its own schedule: SDL_QuitSubSystem/SDL_InitSubSystem
+ * around the Android lifecycle, a joystick re-enumeration, or the engine closing and
+ * reopening the GameController when a common dialog takes focus. This port now opens
+ * two of those dialogs (trophy setup, the rename IME). Once the device is gone, the
+ * latch guaranteed we would never add it back — for the rest of the process.
+ *
+ * And it explains "restarting didn't help": if SDL tears the subsystem down once
+ * during startup AFTER our single registration, the session begins with dead sticks,
+ * and every subsequent launch does the same thing at the same point.
+ *
+ * So re-assert instead of latching. nativeAddJoystick is idempotent — SDL looks the
+ * device id up and returns early if it is already present — so the steady-state cost
+ * is one lookup. Rate-limited to ~1Hz because the sticks are polled at 60Hz and the
+ * JNI strings are built once and reused rather than reallocated per call. */
 void mcsm_register_virtual_controller(void) {
     static int s_registered = 0;
+    static uint64_t s_last_assert_us = 0;
+    static jobject s_name = NULL;
+    static jobject s_desc = NULL;
 #ifdef DEBUG_SOLOADER
     static int s_attempts = 0;
 #endif
     if (s_registered) {
+        /* Re-assert on a slow timer. If SDL still has the device this is a lookup
+         * that changes nothing; if it does not, the sticks come back on their own
+         * within a second instead of being dead for the rest of the session. */
+        const uint64_t now = sceKernelGetSystemTimeWide();
+        if (now - s_last_assert_us < 1000000ULL) {
+            return;
+        }
+        s_last_assert_us = now;
+
+        /* ☠ ASK BEFORE ADDING. Re-adding unconditionally would hand SDL a device it
+         * already has once a second, and SDL posts SDL_JOYDEVICEADDED on that path --
+         * which can make the engine close and reopen its GameController every second,
+         * a new input glitch in place of the old one. SDL_NumJoysticks is a cheap
+         * count and it answers the only question that matters: does SDL still have a
+         * joystick at all? If it does, do nothing. If it does not, our virtual pad is
+         * the one that went missing, because it is the only one this port ever adds. */
+        static SdlNumJoysticksFn s_num_joysticks = NULL;
+        if (!s_num_joysticks) {
+            s_num_joysticks = (SdlNumJoysticksFn)so_symbol(&so_mod_sdl2, "SDL_NumJoysticks");
+        }
+        if (s_num_joysticks && s_num_joysticks() > 0) {
+            return;   /* still registered — nothing to do */
+        }
+        if (!s_num_joysticks) {
+            return;   /* cannot tell; do NOT re-add blind, see above */
+        }
+
+        if (g_sdl_add_joystick && s_name && s_desc) {
+            jint rrc = g_sdl_add_joystick(&jni, NULL, SDL_JOYSTICK_ID_VITA, s_name, s_desc,
+                                          JNI_FALSE,
+                                          SDL_JOYSTICK_BUTTONS_VITA,
+                                          SDL_JOYSTICK_AXES_VITA,
+                                          SDL_JOYSTICK_HATS_VITA,
+                                          0 /*nballs*/);
+            l_info("INPUT: ★ SDL had NO joysticks — re-added the virtual Vita pad "
+                   "(rc=%d). This is the path that used to leave the sticks dead for "
+                   "the rest of the session while the buttons kept working.",
+                   (int)rrc);
+        }
         return;
     }
     resolve_sdl_input_symbols();
@@ -1732,8 +1802,11 @@ void mcsm_register_virtual_controller(void) {
         return;
     }
     s_registered = 1;
-    jobject name = jni->NewStringUTF(&jni, "PS Vita Controller");
-    jobject desc = jni->NewStringUTF(&jni, "0300000000000000564954410000fefe");
+    s_last_assert_us = sceKernelGetSystemTimeWide();
+    /* Built ONCE and kept: the re-assert above reuses these every second, and
+     * allocating a fresh pair per call would leak steadily for the whole session. */
+    jobject name = s_name = jni->NewStringUTF(&jni, "PS Vita Controller");
+    jobject desc = s_desc = jni->NewStringUTF(&jni, "0300000000000000564954410000fefe");
     /* CONTROLLER FIX (2026-07-17): register a GameController mapping for this GUID
      * BEFORE adding the joystick, so SDL_GameControllerOpen succeeds and the engine
      * reads L2/R2 as trigger AXES (the ONLY input the fight ButtonMash QTE samples).
